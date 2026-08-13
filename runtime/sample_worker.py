@@ -39,7 +39,7 @@ def main():
     ap.add_argument('--frames', type=int, required=True); ap.add_argument('--steps', type=int, required=True); ap.add_argument('--cfg', type=float, required=True)
     ap.add_argument('--seed', type=int, required=True); ap.add_argument('--shift', type=float, required=True); ap.add_argument('--audio-shift', type=float, required=True)
     ap.add_argument('--sampler', default='euler'); ap.add_argument('--scheduler', default='simple'); ap.add_argument('--out', required=True)
-    ap.add_argument('--first-frame'); ap.add_argument('--last-frame'); ap.add_argument('--continue-video'); ap.add_argument('--continue-context-frames', type=int, default=35)
+    ap.add_argument('--first-frame'); ap.add_argument('--last-frame'); ap.add_argument('--continue-video'); ap.add_argument('--continue-context-frames', type=int, default=35); ap.add_argument('--continue-audio-memory', action='store_true')
     ap.add_argument('--lora', action='append', default=[]); ap.add_argument('--lora-strength', action='append', type=float, default=[])
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable MiniMax H3 Spectrum feature forecasting')
@@ -105,12 +105,13 @@ def main():
         _flush_models()
         if ns.extended_logging: log_mem('after keyframe VAE flush / before text encoder load', sync=True)
         print('Keyframe VAE unloaded before text encoder load.', flush=True)
-        if ns.continue_video:
+        if ns.continue_video and ns.continue_audio_memory:
             if not ns.audio_vae:
-                raise ValueError('--audio-vae is required for FL2VA source-audio continuation')
+                raise ValueError('--audio-vae is required when --continue-audio-memory is enabled')
             if manager is not None:
                 manager.set_stage('vae')
                 manager.trim_cuda_cache(reason='pre-continue-audio-vae', force=True)
+            print('FL2VA source-audio memory: ENABLED (experimental; known repetition/duplication bugs)', flush=True)
             print('Loading native audio VAE for continuation audio history...', flush=True)
             av_for_history=load_vae(Path(ns.audio_vae))
             prepared_audio_keyframes=prepare_audio_continue_conditioning(av_for_history,ns.continue_video,ns.continue_context_frames,24.0)
@@ -118,6 +119,8 @@ def main():
             _flush_models()
             if ns.extended_logging: log_mem('after continuation audio VAE flush / before text encoder load', sync=True)
             print('Continuation audio VAE unloaded before text encoder load.', flush=True)
+        elif ns.continue_video:
+            print('FL2VA source-audio memory: disabled; continuing with normal newly generated audio.', flush=True)
         if manager is not None:
             manager.set_stage('text')
             manager.trim_cuda_cache(reason='post-keyframe-vae', force=True)
