@@ -1834,7 +1834,7 @@ class MainWindow(QMainWindow):
         vf.addRow("Diffusion load headroom", self.vram_diffusion_headroom)
 
         self.vram_offload_chunk = QSpinBox(); self.vram_offload_chunk.setRange(64, 4096); self.vram_offload_chunk.setSingleStep(64); self.vram_offload_chunk.setValue(512); self.vram_offload_chunk.setSuffix(" MB")
-        self.vram_offload_chunk.setToolTip("Closest MiniMax equivalent to an offload block-size tuning knob. When headroom is breached, ask Comfy to evict at least this much eligible model weight. Smaller = finer control; larger = fewer transfers but more VRAM released at once.")
+        self.vram_offload_chunk.setToolTip("Closest MiniMax equivalent to an offload block-size tuning knob. When headroom is breached, it will evict evict at least this much eligible model weight. Smaller = finer control; larger = fewer transfers but more VRAM released at once.")
         vf.addRow("Offload chunk", self.vram_offload_chunk)
 
 
