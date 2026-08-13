@@ -767,9 +767,18 @@ class MainWindow(QMainWindow):
         self.continue_last_result = QCheckBox("Continue last result")
         self.continue_last_result.setChecked(False)
         self.continue_last_result.toggled.connect(self._sync_continue_video_options)
+        self.continue_audio_memory_row = QWidget()
+        caml = QHBoxLayout(self.continue_audio_memory_row); caml.setContentsMargins(0, 0, 0, 0)
+        self.continue_audio_memory = QCheckBox("Use sound in memory for new clip")
+        self.continue_audio_memory.setChecked(False)
+        self.continue_audio_memory.setToolTip("Experimental source-audio continuation. Uses audio from the previous queued result as H3 memory/context for the new clip. This currently has known repetition/duplication bugs.")
+        self.continue_audio_memory_warning = QLabel("Needs work, has bugs")
+        self.continue_audio_memory_warning.setStyleSheet("color: #d58a00;")
+        self.continue_audio_memory_warning.setToolTip("Experimental: source audio memory can repeat or duplicate a short piece of audio at clip joins.")
+        caml.addWidget(self.continue_audio_memory); caml.addWidget(self.continue_audio_memory_warning); caml.addStretch()
         fl.addRow("First frame", self.first); fl.addRow("Last frame", self.last)
         fl.addRow("Continue video", self.continue_video); fl.addRow("Motion context", self.continue_context)
-        fl.addRow("", self.glue_results); fl.addRow("", self.continue_last_result); v.addWidget(self.fl_group)
+        fl.addRow("", self.glue_results); fl.addRow("", self.continue_last_result); fl.addRow("", self.continue_audio_memory_row); v.addWidget(self.fl_group)
 
         self.ref_group = QGroupBox("Ref2VA references"); rfl = QVBoxLayout(self.ref_group)
         note = QLabel("Prompt tags follow the native order: <Picture 1..9>, <Audio n> paired before <Video n>, then standalone <Audio n>."); note.setWordWrap(True); rfl.addWidget(note)
@@ -1702,6 +1711,8 @@ class MainWindow(QMainWindow):
             continue_source=str(job.get("manual_continue_video") or "")
         if continue_source:
             run_args += ["--continue-video", continue_source, "--continue-context-frames", str(int(job.get("continue_context_frames") or 35))]
+            if job.get("continue_last_result") and job.get("continue_audio_memory"):
+                run_args += ["--continue-audio-memory"]
             if job.get("glue_results"):
                 run_args += ["--glue-source", continue_source]
             job["resolved_continue_source"] = continue_source
@@ -2054,6 +2065,10 @@ class MainWindow(QMainWindow):
         # a manually selected Continue Video source. Keep Last frame available as a destination.
         if hasattr(self, "first"):
             self.first.setEnabled(not chain)
+        if hasattr(self, "continue_audio_memory_row"):
+            self.continue_audio_memory_row.setVisible(chain)
+        if hasattr(self, "continue_audio_memory"):
+            self.continue_audio_memory.setEnabled(chain)
 
     def current_output_dir(self) -> Path:
         p = self.output_folder.path()
@@ -2164,6 +2179,7 @@ class MainWindow(QMainWindow):
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
             "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 35),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
+            "continue_audio_memory": self.continue_audio_memory.isChecked(),
             "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
@@ -2197,7 +2213,7 @@ class MainWindow(QMainWindow):
             self._set_frame_count(d.get("frames", 362))
             self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", "")); self.continue_video.edit.setText(d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",35)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
-            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self._sync_continue_video_options()
+            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", []))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
@@ -2564,10 +2580,11 @@ class MainWindow(QMainWindow):
             if lp and float(strength.value()) != 0.0 and not Path(lp).is_file():
                 QMessageBox.critical(self, "LoRA missing", f"Selected LoRA file was not found:\n{lp}"); return
         args=[script,"--width",str(w),"--height",str(h),"--frames",str(frames),"--steps",str(self.steps.value()),"--cfg",str(self.cfg.value()),"--shift",str(self.shift.value()),"--audio-shift",str(self.audio_shift.value()),"--seed",str(self.seed.value()),"--sampler",self.sampler.currentText(),"--scheduler",self.scheduler.currentText(),"--prompt",prompt]
-        continue_last=False; continue_from_job_id=None; manual_continue_video=""; glue_results=False
+        continue_last=False; continue_from_job_id=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False
         if mode==1:
             continue_last=self.continue_last_result.isChecked()
             glue_results=self.glue_results.isChecked()
+            continue_audio_memory=bool(continue_last and self.continue_audio_memory.isChecked())
             manual_continue_video="" if continue_last else self.continue_video.path()
             if (manual_continue_video or continue_last) and self.first.path():
                 QMessageBox.warning(self,"Conflicting FL2VA inputs","Continue Video already supplies the first-frame boundary. Clear the separate First frame."); return
@@ -2624,7 +2641,7 @@ class MainWindow(QMainWindow):
         args += ["--output",str(out)]
         model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
         model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
-        job={"id":uuid.uuid4().hex,"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 35) if mode==1 else None,"glue_results":bool(glue_results)}
+        job={"id":uuid.uuid4().hex,"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 35) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
 
