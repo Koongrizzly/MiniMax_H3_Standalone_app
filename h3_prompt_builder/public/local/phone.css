@@ -1,0 +1,60 @@
+.phone-access {
+  margin: 16px 0;
+  padding: 14px;
+  border: 1px solid rgba(97, 220, 255, .28);
+  border-radius: 12px;
+  background: rgba(19, 164, 224, .07);
+}
+.phone-access > span {
+  display: block;
+  color: var(--cyan);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .16em;
+}
+.phone-access > b {
+  display: block;
+  margin: 5px 0;
+  color: #fff;
+  font: 600 14px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+.phone-access p { margin: 5px 0 10px; color: var(--muted); font-size: 10px; }
+.phone-access button {
+  border: 1px solid rgba(97, 220, 255, .35);
+  background: #171a29;
+  color: var(--cyan);
+  border-radius: 9px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.version-mismatch {
+  position: relative;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 12px 20px;
+  border-bottom: 1px solid rgba(255, 181, 71, .5);
+  background: #3a250b;
+  color: #fff3d8;
+}
+.version-mismatch[hidden] { display: none; }
+.version-mismatch div { display: flex; gap: 10px; align-items: center; }
+.version-mismatch b { color: #ffbd59; font-size: 11px; letter-spacing: .12em; }
+.version-mismatch span { font-size: 12px; }
+.version-mismatch button {
+  flex: none;
+  border: 1px solid rgba(255, 189, 89, .65);
+  border-radius: 9px;
+  padding: 8px 11px;
+  background: #17120b;
+  color: #ffcf86;
+  cursor: pointer;
+}
+@media (max-width: 680px) {
+  .version-mismatch { align-items: stretch; flex-direction: column; gap: 8px; }
+  .version-mismatch div { align-items: flex-start; flex-direction: column; gap: 3px; }
+}

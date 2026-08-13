@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#080914">
+  <meta name="description" content="Turn a simple video idea into an optimized MiniMax H3 prompt.">
+  <title>Hailuo H3 Prompt Builder</title>
+  <link rel="stylesheet" href="styles.css?v=2.9.1-beta.2">
+  <link rel="stylesheet" href="phone.css?v=2.9.1-beta.2">
+  <link rel="stylesheet" href="history.css?v=2.9.1-beta.2">
+</head>
+<body>
+  <div id="versionMismatch" class="version-mismatch" hidden>
+    <div><b>APP UPDATE MISMATCH</b><span id="versionMismatchText"></span></div>
+    <button id="reloadCurrentVersion">Reload current version</button>
+  </div>
+  <div class="glow glow-one"></div><div class="glow glow-two"></div>
+  <header class="topbar">
+    <a class="brand" href="https://www.bobdoylemedia.com" target="_blank" rel="noreferrer">
+      <span class="brand-mark"><b>BD</b><i>M</i></span>
+      <span><strong>OPEN-SOURCE PROJECT</strong><small>CREATED BY BOB DOYLE MEDIA</small></span>
+    </a>
+    <div class="product-name"><span>Bob Doyle Prompt Builder (beta)</span></div>
+    <div class="header-actions">
+      <span id="serverStatus" class="server-status"><i></i><span>Checking</span></span>
+      <button class="small-button" id="historyButton">History</button>
+      <button class="small-button" id="settingsButton">Settings</button>
+      <button class="small-button danger" id="stopServerButton">Stop server</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <span class="eyebrow">SIMPLE IN. CINEMATIC OUT.</span>
+      <h1>Turn a simple idea into an<br><em>H3-ready video prompt.</em></h1>
+      <p>Describe what you want to see. Choose a few creative options. The builder handles the H3-specific prompt engineering for you.</p>
+      <div class="steps"><span><b>1</b>Describe it</span><i></i><span><b>2</b>Choose the look</span><i></i><span><b>3</b>Generate</span></div>
+    </section>
+
+    <section class="workspace">
+      <div class="input-card">
+        <div class="card-head"><div><span>01</span><h2>What should happen?</h2></div><p>Write it naturally. One sentence is enough.</p></div>
+        <textarea id="idea" class="idea-box" placeholder="Example: A tiny robot discovers a glowing flower growing through a crack in an abandoned factory floor. It kneels down, gently touches it, and the whole factory begins coming back to life."></textarea>
+        <div class="example-row"><span>Try an idea:</span><button data-example="A woman opens an ordinary umbrella and is lifted gently above a rainy city as everyone below looks up in amazement.">Magical city</button><button data-example="A sleek black coffee maker assembles itself from floating metal parts, then pours a perfect cup in a dramatic studio reveal.">Product reveal</button><button data-example="A cartoon orange cat attempts a serious cooking show, but every ingredient keeps escaping across the kitchen counter.">Comedy animation</button></div>
+
+        <div class="divider"></div>
+        <div class="card-head compact"><div><span>02</span><h2>Choose the look</h2></div><p>These are the only choices you need.</p></div>
+
+        <div class="simple-grid">
+          <label class="control wide"><span>Visual style</span><select id="style">
+            <optgroup label="Core visual styles">
+              <option>Cinematic realism</option><option>Live action</option><option>3D animation</option><option>Cartoon</option><option>Anime</option><option>Illustrated</option><option>Game cinematic</option><option>Gameplay / first-person</option><option>Stop motion</option><option>Mixed live action and hand-drawn animation</option><option>Graphic motion design</option><option>Animated poster</option><option>Premium product commercial</option>
+            </optgroup>
+            <optgroup label="Genre and mood presets">
+              <option>Visceral cinematic horror</option><option>Psychological thriller</option><option>Gothic whimsy</option><option>Dark fairy tale</option><option>Cosmic horror</option><option>Supernatural mystery</option><option>Neo-noir crime</option><option>Analog found footage</option><option>Retro science fiction</option><option>Dystopian future</option><option>Disaster spectacle</option><option>Action blockbuster</option><option>Pulp adventure</option><option>Romantic fantasy</option><option>Surreal dreamscape</option>
+            </optgroup>
+            <optgroup label="Comedy presets">
+              <option>Stand-up comedy</option><option>TV comedy</option><option>Sitcom</option><option>Slapstick comedy</option><option>Sketch comedy</option><option>Dark comedy</option><option>Parody</option><option>Surreal comedy</option>
+            </optgroup>
+          </select></label>
+          <label class="control"><span>Camera feel</span><select id="camera"><option>Automatic cinematic camera</option><option>Static composition</option><option>Gentle push-in</option><option>Smooth tracking shot</option><option>Handheld realism</option><option>Orbit around the subject</option><option>Crane reveal</option><option>Fast FPV movement</option></select></label>
+          <label class="control"><span>Shot flow</span><select id="flow"><option>Let H3 decide</option><option>One continuous shot</option><option>Multiple cinematic shots</option><option>Dynamic action sequence</option><option>Suspense / thriller buildup</option><option>Horror escalation and reveal</option><option>Fast commercial-style cuts</option><option>Slow, deliberate pacing</option></select></label>
+        </div>
+
+        <div class="duration-row">
+          <label><span>Video length</span><strong id="durationValue">8 seconds</strong></label>
+          <input id="duration" type="range" min="4" max="20" value="8" step="1">
+          <div class="range-labels"><span>4 sec</span><span>20 sec</span></div>
+        </div>
+
+        <div class="format-row">
+          <div><span class="field-label">Video shape</span><div class="segmented" id="ratioButtons"><button class="active" data-value="16:9">16:9</button><button data-value="9:16">9:16</button><button data-value="1:1">1:1</button><button data-value="21:9">21:9</button></div></div>
+          <label class="toggle"><input id="soundEnabled" type="checkbox" checked><span><b>Generate sound</b><small>Dialogue, effects and ambience</small></span></label>
+          <label class="quality"><span>Quality</span><select id="resolution"><option>2K</option><option>768P</option></select></label>
+        </div>
+
+        <details id="optionalDetails">
+          <summary><span>＋</span> Add optional details <small>Dialogue, sound, reference image or things to avoid</small></summary>
+          <div class="optional-grid">
+            <label class="control"><span>Dialogue or exact on-screen text</span><textarea id="dialogue" placeholder="Optional: exact words, speaker, logo or title text"></textarea></label>
+            <label class="control"><span>Sound or music direction</span><textarea id="sound" placeholder="Optional: ambience, sound effects, music mood"></textarea></label>
+            <label class="control"><span>Things to avoid</span><textarea id="avoid" placeholder="Optional: no extra text, no camera shake, no identity drift…"></textarea></label>
+            <label class="reference-toggle"><input id="referenceEnabled" type="checkbox"><span><b>I’m using a reference image</b><small>Keep its subject or product visually consistent.</small></span></label>
+            <label id="referenceField" class="control reference-field" hidden><span>What should stay consistent?</span><input id="referenceLock" placeholder="Example: face, blue jacket and hairstyle"></label>
+          </div>
+        </details>
+
+        <button class="generate-button" id="generateButton"><span>Generate optimized H3 prompt</span><b>⌘ ↵</b></button>
+        <div id="generationStatus" class="generation-status" hidden><i></i><span><b id="generationLabel">Sending your idea to Ollama…</b><small>Elapsed <em id="elapsed">0:00</em></small></span><button id="cancelButton">Cancel</button></div>
+      </div>
+
+      <aside class="output-card">
+        <div class="output-head"><div><span>YOUR H3 PROMPT</span><h2>Ready to copy</h2></div><div><button id="copyButton" title="Copy prompt">Copy</button><button id="downloadButton" title="Download prompt">↓</button></div></div>
+        <div class="badges"><span id="styleBadge">Cinematic realism</span><span id="durationBadge">8 sec</span><span id="ratioBadge">16:9</span><span id="soundBadge">Sound on</span></div>
+        <textarea id="promptOutput" maxlength="12000" placeholder="Your expanded prompt will appear here."></textarea>
+        <div class="output-meta"><span id="charCount">0 / 12,000</span><span id="message"></span></div>
+        <button class="secondary-button" id="regenerateButton">Regenerate</button>
+        <button class="companion-button" id="imagePromptButton" hidden><span>Create an image prompt</span><small>Starting frame or reference board</small></button>
+        <div class="tip"><b>Tip</b><p>You can edit the finished prompt directly before copying it into Hailuo.</p></div>
+      </aside>
+    </section>
+  </main>
+
+  <footer><span></span><div><a href="https://www.youtube.com/@BobDoyleMedia" target="_blank" rel="noreferrer">YouTube ↗</a></div></footer>
+
+  <dialog id="imagePromptDialog" class="image-prompt-dialog">
+    <button class="dialog-close" id="closeImagePrompt">×</button>
+    <span class="eyebrow">COMPANION IMAGE</span><h2>Create an image prompt</h2>
+    <p>Use the finished video prompt—including any edits you made—to create the right visual foundation.</p>
+    <div class="image-mode-grid">
+      <button data-image-mode="start"><b>Starting Image</b><span>The exact fully assembled opening frame where Shot 1 begins.</span></button>
+      <button data-image-mode="reference"><b>Reference Image</b><span>A clean multi-panel board of the recurring subjects, objects and environment.</span></button>
+    </div>
+    <button id="generateImageButton" class="generate-image-button" disabled>Generate Image</button>
+    <small class="generate-image-note">Creates a copyable image-generation prompt; it does not render the image inside this app.</small>
+    <div id="imagePromptStatus" class="image-prompt-status" hidden><i></i><span id="imagePromptStatusText">Generating image prompt…</span><button id="cancelImagePrompt">Cancel</button></div>
+    <textarea id="imagePromptOutput" maxlength="4000" placeholder="Choose Starting Image or Reference Image above."></textarea>
+    <button id="applyReferenceGuidance" class="apply-reference-button" hidden>Update video prompt to use this reference image</button>
+    <div class="image-prompt-footer"><span id="imagePromptMessage">Choose the kind of image you want to generate.</span><div><button id="regenerateImagePrompt" disabled>Regenerate</button><button id="copyImagePrompt" disabled>Copy image prompt</button></div></div>
+  </dialog>
+
+  <dialog id="historyDialog" class="history-dialog">
+    <button class="dialog-close" id="closeHistory">×</button>
+    <span class="eyebrow">PROMPT HISTORY</span><h2>Previous generations</h2>
+    <p>Choose an entry to restore its idea, every setting, optional detail and finished prompt.</p>
+    <input id="historySearch" class="history-search" type="search" placeholder="Search prompt history…">
+    <div id="historyList" class="history-list"><p class="history-empty">Loading history…</p></div>
+  </dialog>
+
+  <dialog id="settingsDialog">
+    <button class="dialog-close" id="closeSettings">×</button>
+    <span class="eyebrow">SETTINGS</span><h2>Local prompt engine</h2><p>Use the built-in prompt engine, Ollama, or one of your own GGUF models through llama.cpp. The selected LLM is used only to expand/build prompts; MiniMax generation stays separate.</p>
+    <section class="phone-access"><span>PHONE ACCESS · OPT IN</span><b id="networkAddress">Checking phone-access status…</b><p>Phone access is off by default.</p><button id="copyNetworkAddress">Copy phone address</button></section>
+    <label class="control"><span>LLM backend</span><select id="llmBackend"><option value="gguf" selected>Local GGUF / llama.cpp</option><option value="ollama">Ollama</option><option value="builtin">Built-in prompt engine only</option></select></label>
+    <div id="ollamaSettings">
+      <label class="control"><span>Ollama URL</span><input id="ollamaUrl" value="http://localhost:11434"></label>
+      <div class="settings-row"><label class="control"><span>Ollama model</span><select id="ollamaModel"><option value="">No model selected</option></select></label><button id="testOllamaButton">Find installed models</button></div>
+    </div>
+    <div id="ggufSettings">
+      <div class="settings-row"><label class="control"><span>GGUF folder</span><input id="ggufFolder" placeholder="Select the folder containing your .gguf files"></label><button id="browseGgufFolderButton">Browse folder…</button></div>
+      <div class="settings-row"><label class="control"><span>GGUF model</span><select id="ggufModel"><option value="">No GGUF model selected</option></select></label><button id="scanGgufButton">Scan GGUF folder</button></div>
+      <div class="settings-row"><label class="control"><span>llama-server.exe</span><input id="llamaRunner" placeholder="Select llama-server.exe"></label><button id="browseRunnerButton">Browse…</button><button id="downloadLlamaBundleButton" type="button">Download llama server bundle</button></div>
+      <label class="control"><span>Context size</span><select id="ggufContext"><option value="8192">8K</option><option value="16384" selected>16K</option><option value="32768">32K</option><option value="65536">64K</option></select></label>
+    </div>
+    <div class="model-controls"><button id="loadModelButton">Load selected model</button><button id="unloadModelButton">Unload model</button><button id="cancelModelLoadButton" hidden>Cancel model load</button></div>
+    <div id="modelLoadPanel" class="model-load-panel" hidden>
+      <div class="model-load-head"><b id="modelLoadTitle">Loading model…</b><span id="modelLoadElapsed">0:00</span></div>
+      <div class="model-load-track"><i id="modelLoadBar"></i></div>
+      <small id="modelLoadDetail">Waiting for the selected local LLM to become ready.</small>
+    </div>
+    <label class="control"><span>Request timeout</span><select id="timeout"><option value="60">1 minute</option><option value="90">90 seconds</option><option value="120" selected>2 minutes</option></select></label>
+    <div id="ollamaMessage" class="settings-message">Choose a local LLM backend and model, or use the built-in prompt engine.</div>
+  </dialog>
+
+  <dialog id="llamaDownloadDialog" class="download-dialog">
+    <button class="dialog-close" id="closeLlamaDownload">×</button>
+    <span class="eyebrow">LLAMA.CPP SETUP</span><h2>Download llama server bundle</h2>
+    <p id="llamaDownloadMessage">Preparing download…</p>
+    <div class="model-load-track"><i id="llamaDownloadBar"></i></div>
+    <div class="model-load-head"><b id="llamaDownloadStage">Starting…</b><span id="llamaDownloadPercent">0%</span></div>
+    <small id="llamaDownloadBytes">The popup can be closed; the download will continue in the background.</small>
+    <p class="settings-message" id="llamaDownloadError" hidden></p>
+  </dialog>
+
+  <script src="app.js?v=2.9.1-beta.2"></script>
+</body>
+</html>

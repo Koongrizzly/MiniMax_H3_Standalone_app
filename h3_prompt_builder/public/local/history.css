@@ -1,0 +1,19 @@
+.history-dialog { width: min(720px, calc(100vw - 24px)); }
+.history-dialog > p { color: var(--muted); font-size: 11px; margin: 0 0 14px; }
+.history-search { margin-bottom: 12px; }
+.history-list { display: grid; gap: 9px; max-height: min(58vh, 620px); overflow-y: auto; padding-right: 3px; }
+.history-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: #0b0d17; cursor: pointer; }
+.history-entry:hover { border-color: rgba(97, 220, 255, .48); background: #101522; }
+.history-entry h3 { margin: 0 0 4px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history-entry p { margin: 0 0 7px; color: var(--muted); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history-meta { display: flex; flex-wrap: wrap; gap: 5px; }
+.history-meta span { border: 1px solid var(--line); border-radius: 999px; padding: 3px 6px; color: #b7bdd0; font-size: 8px; }
+.history-actions { display: flex; gap: 6px; }
+.history-actions button { border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: #171a29; color: var(--cyan); cursor: pointer; }
+.history-actions .history-delete { color: #ff9caf; }
+.history-empty { margin: 20px 0; text-align: center; color: var(--muted); font-size: 11px; }
+@media (max-width: 600px) {
+  .history-dialog { padding: 20px 16px; }
+  .history-entry { grid-template-columns: 1fr; }
+  .history-actions button:first-child { flex: 1; }
+}
