@@ -302,21 +302,18 @@ def _load_audio_tail_32k(path, seconds):
     data=data[:data.size-(data.size%2)].reshape(-1,2).copy()
     return torch.from_numpy(data).unsqueeze(0)
 
-def prepare_audio_continue_conditioning(audio_vae, continue_video, continue_context_frames, fps=24.0):
-    """Encode source-tail audio strictly as pre-target H3 history conditioning.
+def prepare_audio_continue_conditioning(audio_vae, continue_video, audio_context_frames=24, fps=24.0):
+    """Encode the source tail as H3 audio history immediately before target time zero.
 
-    The final ~one video-frame worth of source audio is intentionally *not* placed
-    on the generated target's first instant.  That boundary conditioning caused
-    the beginning of a continuation segment to replay a short piece of the source
-    soundtrack even though the video had already advanced.  We keep the earlier
-    tail as context and discard that boundary slice so target audio starts newly
-    generated at frame 0 while still inheriting acoustic context from the source.
+    MiniMax H3 audio latents run at 40 Hz while video runs at 24 fps.  Continuation
+    therefore must be placed by model time, not by deleting a guessed number of audio
+    latents at the boundary.  The layout code end-aligns this complete latent window to
+    the generated target's audio origin.  Twenty-four video-frame equivalents are used
+    by default: exactly one second, which is exactly 40 H3 audio steps.
     """
     if not continue_video or audio_vae is None:
         return []
-    requested=max(1,int(continue_context_frames))
-    if requested > 1:
-        requested=((requested-1)//17)*17+1
+    requested=max(1,int(audio_context_frames))
     seconds=requested/float(fps)
     waveform=_load_audio_tail_32k(continue_video,seconds)
     if waveform is None:
@@ -329,17 +326,16 @@ def prepare_audio_continue_conditioning(audio_vae, continue_video, continue_cont
     if total <= 0:
         return []
 
-    # Reserve roughly one output-video-frame of 40 Hz audio latents at the end of
-    # the source tail.  Do NOT inject this reserved slice at target time zero: it
-    # is the part that was audibly repeated at clip joins.
-    dropped_boundary=min(total,max(1,round(40.0/float(fps))))
-    history=total-dropped_boundary
-    if history <= 0:
-        print(f"FL2VA audio continuation skipped: source={Path(continue_video).name} | audio tail too short after boundary exclusion",flush=True)
-        return []
-
-    print(f"FL2VA audio continuation context: source={Path(continue_video).name} | requested tail={seconds:.3f}s | audio latents={total} | history={history} | excluded boundary={dropped_boundary} | target audio starts fresh",flush=True)
-    return [{'anchor':'history','latent_frame_count':history,'latent':latent[...,:history]}]
+    expected_steps=seconds*40.0
+    phase_error_ms=(total-expected_steps)/40.0*1000.0
+    print(
+        f"FL2VA audio continuation context: source={Path(continue_video).name} | "
+        f"tail={requested} video-frame equivalents / {seconds:.3f}s | "
+        f"audio latents={total} (expected {expected_steps:.3f}, delta={phase_error_ms:+.2f}ms) | "
+        "full tail kept | end-aligned to target audio origin",
+        flush=True,
+    )
+    return [{'anchor':'history','latent_frame_count':total,'latent':latent}]
 
 def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=None, last_frame=None, continue_video=None, continue_context_frames=35):
     """Encode FL2VA image anchors and optional native temporal continuation history.

@@ -111,10 +111,10 @@ def main():
             if manager is not None:
                 manager.set_stage('vae')
                 manager.trim_cuda_cache(reason='pre-continue-audio-vae', force=True)
-            print('FL2VA source-audio memory: ENABLED (experimental; known repetition/duplication bugs)', flush=True)
+            print('FL2VA source-audio memory: ENABLED | 1.000s tail | 40 Hz timeline end-alignment', flush=True)
             print('Loading native audio VAE for continuation audio history...', flush=True)
             av_for_history=load_vae(Path(ns.audio_vae))
-            prepared_audio_keyframes=prepare_audio_continue_conditioning(av_for_history,ns.continue_video,ns.continue_context_frames,24.0)
+            prepared_audio_keyframes=prepare_audio_continue_conditioning(av_for_history,ns.continue_video,24,24.0)
             del av_for_history
             _flush_models()
             if ns.extended_logging: log_mem('after continuation audio VAE flush / before text encoder load', sync=True)
