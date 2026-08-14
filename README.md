@@ -3,19 +3,22 @@ MiniMax H3 INT4 Standalone
 A Windows desktop application for running MiniMax H3 locally on NVIDIA RTX GPUs using pre-quantized INT4 / W4A8 ConvRot model weights.
 (This project provides a standalone PySide6 GUI for MiniMax H3 video generation without requiring the user to install or launch ComfyUI. A minimal comfyui backend to load the models runs in the background)
 
+
 It supports:
 
 Text → video + audio (T2VA)
 
 First/last image/video → video + audio (FL2VA)
 
+Video To Video with sound memory + 'use last finished job' feature for automation (FL2VA)
+
 Reference image/video/audio → video + audio (Ref2VA)
 
 Native MiniMax H3 stereo audio generation
 
-Up to 60 seconds at 24 FPS in this standalone build
+Up to 30 seconds at 24 FPS + experimental : up to 100 seconds !
 
-MiniMax H3 4 step LoRAs included in the install
+MiniMax H3 4 step LoRA included in the installer
 
 Built-in generation queue
 
@@ -50,17 +53,15 @@ This standalone application focuses on running the H3-Base models locally with c
 Official MiniMax H3: Hugging Face: https://huggingface.co/MiniMaxAI/MiniMax-H3 / MiniMax: https://www.minimax.io / MiniMax GitHub: https://github.com/MiniMax-AI
 
 
-Quick install
 
-Requirements
+Quick install / Requirements
 
-Windows 10 or Windows 11
 
-NVIDIA RTX GPU
+Windows 10 or Windows 11 with NVIDIA RTX GPU
 
 Recent NVIDIA driver with CUDA 13-capable PyTorch support
 
-Miniconda or Anaconda
+Miniconda or Anaconda (not included in the installer)
 
 Enough free disk space for the selected models (40+ gigabyte)
 
@@ -73,17 +74,6 @@ This build was created specifically to make MiniMax H3 practical on consumer RTX
 
 The included VRAM Manager / VRAM Lab can selectively keep model weights on the GPU and offload them when required. If a job is estimated to fit in dedicated VRAM, VRAM Lab is automatically bypassed so the model can run without unnecessary offloading overhead.
 
-As a rough guide:
-
-Lower-VRAM RTX cards can run supported jobs by using the VRAM manager and more CPU/RAM offloading.
-
-16 GB+ VRAM cards benefit substantially because many normal jobs can keep much more of the model on the GPU.
-
-24 GB cards, such as an RTX 3090/4090, can run many 480p/704p jobs without VRAM Lab being involved at all.
-
-Very large resolutions, long clips and heavy reference jobs can still require offloading.
-
-Actual memory use and speed depend on resolution, frame count, reference inputs, LoRAs and generation settings.
 
 Installation
 
@@ -101,6 +91,7 @@ Or download the repository as a ZIP from GitHub and extract it.
 The installer expects conda.exe to be available either in a normal Miniconda/Anaconda installation location or on your PATH.
 
 Miniconda is enough; a full Anaconda installation is not required.
+
 
 3. Run install.bat
 
@@ -129,75 +120,17 @@ SageAttention 2.2.0.post6
 GUI
 PySide6
 
-The installer starts the model downloader and asks whether you want:
+The installer later starts the model downloader and asks whether you want:
 FL2VA only
 Ref2VA only
 Both
 It also offers available MiniMax H3 LoRAs.
-The model downloader fetches only the selected files. It does not download the full official MiniMax H3 repository.
 Large files use a multi-connection HTTP downloader to improve Hugging Face transfer speed without requiring Xet or leaving a large Xet cache behind.
 
 4. Start the application
 After installation, double-click:
 start.bat
-Model modes
-T2VA — Text to Video
-Uses the FL2VA checkpoint with no image conditioning.
-Enter a text prompt and MiniMax H3 generates synchronized video and audio.
 
-FL2VA — First / Last Frame to Video
-Uses the same FL2VA model as T2VA.
-You can supply:
-first frame only
-last frame only
-first + last frame
-neither image, which is normal T2VA
-The application previews selected images directly in the GUI.
-
-Ref2VA — Omni Reference to Video
-Uses the MiniMax H3 Ref2VA checkpoint.
-Supported reference groups in this standalone include:
-up to 9 reference images
-up to 3 reference videos
-up to 3 reference audio files
-Reference images are displayed as thumbnails and can be opened in the full image preview.
-
-VRAM management
-MiniMax H3 is a very large model. Simply loading every stage at the same time can cause Windows shared-memory spill, huge slowdowns or out-of-memory errors.
-This standalone therefore uses staged model loading:
-Visual/reference VAE work is performed.
-Required conditioning latents are moved away from VRAM.
-The VAE is released.
-The Qwen3-VL text encoder performs prompt/reference conditioning.
-The text encoder is released when possible.
-The diffusion model is loaded for sampling.
-Video/audio decoding is performed in separate stages.
-The Automatic VRAM Lab bypass checks the current GPU and job before sampling. When the job should fit in dedicated VRAM, the VRAM manager is completely bypassed. When it does not fit, the manager can use partial model residency/offloading to make larger jobs possible.
-
-The goal is:
-Use VRAM management only when it is actually needed.
-This is especially important on Windows, where excessive GPU spill into shared system memory can make a generation dramatically slower.
-
-Spectrum Feature Forecasting
-The application includes optional MiniMax H3 Spectrum Feature Forecasting.
-The implementation in this standalone was developed with the WanGP/Wan2GP MiniMax H3 Spectrum implementation by DeepBeepMeep used as a reference for the forecasting approach and settings.
-Spectrum attempts to predict selected later transformer feature states so that some expensive transformer passes can be skipped.
-Important
-Spectrum requires enough real sampling points before it can begin forecasting.
-It needs at least 6 denoising steps before it can activate.
-With very short schedules such as a 4-step Turbo LoRA generation, Spectrum remains inactive because there are not enough real transformer passes to build a useful forecast.
-Spectrum is an approximation and may change motion or fine detail, so it is Off by default.
-Credits to WanGP / Wan2GP for the settings, visit  GitHub: https://github.com/deepbeepmeep/Wan2GP Website: https://wangp.ai/
-
-SageAttention
-Optional SageAttention support is included and can be enabled from the GUI.
-The installer installs:
-Triton-Windows 3.6.x
-SageAttention 2.2.0.post6
-SageAttention can improve sampling speed on compatible NVIDIA hardware, but it is Off by default.
-Because alternative attention implementations can produce slightly different results from standard attention, users who prioritize reproducibility or maximum audio/video fidelity may prefer to keep SageAttention disabled.
-SageAttention: Project: https://github.com/thu-ml/SageAttention
-Triton-Windows: Project: https://github.com/woct0rdho/triton-windows
 
 Prompt Builder
 The application contains an integrated version of the Hailuo H3 Prompt Builder, an unofficial community prompt-building tool created by Bob Doyle Media.
@@ -209,37 +142,17 @@ INT4 / W4A8 ConvRot models
 The standalone uses community pre-quantized MiniMax H3 INT4 / W4A8 ConvRot model and text-encoder files.
 Credit for the INT4 ConvRot MiniMax H3 weights used as the basis for this setup goes to Winnougan.
 MiniMax H3 INT4 ConvRot repository:https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI
-Winnougan Hugging Face:https://huggingface.co/Winnougan
-
-
+Winnougan Hugging Face:https://huggingface.co/Winnougan.
 Please respect the licenses and usage terms of the original MiniMax H3 model and every upstream quantized checkpoint.
+
 
 ComfyUI components
 Although this is a standalone desktop application and does not require the user to run ComfyUI, parts of the backend use code/components originating from ComfyUI / Comfy-Org, including MiniMax H3 model loading, comfy_extras H3 support and VAE/model-management components.
 ComfyUI is licensed under GPL-3.0.
 ComfyUI GitHub: https://github.com/Comfy-Org/ComfyUI
 ComfyUI documentation: https://docs.comfy.org/
-
 Please see the repository license files for the licensing requirements that apply to redistributed ComfyUI-derived code.
-Built with
 
-The standalone application is primarily built with:
-Python 3.12
-PySide6 / Qt 6 — desktop GUI
-PyTorch 2.11 / CUDA 13.0
-TorchAudio
-ComfyUI backend components
-FFmpeg (downloads at first time use of the app)
-Triton-Windows
-Optional SageAttention
-Pillow / NumPy / AV and other Python runtime dependencies
-Local HTTP/WebEngine integration for the Prompt Builder
-
-The GUI, standalone installer, queue system, VRAM management integration and application-specific workflow are assembled as a Windows standalone application rather than a ComfyUI workflow.
-
-Some GUI resolution labels are friendly display names while the actual generation size follows MiniMax-compatible dimensions. For example, the GUI's 1280 × 720 preset generates at 1280 × 704.
-
-The official H3 model card describes the standard H3 system as supporting 4–15 second output, while this standalone exposes the working H3-Base frame range tested by this project.
 
 Troubleshooting
 
@@ -262,10 +175,6 @@ You can rerun the downloader later to install the second model or additional LoR
 Generation is extremely slow and shared GPU memory keeps increasing
 
 Enable extended logging and inspect the VRAM Manager output. Large jobs may require offloading, but normal jobs that fit should show the automatic VRAM bypass path.
-
-Spectrum does nothing
-
-Spectrum requires at least 6 generation steps. It intentionally stays inactive on shorter schedules.
 
 SageAttention changes the result
 
@@ -301,14 +210,6 @@ https://huggingface.co/Winnougan
 
 https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI
 
-DeepBeepMeep — WanGP / Wan2GP
-
-The WanGP MiniMax H3 Spectrum Feature Forecasting implementation was used as a reference for the Spectrum forecasting approach/settings used in this standalone.
-
-https://github.com/deepbeepmeep/Wan2GP
-
-https://wangp.ai/
-
 Bob Doyle Media
 
 Creator of the unofficial Hailuo H3 Prompt Builder integrated into the application.
@@ -333,22 +234,8 @@ Disclaimer
 
 This is an unofficial community project. It is not affiliated with or endorsed by MiniMax.
 
-MiniMax H3 and its official weights are subject to the MiniMax H3 Community License Agreement. Quantized checkpoints and included/upstream open-source components may have their own licenses.
-
-Before redistribution or commercial use, check the license terms for:
-
-MiniMax H3
-
-the INT4/W4A8 checkpoint source
-
-ComfyUI-derived code
-
-LoRAs
-
-all other bundled third-party components
 
 Repository
 
 https://github.com/Koongrizzly/MiniMax_H3_Standalone_app
 
-Issues, testing re
