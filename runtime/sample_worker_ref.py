@@ -198,13 +198,13 @@ def main():
     spectrum = None
     if ns.spectrum:
         from runtime.h3_spectrum import MiniMaxH3Spectrum, MIN_FIT_POINTS
-        if ns.steps <= MIN_FIT_POINTS:
-            print(f'[SPECTRUM] requested but inactive: {ns.steps} steps is too short; at least {MIN_FIT_POINTS + 1} steps are required before any transformer pass can be forecast.', flush=True)
+        if int(ns.steps) < MIN_FIT_POINTS + 2:
+            print(f'[SPECTRUM] requested but inactive: {ns.steps} steps is too short; at least {MIN_FIT_POINTS + 2} steps are required for two anchors, a forecast, and a native tail refresh.', flush=True)
         else:
             spectrum = MiniMaxH3Spectrum(total_steps=ns.steps, start_step=0, verbose=ns.extended_logging)
             opts = model.model_options.setdefault('transformer_options', {})
             opts['minimax_h3_spectrum'] = spectrum
-            print(f'[SPECTRUM] enabled | bundled feature forecasting | steps={ns.steps} | warm-up actual passes={MIN_FIT_POINTS}', flush=True)
+            print(f'[SPECTRUM] enabled | standalone H3 target-row feature forecasting | steps={ns.steps} | warm-up actual passes={MIN_FIT_POINTS}', flush=True)
     if ns.extended_logging: log_mem('after sigma patch / before sampler setup', sync=True)
     if ns.extended_logging: log_mem('after diffusion model load')
     diag_cleanup=(install_sampling_block_trace(model, ns.steps) if ns.extended_logging else (lambda: None))

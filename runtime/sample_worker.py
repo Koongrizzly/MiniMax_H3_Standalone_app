@@ -39,7 +39,7 @@ def main():
     ap.add_argument('--frames', type=int, required=True); ap.add_argument('--steps', type=int, required=True); ap.add_argument('--cfg', type=float, required=True)
     ap.add_argument('--seed', type=int, required=True); ap.add_argument('--shift', type=float, required=True); ap.add_argument('--audio-shift', type=float, required=True)
     ap.add_argument('--sampler', default='euler'); ap.add_argument('--scheduler', default='simple'); ap.add_argument('--out', required=True)
-    ap.add_argument('--first-frame'); ap.add_argument('--last-frame'); ap.add_argument('--continue-video'); ap.add_argument('--continue-context-frames', type=int, default=35); ap.add_argument('--continue-audio-memory', action='store_true')
+    ap.add_argument('--first-frame'); ap.add_argument('--last-frame'); ap.add_argument('--continue-video'); ap.add_argument('--continue-context-frames', type=int, default=39); ap.add_argument('--continue-audio-memory', action='store_true')
     ap.add_argument('--lora', action='append', default=[]); ap.add_argument('--lora-strength', action='append', type=float, default=[])
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable MiniMax H3 Spectrum feature forecasting')
@@ -162,13 +162,13 @@ def main():
     spectrum_controller = None
     if ns.spectrum:
         from runtime.h3_spectrum import MiniMaxH3Spectrum, MIN_FIT_POINTS
-        if int(ns.steps) <= MIN_FIT_POINTS:
-            print(f'[SPECTRUM] requested, but {ns.steps} denoise steps cannot benefit: the forecaster needs at least {MIN_FIT_POINTS} real feature points before it can skip a later step. Spectrum left inactive for this job.', flush=True)
+        if int(ns.steps) < MIN_FIT_POINTS + 2:
+            print(f'[SPECTRUM] requested, but {ns.steps} denoise steps cannot benefit: the forecaster needs {MIN_FIT_POINTS} real H3 anchors plus a later forecastable step. Spectrum left inactive for this job.', flush=True)
         else:
             spectrum_controller = MiniMaxH3Spectrum(total_steps=int(ns.steps), verbose=bool(ns.extended_logging))
             to = model.model_options['transformer_options'] = model.model_options.get('transformer_options', {}).copy()
             to['minimax_h3_spectrum'] = spectrum_controller
-            print(f'[SPECTRUM] enabled | degree=4 | warm-up={MIN_FIT_POINTS} actual steps | max consecutive forecasts=1 | implementation=bundled WanGP-style H3 feature forecasting', flush=True)
+            print(f'[SPECTRUM] enabled | degree=1 | warm-up={MIN_FIT_POINTS} actual steps | max consecutive forecasts=1 | implementation=standalone H3 target-row spectral forecasting', flush=True)
     if ns.extended_logging: log_mem('after sigma patch / before sampler setup', sync=True)
     if ns.extended_logging: log_mem('after diffusion model load')
     diag_cleanup=(install_sampling_block_trace(model, ns.steps) if ns.extended_logging else (lambda: None))
