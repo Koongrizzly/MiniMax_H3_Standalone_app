@@ -90,6 +90,7 @@ def main():
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable experimental MiniMax H3 Spectrum feature forecasting')
     ap.add_argument('--vram-manager', action='store_true')
+    ap.add_argument('--vram-managed-stage', action='append', choices=['reference','text','diffusion'], default=[], help='Limit VRAM Manager to selected worker stage(s); omitted means all stages')
     ap.add_argument('--vram-runtime-free-gb', type=float, default=0.5)
     ap.add_argument('--vram-text-headroom-gb', type=float, default=2.0)
     ap.add_argument('--vram-diffusion-headroom-gb', type=float, default=4.0)
@@ -121,6 +122,7 @@ def main():
             residency_refill_interval=max(1, ns.vram_residency_refill_interval),
             allocator_memory_fraction=min(0.99, max(0.50, ns.vram_allocator_fraction)),
             cache_trim_slack_gb=max(0.25, ns.vram_cache_trim_slack_gb),
+            managed_stages=tuple(ns.vram_managed_stage) or None,
         ), verbose=ns.extended_logging)
         manager.install(); manager.set_stage('text')
     if ns.frames>1433: raise ValueError('Maximum allowed requested frame count is 1433 (59.71 seconds at 24 FPS)')
@@ -129,7 +131,7 @@ def main():
     print(f'Generation settings: {ns.width}x{ns.height} | requested frames={ns.frames} | steps={ns.steps} | CFG={ns.cfg:g} | shift={ns.shift:g} | audio shift={ns.audio_shift:g} | sampler={ns.sampler} | scheduler={ns.scheduler} | seed={ns.seed}', flush=True)
     latent,frame_count=_empty_av_latent(ns.width,ns.height,ns.frames)
     ref_items=[]; ref_blocks=[]
-    if manager is not None: manager.set_stage('text')
+    if manager is not None: manager.set_stage('reference')
     print('Loading video VAE and encoding Ref2VA visual references...',flush=True); vv=load_vae(Path(ns.video_vae))
     for path in ns.ref_image[:9]:
         img=load_image(path); h,w=img.shape[1],img.shape[2]
@@ -149,7 +151,7 @@ def main():
         video_data.append((path,z,ch,cw,qwen,[i/2.0 for i in range(len(sample_idx))]))
     del vv; _flush_models()
     if ns.extended_logging: log_mem('after Ref2VA visual reference encode / VAE flush', sync=True)
-    if manager is not None: manager.set_stage('text')
+    if manager is not None: manager.set_stage('reference')
     print('Loading audio VAE and encoding Ref2VA audio references...',flush=True); avae=load_vae(Path(ns.audio_vae))
     with tempfile.TemporaryDirectory(prefix='h3_ref_audio_') as td:
         for path,z,ch,cw,qwen,timestamps in video_data:
@@ -161,10 +163,11 @@ def main():
             az,at=encode_audio(avae,load_audio(path)); az=_cpu_latent(az); ref_items.append({'type':'audio'}); ref_blocks.append({'kind':'audio','ref_audio_t':at,'audio_latent':az})
     del avae,video_data; _flush_models()
     if ns.extended_logging: log_mem('after Ref2VA audio reference encode / VAE flush', sync=True)
+    if manager is not None: manager.set_stage('text')
     qwen_patch=None
     if ns.extended_logging:
         _log_checkpoint('text encoder checkpoint', ns.text_encoder); log_mem('before text encoder load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
-    if ns.extended_logging or manager is not None:
+    if ns.extended_logging or (manager is not None and manager.is_stage_managed('text')):
         qwen_patch=_install_qwen_layer_trace(manager)
     print('Loading W4A8 text encoder for Ref2VA...',flush=True); clip=comfy.sd.load_clip([ns.text_encoder],clip_type=comfy.sd.CLIPType.MINIMAX)
     if ns.extended_logging: log_mem('after text encoder load')

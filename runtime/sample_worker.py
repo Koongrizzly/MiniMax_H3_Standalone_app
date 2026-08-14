@@ -44,6 +44,7 @@ def main():
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable MiniMax H3 Spectrum feature forecasting')
     ap.add_argument('--vram-manager', action='store_true')
+    ap.add_argument('--vram-managed-stage', action='append', choices=['reference','text','diffusion'], default=[], help='Limit VRAM Manager to selected worker stage(s); omitted means all stages')
     ap.add_argument('--vram-runtime-free-gb', type=float, default=0.5)
     ap.add_argument('--vram-text-headroom-gb', type=float, default=2.0)
     ap.add_argument('--vram-diffusion-headroom-gb', type=float, default=4.0)
@@ -79,6 +80,7 @@ def main():
             residency_refill_interval=max(1, ns.vram_residency_refill_interval),
             allocator_memory_fraction=min(0.99, max(0.50, ns.vram_allocator_fraction)),
             cache_trim_slack_gb=max(0.25, ns.vram_cache_trim_slack_gb),
+            managed_stages=tuple(ns.vram_managed_stage) or None,
         ), verbose=ns.extended_logging)
         manager.install(); manager.set_stage('text')
     load_trace_cleanup=(install_comfy_load_trace(comfy) if ns.extended_logging else (lambda: None))
@@ -92,7 +94,7 @@ def main():
         if ns.continue_video and not Path(ns.continue_video).is_file(): raise ValueError(f'Continue video not found: {ns.continue_video}')
         if ns.continue_context_frames < 1: raise ValueError('--continue-context-frames must be at least 1')
         if manager is not None:
-            manager.set_stage('vae')
+            manager.set_stage('reference')
             manager.trim_cuda_cache(reason='pre-keyframe-vae', force=True)
         print('Loading native video VAE for keyframe conditioning...', flush=True)
         if ns.extended_logging: log_mem('before keyframe VAE load', sync=True)
@@ -109,7 +111,7 @@ def main():
             if not ns.audio_vae:
                 raise ValueError('--audio-vae is required when --continue-audio-memory is enabled')
             if manager is not None:
-                manager.set_stage('vae')
+                manager.set_stage('reference')
                 manager.trim_cuda_cache(reason='pre-continue-audio-vae', force=True)
             print('FL2VA source-audio memory: ENABLED | 1.000s tail | 40 Hz timeline end-alignment', flush=True)
             print('Loading native audio VAE for continuation audio history...', flush=True)
@@ -128,7 +130,7 @@ def main():
     qwen_patch=None
     if ns.extended_logging:
         _log_checkpoint('text encoder checkpoint', ns.text_encoder); log_mem('before text encoder load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
-    if ns.extended_logging or manager is not None:
+    if ns.extended_logging or (manager is not None and manager.is_stage_managed('text')):
         qwen_patch=_install_qwen_layer_trace(manager)
     print('Loading W4A8 text encoder...', flush=True)
     clip=comfy.sd.load_clip([ns.text_encoder], clip_type=comfy.sd.CLIPType.MINIMAX)

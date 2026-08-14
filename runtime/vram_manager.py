@@ -24,6 +24,7 @@ class VRAMManagerConfig:
     allocator_memory_fraction: float = 0.94
     cache_trim_slack_gb: float = 2.0
     disable_comfy_pinned_offload: bool = True
+    managed_stages: tuple[str, ...] | None = None
 
 
 class VRAMManager:
@@ -65,6 +66,9 @@ class VRAMManager:
         self._orig_memory_fraction = None
         self._cache_trim_events = 0
         self._orig_max_pinned_memory = None
+        self._orig_extra_reserved_vram = getattr(self.mm, "EXTRA_RESERVED_VRAM", 0)
+        self._allocator_guard_active = False
+        self._pinned_guard_active = False
 
     @staticmethod
     def _gb(n: int) -> str:
@@ -83,11 +87,27 @@ class VRAMManager:
     def load_headroom_bytes(self) -> int:
         if self.stage == "diffusion":
             gb = self.cfg.diffusion_load_headroom_gb
-        elif self.stage == "vae":
+        elif self.stage == "reference":
             gb = self.cfg.vae_load_headroom_gb
         else:
             gb = self.cfg.text_load_headroom_gb
         return max(self.runtime_floor_bytes(), int(float(gb) * _GIB))
+
+    @staticmethod
+    def _normalize_stage(stage: str) -> str:
+        value = str(stage).lower().strip()
+        if value.startswith("diff"):
+            return "diffusion"
+        if value.startswith("ref") or value.startswith("vae") or value.startswith("key"):
+            return "reference"
+        return "text"
+
+    def is_stage_managed(self, stage: str | None = None) -> bool:
+        stages = self.cfg.managed_stages
+        if not stages:
+            return True
+        value = self._normalize_stage(stage if stage is not None else self.stage)
+        return value in {self._normalize_stage(x) for x in stages}
 
     def _set_comfy_reserve(self, nbytes: int):
         try:
@@ -96,22 +116,22 @@ class VRAMManager:
             pass
 
     def set_stage(self, stage: str):
-        value = str(stage).lower()
-        if value.startswith("diff"):
-            self.stage = "diffusion"
-        elif value.startswith("vae"):
-            self.stage = "vae"
+        self.stage = self._normalize_stage(stage)
+        managed = self.is_stage_managed(self.stage)
+        if managed:
+            self._set_comfy_reserve(self.load_headroom_bytes())
         else:
-            self.stage = "text"
-        self._set_comfy_reserve(self.load_headroom_bytes())
+            self._set_comfy_reserve(int(self._orig_extra_reserved_vram or 0))
+        self._sync_stage_guards(managed)
         self._log(
-            f"stage={self.stage} | load headroom={self._gb(self.load_headroom_bytes())} | "
+            f"stage={self.stage} | mode={'managed' if managed else 'native'} | "
+            f"load headroom={self._gb(self.load_headroom_bytes()) if managed else 'original/default'} | "
             f"runtime floor={self._gb(self.runtime_floor_bytes())}",
             force=True,
         )
 
     def _install_allocator_guard(self):
-        if not torch.cuda.is_available():
+        if self._allocator_guard_active or not torch.cuda.is_available():
             return
         frac = float(getattr(self.cfg, "allocator_memory_fraction", 0.94) or 0.94)
         frac = min(0.99, max(0.50, frac))
@@ -122,6 +142,7 @@ class VRAMManager:
             self._orig_memory_fraction = None
         try:
             torch.cuda.set_per_process_memory_fraction(frac)
+            self._allocator_guard_active = True
             _, total = self._cuda_free()
             limit = int(float(total) * frac) if total is not None else 0
             self._log(
@@ -133,7 +154,7 @@ class VRAMManager:
             self._log(f"V9 CUDA allocator guard unavailable: {exc}", force=True)
 
     def trim_cuda_cache(self, reason: str = "runtime", force: bool = False) -> int:
-        if not torch.cuda.is_available():
+        if not self.is_stage_managed() or not torch.cuda.is_available():
             return 0
         try:
             allocated = int(torch.cuda.memory_allocated())
@@ -172,12 +193,13 @@ class VRAMManager:
         return released
 
     def _install_pinned_offload_guard(self):
-        if not bool(getattr(self.cfg, "disable_comfy_pinned_offload", True)):
+        if self._pinned_guard_active or not bool(getattr(self.cfg, "disable_comfy_pinned_offload", True)):
             return
         try:
             self._orig_max_pinned_memory = getattr(self.mm, "MAX_PINNED_MEMORY", None)
             total_pinned = int(getattr(self.mm, "TOTAL_PINNED_MEMORY", 0) or 0)
             self.mm.MAX_PINNED_MEMORY = 0
+            self._pinned_guard_active = True
             self._log(
                 "V9 Comfy host pinning disabled for MiniMax worker | "
                 f"previous pin budget={self._gb(int(self._orig_max_pinned_memory)) if isinstance(self._orig_max_pinned_memory, (int, float)) and self._orig_max_pinned_memory > 0 else self._orig_max_pinned_memory} | "
@@ -187,15 +209,47 @@ class VRAMManager:
         except Exception as exc:
             self._log(f"V9 Comfy host-pinning guard unavailable: {exc}", force=True)
 
+    def _restore_allocator_guard(self):
+        if not self._allocator_guard_active or not torch.cuda.is_available():
+            return
+        try:
+            if self._orig_memory_fraction is not None:
+                torch.cuda.set_per_process_memory_fraction(self._orig_memory_fraction)
+        except Exception:
+            pass
+        self._allocator_guard_active = False
+
+    def _restore_pinned_offload_guard(self):
+        if not self._pinned_guard_active:
+            return
+        try:
+            self.mm.MAX_PINNED_MEMORY = self._orig_max_pinned_memory
+        except Exception:
+            pass
+        self._pinned_guard_active = False
+
+    def _sync_stage_guards(self, managed: bool):
+        # The allocator ceiling is a diffusion spill guard. Native Qwen/VAE stages
+        # should keep the normal allocator behaviour. Host pinning follows whether
+        # the current stage is actually managed.
+        if managed and self.stage == "diffusion":
+            self._install_allocator_guard()
+        else:
+            self._restore_allocator_guard()
+        if managed:
+            self._install_pinned_offload_guard()
+        else:
+            self._restore_pinned_offload_guard()
+
     def install(self):
         if self._orig_load_models_gpu is not None:
             return
-        self._install_allocator_guard()
-        self._install_pinned_offload_guard()
         self._orig_load_models_gpu = self.mm.load_models_gpu
         manager = self
 
         def managed_load_models_gpu(models, *args, **kwargs):
+            if not manager.is_stage_managed():
+                return manager._orig_load_models_gpu(models, *args, **kwargs)
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
             manager._set_comfy_reserve(reserve)
@@ -264,10 +318,20 @@ class VRAMManager:
                     f"force_full_load={kwargs.get('force_full_load', False)}",
                     force=True,
                 )
-            # Never turn a partial MiniMax load into a full load from this wrapper.
-            if manager.stage == "diffusion" and kwargs.get('force_full_load', False):
+            # Comfy's CLIP constructor explicitly requests force_full_load=True.
+            # On lower-VRAM GPUs that forces the entire ~17 GiB Qwen onto CUDA and
+            # defeats partial residency. Override it only when the text stage was
+            # independently selected for management.
+            if manager.stage in ("text", "diffusion") and kwargs.get('force_full_load', False):
                 kwargs['force_full_load'] = False
-                manager._log("V9 sampling admission guard: force_full_load=True overridden to False", force=True)
+                if manager.stage == "text":
+                    manager._log(
+                        "Qwen admission guard: force_full_load=True overridden to False; "
+                        "partial CUDA residency is allowed",
+                        force=True,
+                    )
+                else:
+                    manager._log("V9 sampling admission guard: force_full_load=True overridden to False", force=True)
 
             out = manager._orig_load_models_gpu(models, *call_args, **kwargs)
             if first_load:
@@ -283,13 +347,14 @@ class VRAMManager:
 
         self.mm.load_models_gpu = managed_load_models_gpu
         self._log(
-            "enabled V9 MiniMax residency control | "
+            "enabled V10 stage-aware MiniMax residency control | "
             f"offload chunk={int(self.cfg.offload_chunk_mb)} MiB | "
             f"max resident weights={'auto' if self.cfg.max_resident_weights_gb <= 0 else f'{self.cfg.max_resident_weights_gb:.2f} GiB'} | "
             f"check every {max(1, int(self.cfg.block_check_interval))} block(s) | "
             f"residency fill={'on' if self.cfg.residency_fill_enabled else 'off'} "
             f"target free={self._gb(self.residency_target_free_bytes())} "
-            f"warm-up={max(0, int(self.cfg.residency_warmup_blocks))} block(s)",
+            f"warm-up={max(0, int(self.cfg.residency_warmup_blocks))} block(s) | "
+            f"managed stages={','.join(self.cfg.managed_stages) if self.cfg.managed_stages else 'all'}",
             force=True,
         )
 
@@ -306,17 +371,9 @@ class VRAMManager:
             except Exception:
                 pass
             self._orig_load_models_gpu = None
-        if self._orig_max_pinned_memory is not None:
-            try:
-                self.mm.MAX_PINNED_MEMORY = self._orig_max_pinned_memory
-            except Exception:
-                pass
-            self._orig_max_pinned_memory = None
-        if self._orig_memory_fraction is not None and torch.cuda.is_available():
-            try:
-                torch.cuda.set_per_process_memory_fraction(self._orig_memory_fraction)
-            except Exception:
-                pass
+        self._restore_pinned_offload_guard()
+        self._restore_allocator_guard()
+        self._set_comfy_reserve(int(self._orig_extra_reserved_vram or 0))
         self._log(
             f"disabled after {self._events} offload event(s), {self._fill_events} residency fill event(s), "
             f"{self._cache_trim_events} cache trim event(s), filled={self._gb(self._fill_bytes)}",
@@ -488,6 +545,8 @@ class VRAMManager:
         return loaded_more
 
     def maybe_check_blocks(self, reason: str = "block"):
+        if not self.is_stage_managed():
+            return
         self._block_calls += 1
         interval = max(1, int(self.cfg.block_check_interval))
         if self._block_calls % interval == 0:
@@ -515,6 +574,9 @@ class VRAMManager:
             self.fill_residency(reason=f"post-block {name}")
 
     def install_sampling_hooks(self, model):
+        if not self.is_stage_managed("diffusion"):
+            self._log("diffusion stage is native; sampling residency hooks not installed", force=True)
+            return lambda: None
         try:
             modules = list(model.model.named_modules())
         except Exception:
