@@ -1231,6 +1231,10 @@ class MainWindow(QMainWindow):
         self.clear_cancelled_btn.setToolTip("Remove cancelled jobs from this queue history only. Files on disk are not deleted.")
         self.clear_cancelled_btn.clicked.connect(self._clear_cancelled_jobs)
         clearrow.addWidget(self.clear_cancelled_btn)
+        self.clear_failed_btn = QPushButton("Clear failed")
+        self.clear_failed_btn.setToolTip("Remove failed jobs from this queue history only. Files on disk are not deleted.")
+        self.clear_failed_btn.clicked.connect(self._clear_failed_jobs)
+        clearrow.addWidget(self.clear_failed_btn)
         self.clear_finished_btn = QPushButton("Clear finished / failed jobs")
         self.clear_finished_btn.setToolTip("Remove finished and failed jobs from this queue history only. Output files on disk are not deleted.")
         self.clear_finished_btn.clicked.connect(self._clear_finished_jobs)
@@ -1537,6 +1541,11 @@ class MainWindow(QMainWindow):
         self.queue_jobs=[j for j in self.queue_jobs if j.get("state") not in ("finished","failed")]
         self._save_queue_state(); self._refresh_queue_views()
 
+    def _clear_failed_jobs(self):
+        # Separate cleanup for failed jobs only; generated files remain untouched.
+        self.queue_jobs=[j for j in self.queue_jobs if j.get("state") != "failed"]
+        self._save_queue_state(); self._refresh_queue_views()
+
     def _clear_cancelled_jobs(self):
         # Separate cleanup requested so cancelled tests can be removed without
         # also clearing successful/failed history. Never deletes output files.
@@ -1677,6 +1686,15 @@ class MainWindow(QMainWindow):
         self.status.setText("Preparing FFmpeg tools…")
         proc.start()
         return False
+
+    def _latest_non_cancelled_queue_job(self):
+        # "Continue last result" should ignore cancelled tests.  Everything else
+        # still counts as the latest prior queue job, including failed jobs, so
+        # a failure in the chain stops continuation instead of silently skipping it.
+        candidates=[j for j in self.queue_jobs if j.get("state") != "cancelled"]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda j: float(j.get("created_at") or 0))
 
     def _start_next_pending(self):
         if self.proc and self.proc.state()!=QProcess.ProcessState.NotRunning: return
@@ -2597,13 +2615,13 @@ class MainWindow(QMainWindow):
             if manual_continue_video and not Path(manual_continue_video).is_file():
                 QMessageBox.warning(self,"Video missing","The selected Continue video file does not exist."); return
             if continue_last:
-                previous=max(self.queue_jobs, key=lambda j: float(j.get("created_at") or 0), default=None)
+                previous=self._latest_non_cancelled_queue_job()
                 if previous is None:
-                    QMessageBox.warning(self,"No previous queue job","Continue last result needs an earlier queue job to continue from. Add or finish a source job first."); return
-                if previous.get("state") in ("failed","cancelled"):
-                    QMessageBox.warning(self,"Previous job unavailable",f"The last queue job is {previous.get('state')} and cannot be used as a continuation source."); return
+                    QMessageBox.warning(self,"No previous queue job","Continue last result needs an earlier non-cancelled queue job to continue from. Add or finish a source job first."); return
+                if previous.get("state")=="failed":
+                    QMessageBox.warning(self,"Previous job failed","The latest non-cancelled queue job failed and continuation stops there. Remove the failed job or run a new successful source job first."); return
                 if previous.get("state")=="finished" and not Path(previous.get("output","")).is_file():
-                    QMessageBox.warning(self,"Previous output missing","The last queue job is finished but its output file is missing."); return
+                    QMessageBox.warning(self,"Previous output missing","The latest non-cancelled queue job is finished but its output file is missing."); return
                 continue_from_job_id=previous.get("id")
             if glue_results and not (manual_continue_video or continue_last):
                 QMessageBox.warning(self,"Glue source required","Glue results requires either a selected Continue video or Continue last result."); return
