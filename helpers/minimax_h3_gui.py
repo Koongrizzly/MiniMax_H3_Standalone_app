@@ -666,6 +666,7 @@ class MainWindow(QMainWindow):
         self.builder_template_default_applied = False
         self.prompt_webview = None
         self.queue_jobs = []
+        self._next_job_number_value = 1
         self.current_job_id = None
         self._termination_action = None
         self._proc_buffer = ""
@@ -1249,9 +1250,9 @@ class MainWindow(QMainWindow):
         self.queue_summary.setToolTip("Live queue counts. Jobs are persisted in presets\\setsave\\minimax_h3_queue.json.")
         right_layout.addWidget(self.queue_summary)
 
-        self.running_tree = self._make_queue_tree(["Started", "Elapsed", "Progress", "Resolution", "Seed", "Output", "Model"])
-        self.pending_tree = self._make_queue_tree(["Queued", "Status", "Resolution", "Seed", "Output", "Model"])
-        self.finished_tree = self._make_queue_tree(["Done at", "Status", "Took", "Resolution", "Duration", "Seed", "Output", "Model"])
+        self.running_tree = self._make_queue_tree(["Job", "Started", "Elapsed", "Progress", "Dependency", "Source resolved", "Resolution", "Seed", "Output", "Model"])
+        self.pending_tree = self._make_queue_tree(["Job", "Queued", "Status", "Dependency", "Source resolved", "Resolution", "Seed", "Output", "Model"])
+        self.finished_tree = self._make_queue_tree(["Job", "Done at", "Status", "Dependency", "Source resolved", "Took", "Resolution", "Duration", "Seed", "Output", "Model"])
 
         # Enough room to inspect several jobs at once.  Each tree keeps its own
         # scrollbar for longer lists, while the right column itself can scroll.
@@ -1328,6 +1329,101 @@ class MainWindow(QMainWindow):
     def _job_by_id(self, jid):
         return next((j for j in self.queue_jobs if j.get("id")==jid),None)
 
+    def _ensure_queue_job_numbers(self):
+        """Give every persisted queue entry a stable human-readable Job #."""
+        used=set()
+        for job in self.queue_jobs:
+            try:
+                n=int(job.get("job_number") or 0)
+            except Exception:
+                n=0
+            if n > 0 and n not in used:
+                job["job_number"]=n
+                used.add(n)
+            else:
+                job.pop("job_number", None)
+
+        # Old queue files had UUIDs only. Assign their numbers chronologically,
+        # without changing the queue's actual list/order semantics.
+        missing=[(i,j) for i,j in enumerate(self.queue_jobs) if not j.get("job_number")]
+        missing.sort(key=lambda pair:(float(pair[1].get("created_at") or 0), pair[0]))
+        next_number=max(used, default=0)+1
+        for _, job in missing:
+            while next_number in used:
+                next_number += 1
+            job["job_number"]=next_number
+            used.add(next_number)
+            next_number += 1
+
+        # Cache the dependency's display number in the child too, so a historical
+        # source can still be identified after its queue-history row is removed.
+        by_id={j.get("id"):j for j in self.queue_jobs if j.get("id")}
+        for job in self.queue_jobs:
+            dep_id=job.get("continue_from_job_id")
+            if dep_id and not job.get("continue_from_job_number"):
+                dep=by_id.get(dep_id)
+                if dep and dep.get("job_number"):
+                    job["continue_from_job_number"]=int(dep["job_number"])
+
+        self._next_job_number_value=max(int(getattr(self,"_next_job_number_value",1) or 1), max(used, default=0)+1)
+
+    def _take_next_job_number(self):
+        self._ensure_queue_job_numbers()
+        number=int(self._next_job_number_value)
+        self._next_job_number_value=number+1
+        return number
+
+    def _job_number_text(self, job):
+        try:
+            return f"Job #{int(job.get('job_number'))}"
+        except Exception:
+            return "Job #?"
+
+    def _dependency_display(self, job):
+        if not job.get("continue_last_result"):
+            return "—"
+        dep=self._job_by_id(job.get("continue_from_job_id"))
+        dep_number=job.get("continue_from_job_number")
+        if dep_number is None and dep is not None:
+            dep_number=dep.get("job_number")
+        try:
+            label=f"Job #{int(dep_number)}"
+        except Exception:
+            label="previous job"
+
+        if dep is None:
+            return f"Missing: {label}"
+        if job.get("state")=="pending" and dep.get("state") != "finished":
+            return f"Waiting for: {label}"
+        if job.get("state")=="failed" and dep.get("state") != "finished":
+            return f"Blocked by: {label}"
+        if job.get("state")=="failed" and not Path(dep.get("output", "")).is_file():
+            return f"Blocked by: {label}"
+        return f"Continues: {label}"
+
+    def _resolved_source_display(self, job):
+        source=str(job.get("resolved_continue_source") or "")
+        if not source and not job.get("continue_last_result"):
+            source=str(job.get("manual_continue_video") or "")
+        if not source:
+            return "—"
+        return Path(source).name or source
+
+    def _apply_queue_dependency_tooltips(self, item, job, dependency_col, source_col):
+        dep_id=job.get("continue_from_job_id")
+        if dep_id:
+            dep=self._job_by_id(dep_id)
+            dep_number=job.get("continue_from_job_number") or (dep.get("job_number") if dep else None)
+            detail=f"Dependency: Job #{dep_number}" if dep_number else "Dependency: previous queue job"
+            if dep:
+                detail += f"\nState: {dep.get('state','unknown')}\nExpected output: {dep.get('output','—')}"
+            else:
+                detail += "\nThis dependency is no longer present in queue history."
+            item.setToolTip(dependency_col, detail)
+        source=str(job.get("resolved_continue_source") or job.get("manual_continue_video") or "")
+        if source:
+            item.setToolTip(source_col, source)
+
     def _fmt_clock(self, epoch):
         if not epoch: return "—"
         return time.strftime("%H:%M:%S", time.localtime(float(epoch)))
@@ -1380,6 +1476,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_queue_views(self):
         if not hasattr(self,"running_tree"): return
+        self._ensure_queue_job_numbers()
         self.running_tree.setUpdatesEnabled(False); self.pending_tree.setUpdatesEnabled(False); self.finished_tree.setUpdatesEnabled(False)
         try:
             self.running_tree.clear(); self.pending_tree.clear(); self.finished_tree.clear()
@@ -1388,13 +1485,16 @@ class MainWindow(QMainWindow):
             normal_brush=QBrush(QColor("#e8eef6")); failed_brush=QBrush(QColor("#ff8f8f")); done_brush=QBrush(QColor("#9be7b0"))
             for j in self.queue_jobs:
                 state=j.get("state")
+                job_label=self._job_number_text(j)
+                dependency=self._dependency_display(j)
+                source=self._resolved_source_display(j)
                 seed=str(j.get("actual_seed") if j.get("actual_seed") is not None else j.get("seed","—"))
                 res=j.get("resolution","—"); out=Path(j.get("output","")).name or "—"; model=self._short_model(j)
                 item=None
                 if state=="running":
                     counts["running"]+=1
                     elapsed=now-float(j.get("started_at") or now)
-                    vals=[self._fmt_clock(j.get("started_at")),self._fmt_elapsed(elapsed),"",res,seed,out,model]
+                    vals=[job_label,self._fmt_clock(j.get("started_at")),self._fmt_elapsed(elapsed),"",dependency,source,res,seed,out,model]
                     item=QTreeWidgetItem(vals); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.running_tree.addTopLevelItem(item)
                     pb=QProgressBar(); p=j.get("progress")
                     if p is None:
@@ -1402,7 +1502,8 @@ class MainWindow(QMainWindow):
                     else:
                         pb.setRange(0,100); pb.setValue(int(p)); pb.setFormat(f"Sampling %p%")
                     pb.setStyleSheet("QProgressBar{background:#111820;color:#e8eef6;border:1px solid #334556;text-align:center;} QProgressBar::chunk{background:#126680;}")
-                    self.running_tree.setItemWidget(item,2,pb)
+                    self.running_tree.setItemWidget(item,3,pb)
+                    self._apply_queue_dependency_tooltips(item,j,4,5)
                 elif state=="pending":
                     counts["pending"]+=1
                     pending_status = j.get("phase") or "Waiting"
@@ -1410,7 +1511,8 @@ class MainWindow(QMainWindow):
                         pending_status = "Waiting for FFmpeg setup…"
                     elif self._ffmpeg_setup_failed and not ffmpeg_tools_ready():
                         pending_status = "FFmpeg setup failed"
-                    item=QTreeWidgetItem([self._fmt_clock(j.get("created_at")),pending_status,res,seed,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
+                    item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("created_at")),pending_status,dependency,source,res,seed,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
+                    self._apply_queue_dependency_tooltips(item,j,3,4)
                 elif state in ("finished","failed","cancelled"):
                     counts["finished"]+=1
                     status="Finished" if state=="finished" else ("Cancelled" if state=="cancelled" else "Failed")
@@ -1419,14 +1521,15 @@ class MainWindow(QMainWindow):
                         clip_duration = self._probe_clip_duration(j.get("output"), j.get("frames"))
                         if clip_duration is not None:
                             j["clip_duration"] = clip_duration
-                    item=QTreeWidgetItem([self._fmt_clock(j.get("finished_at")),status,self._fmt_elapsed(j.get("elapsed",0)),res,self._fmt_clip_duration(clip_duration),seed,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.finished_tree.addTopLevelItem(item)
+                    item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("finished_at")),status,dependency,source,self._fmt_elapsed(j.get("elapsed",0)),res,self._fmt_clip_duration(clip_duration),seed,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.finished_tree.addTopLevelItem(item)
+                    self._apply_queue_dependency_tooltips(item,j,3,4)
                     brush=done_brush if state=="finished" else failed_brush
                     for c in range(item.columnCount()): item.setForeground(c,brush)
                 elif state=="interrupted":
-                    # Normally this exists only briefly during startup before the recovery dialog.
                     counts["pending"]+=1
-                    item=QTreeWidgetItem([self._fmt_clock(j.get("created_at")),"Recovery pending",res,seed,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
+                    item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("created_at")),"Recovery pending",dependency,source,res,seed,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
                     item.setToolTip(0,"Interrupted by the previous application shutdown; recovery decision pending.")
+                    self._apply_queue_dependency_tooltips(item,j,3,4)
                 if item is not None and state not in ("finished","failed","cancelled"):
                     for c in range(item.columnCount()): item.setForeground(c,normal_brush)
             if hasattr(self,"running_group"): self.running_group.setTitle(f"Running jobs ({counts['running']})")
@@ -1492,9 +1595,9 @@ class MainWindow(QMainWindow):
                     return
 
                 elapsed = now - float(job.get("started_at") or now)
-                item.setText(1, self._fmt_elapsed(elapsed))
+                item.setText(2, self._fmt_elapsed(elapsed))
 
-                pb = self.running_tree.itemWidget(item, 6)
+                pb = self.running_tree.itemWidget(item, 3)
                 if pb is None:
                     continue
                 progress = job.get("progress")
@@ -1615,7 +1718,8 @@ class MainWindow(QMainWindow):
     def _save_queue_state(self):
         PRESET_DIR.mkdir(parents=True,exist_ok=True)
         try:
-            payload=json.dumps({"version":2,"saved_at":time.time(),"jobs":self.queue_jobs},indent=2,ensure_ascii=False)
+            self._ensure_queue_job_numbers()
+            payload=json.dumps({"version":3,"saved_at":time.time(),"next_job_number":self._next_job_number_value,"jobs":self.queue_jobs},indent=2,ensure_ascii=False)
             tmp=QUEUE_FILE.with_suffix(QUEUE_FILE.suffix+".tmp")
             tmp.write_text(payload,encoding="utf-8")
             os.replace(str(tmp),str(QUEUE_FILE))
@@ -1625,7 +1729,7 @@ class MainWindow(QMainWindow):
     def _load_queue_state(self):
         if not QUEUE_FILE.is_file(): self._refresh_queue_views(); return
         try:
-            data=json.loads(QUEUE_FILE.read_text(encoding="utf-8")); self.queue_jobs=list(data.get("jobs",[]))
+            data=json.loads(QUEUE_FILE.read_text(encoding="utf-8")); self.queue_jobs=list(data.get("jobs",[])); self._next_job_number_value=max(1,int(data.get("next_job_number") or 1))
             # Migrate queue entries created before the inference launchers moved into helpers/.
             for j in self.queue_jobs:
                 args=j.get("args")
@@ -1635,6 +1739,7 @@ class MainWindow(QMainWindow):
             # A process cannot still belong to this freshly-started GUI. Preserve it as interrupted until user decides.
             for j in self.queue_jobs:
                 if j.get("state")=="running": j["state"]="interrupted"; j["cancel_reason"]="Application closed while this job was running."
+            self._ensure_queue_job_numbers()
         except Exception as exc:
             self.queue_jobs=[]
             if hasattr(self,"log"): self.append_log(f"Queue load warning: {exc}\n")
@@ -1772,13 +1877,13 @@ class MainWindow(QMainWindow):
             if dep_id:
                 dep = self._job_by_id(dep_id)
                 if dep is None:
-                    candidate["state"]="failed"; candidate["phase"]="Failed"; candidate["finished_at"]=time.time(); candidate["error"]="Continue last result dependency no longer exists in the queue history."; queue_changed=True; continue
+                    candidate["state"]="failed"; candidate["phase"]="Failed"; candidate["finished_at"]=time.time(); candidate["error"]=f"Continue dependency Job #{candidate.get('continue_from_job_number') or '?'} no longer exists in the queue history."; queue_changed=True; continue
                 if dep.get("state") in ("failed","cancelled"):
-                    candidate["state"]="failed"; candidate["phase"]="Failed"; candidate["finished_at"]=time.time(); candidate["error"]=f"Previous chained job did not finish successfully ({dep.get('state')})."; queue_changed=True; continue
+                    candidate["state"]="failed"; candidate["phase"]="Failed"; candidate["finished_at"]=time.time(); candidate["error"]=f"Dependency {self._job_number_text(dep)} did not finish successfully ({dep.get('state')})."; queue_changed=True; continue
                 if dep.get("state") != "finished":
                     continue
                 if not Path(dep.get("output", "")).is_file():
-                    candidate["state"]="failed"; candidate["phase"]="Failed"; candidate["finished_at"]=time.time(); candidate["error"]="Previous chained job finished but its output file is missing."; queue_changed=True; continue
+                    candidate["state"]="failed"; candidate["phase"]="Failed"; candidate["finished_at"]=time.time(); candidate["error"]=f"Dependency {self._job_number_text(dep)} finished but its output file is missing."; queue_changed=True; continue
             job=candidate; break
         if queue_changed:
             self._save_queue_state(); self._refresh_queue_views()
@@ -2662,7 +2767,7 @@ class MainWindow(QMainWindow):
             if lp and float(strength.value()) != 0.0 and not Path(lp).is_file():
                 QMessageBox.critical(self, "LoRA missing", f"Selected LoRA file was not found:\n{lp}"); return
         args=[script,"--width",str(w),"--height",str(h),"--frames",str(frames),"--steps",str(self.steps.value()),"--cfg",str(self.cfg.value()),"--shift",str(self.shift.value()),"--audio-shift",str(self.audio_shift.value()),"--seed",str(self.seed.value()),"--sampler",self.sampler.currentText(),"--scheduler",self.scheduler.currentText(),"--prompt",prompt]
-        continue_last=False; continue_from_job_id=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False
+        continue_last=False; continue_from_job_id=None; continue_from_job_number=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False
         if mode==1:
             continue_last=self.continue_last_result.isChecked()
             glue_results=self.glue_results.isChecked()
@@ -2683,6 +2788,7 @@ class MainWindow(QMainWindow):
                 if previous.get("state")=="finished" and not Path(previous.get("output","")).is_file():
                     QMessageBox.warning(self,"Previous output missing","The latest non-cancelled queue job is finished but its output file is missing."); return
                 continue_from_job_id=previous.get("id")
+                continue_from_job_number=previous.get("job_number")
             if glue_results and not (manual_continue_video or continue_last):
                 QMessageBox.warning(self,"Glue source required","Glue results requires either a selected Continue video or Continue last result."); return
             if not self.first.path() and not self.last.path() and not manual_continue_video and not continue_last:
@@ -2723,7 +2829,7 @@ class MainWindow(QMainWindow):
         args += ["--output",str(out)]
         model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
         model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
-        job={"id":uuid.uuid4().hex,"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 35) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
+        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 35) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
 
