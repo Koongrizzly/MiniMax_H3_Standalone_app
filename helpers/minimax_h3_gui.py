@@ -154,6 +154,16 @@ class SystemHud(QLabel):
         self.setTextFormat(Qt.TextFormat.RichText)
         self.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
         self.setMinimumHeight(36)
+        # The HUD is intentionally a single rich-text line. During generation the
+        # JOB phase can become much longer than the idle text (for example VAE /
+        # continuation loading messages). QLabel's normal horizontal size hint then
+        # tries to make the *entire main layout* wide enough for that text, which can
+        # push the right edge of the Generation tab outside a maximized Windows
+        # client area. A manual resize appeared to fix it only because Qt renegotiated
+        # the layout at that point. The HUD must consume whatever width is available;
+        # it must never dictate the application's minimum/preferred width.
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.setToolTip("Live GPU VRAM/load/temperature, DDR RAM, CPU load, network traffic above 100 KB/s, and local date/time.")
         self._last_net = None
         self._last_net_t = time.monotonic()
@@ -645,6 +655,8 @@ class MainWindow(QMainWindow):
         self.resize(1180, 900)
         self._user_window_size_override = False
         self._window_state_guard_pending = False
+        self._layout_refresh_pending = False
+        self._main_scroll_pages = []
         self.proc = None
         self.builder_process = None
         self.builder_port = 0
@@ -682,10 +694,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(10000, self._startup_update_check)
 
     def _scroll_page(self, content: QWidget) -> QScrollArea:
-        # Keep the vertical scroll path stable.  With ScrollBarAsNeeded Qt can
-        # temporarily decide that a dynamically-updated page fits, hide the bar,
-        # and then leave the child at the viewport height until a window resize.
-        # Queue/HUD/log updates make that race especially visible on Windows.
+        # These pages are vertical-scroll-only.  Do NOT apply SetMinimumSize to
+        # the whole page: on Windows that can preserve a pre-maximize width from
+        # a child/layout sizeHint, while the horizontal scrollbar is deliberately
+        # disabled.  The result is a clipped right edge until the user restores
+        # and maximizes the window again.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -694,12 +707,49 @@ class MainWindow(QMainWindow):
         try:
             lay = content.layout()
             if lay is not None:
-                lay.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+                lay.setSizeConstraint(QLayout.SizeConstraint.SetDefaultConstraint)
         except Exception:
             pass
-        content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        # Ignore horizontal size hints so long labels/path controls cannot make
+        # the hidden horizontal dimension wider than the visible viewport.
+        content.setMinimumWidth(0)
+        content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         scroll.setWidget(content)
+        self._main_scroll_pages.append(scroll)
         return scroll
+
+    def _schedule_layout_refresh(self):
+        if self._layout_refresh_pending or self._closing:
+            return
+        self._layout_refresh_pending = True
+        QTimer.singleShot(0, self._refresh_main_layout)
+
+    def _refresh_main_layout(self):
+        """Recalculate width-sensitive tab contents after a native resize/state change."""
+        self._layout_refresh_pending = False
+        if self._closing:
+            return
+        try:
+            central = self.centralWidget()
+            if central is not None and central.layout() is not None:
+                central.layout().invalidate()
+                central.layout().activate()
+            self.tabs.updateGeometry()
+            for scroll in self._main_scroll_pages:
+                content = scroll.widget()
+                if content is None:
+                    continue
+                content.setMinimumWidth(0)
+                content.updateGeometry()
+                lay = content.layout()
+                if lay is not None:
+                    lay.invalidate()
+                    lay.activate()
+                scroll.updateGeometry()
+                scroll.viewport().update()
+        except RuntimeError:
+            # A late queued refresh can race with application shutdown.
+            pass
 
     def _build(self):
         root = QWidget(); outer = QVBoxLayout(root); outer.setContentsMargins(10, 10, 10, 10); outer.setSpacing(8)
@@ -795,7 +845,9 @@ class MainWindow(QMainWindow):
 
         loras = QGroupBox("LoRA adapters (up to 3)"); lf = QFormLayout(loras)
         lnote = QLabel(f"Optional MiniMax H3 diffusion-model LoRAs. Browse starts in {DEFAULT_LORA_DIR}. Files from any other folder can also be selected. Strength 1.0 = normal; 0 disables that slot.")
-        lnote.setWordWrap(True); lf.addRow(lnote)
+        lnote.setWordWrap(True)
+        lnote.setMinimumWidth(0)
+        lf.addRow(lnote)
         self.lora_rows = []
         for i in range(3):
             row = QWidget(); rl = QHBoxLayout(row); rl.setContentsMargins(0,0,0,0)
@@ -2718,6 +2770,12 @@ class MainWindow(QMainWindow):
     def cancel_job(self):
         self._stop_running_job("cancel")
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Qt/Windows can finalize maximized client geometry one event after the
+        # initial show.  Re-run width-sensitive layouts against the real viewport.
+        self._schedule_layout_refresh()
+
     def _restore_expected_maximized_state(self):
         """Undo accidental/programmatic restores while respecting the user."""
         self._window_state_guard_pending = False
@@ -2731,6 +2789,7 @@ class MainWindow(QMainWindow):
 
     def changeEvent(self, event):
         if event.type() == QEvent.Type.WindowStateChange:
+            self._schedule_layout_refresh()
             state = self.windowState()
             minimized = bool(state & Qt.WindowState.WindowMinimized)
             maximized = bool(state & Qt.WindowState.WindowMaximized)
@@ -2776,5 +2835,6 @@ def main():
     # Start in the state most users keep this control-heavy GUI in.  A later
     # manual restore/resize is respected by MainWindow.changeEvent().
     w.showMaximized()
+    QTimer.singleShot(0, w._schedule_layout_refresh)
     return app.exec()
 if __name__ == "__main__": raise SystemExit(main())
