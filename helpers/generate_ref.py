@@ -15,7 +15,7 @@ from runtime.ffmpeg_tools import ensure_ffmpeg_tools, tool_path
 def main():
     ap = argparse.ArgumentParser(description="MiniMax-H3 Ref2VA W4A8 standalone generator")
     ap.add_argument("--prompt", required=True); ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--frames", type=int, default=362); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
+    ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0); ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
     ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
@@ -50,7 +50,10 @@ def main():
     if len(ns.lora) > 3: print("ERROR: maximum 3 LoRAs are supported"); return 2
     for lp in ns.lora:
         if not Path(lp).is_file(): print(f"ERROR: LoRA not found: {lp}"); return 2
-    if ns.frames > 1433: print("ERROR: maximum allowed requested frame count is 1433 (59.71 seconds at 24 FPS)"); return 2
+    max_frames = 2385 if ns.experimental_long_duration else 719
+    if ns.frames > max_frames:
+        mode_name = "experimental long-duration" if ns.experimental_long_duration else "normal"
+        print(f"ERROR: maximum allowed requested frame count in {mode_name} mode is {max_frames} ({max_frames / 24.0:.3f} seconds at 24 FPS)"); return 2
     if ns.width % 32 or ns.height % 32: print("ERROR: width and height must be valid preset values divisible by 32"); return 2
     if not (ns.ref_image or ns.ref_video or ns.ref_audio): print("ERROR: Ref2VA needs at least one reference"); return 2
 
@@ -95,6 +98,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="h3_ref_isolated_", dir=str(ROOT / "output")) as td:
         td = Path(td); lat = td / "latents.pt"; frames_dir = td / "frames"; wav = td / "audio.wav"
         cmd = [py, "-m", "runtime.sample_worker_ref", "--diffusion", str(ref), "--text-encoder", str(te), "--video-vae", str(vv), "--audio-vae", str(av), "--prompt", ns.prompt, "--width", str(ns.width), "--height", str(ns.height), "--frames", str(ns.frames), "--steps", str(ns.steps), "--cfg", str(ns.cfg), "--seed", str(ns.seed), "--shift", str(ns.shift), "--audio-shift", str(ns.audio_shift), "--sampler", ns.sampler, "--scheduler", ns.scheduler, "--ref-image-size", ns.ref_image_size, "--out", str(lat)]
+        if ns.experimental_long_duration: cmd += ["--experimental-long-duration"]
         if ns.spectrum: cmd += ["--spectrum"]
         sample_env = os.environ.copy()
         comfy_args = []

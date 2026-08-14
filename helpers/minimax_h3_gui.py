@@ -399,7 +399,10 @@ RESOLUTION_PRESETS = {
     "1920 × 1088":{"16:9": (1920, 1088),"9:16": (1088, 1920),"1:1": (1088, 1088)},
 }
 DEFAULT_RESOLUTION = "832 × 480"
-FRAME_PRESETS = sorted(set(list(range(124, 1434, 17)) + [480]))
+NORMAL_FRAME_MAX = 719   # last H3 native-grid value below 30 seconds (29.958 s at 24 FPS)
+EXPERIMENTAL_FRAME_MAX = 2385  # last H3 native-grid value at/below 100 seconds (99.375 s at 24 FPS)
+FRAME_PRESETS = sorted(set(list(range(124, NORMAL_FRAME_MAX + 1, 17)) + [480]))
+EXPERIMENTAL_FRAME_PRESETS = sorted(set(list(range(124, EXPERIMENTAL_FRAME_MAX + 1, 17)) + [480]))
 SAMPLERS = [
     "euler", "euler_cfg_pp", "euler_ancestral", "euler_ancestral_cfg_pp",
     "heun", "heunpp2", "dpm_2", "dpm_2_ancestral", "dpmpp_2m",
@@ -799,11 +802,14 @@ class MainWindow(QMainWindow):
         for x in FRAME_PRESETS:
             self.frames.addItem(f"{x} frames — {x / 24.0:.2f} s", x)
         self._set_frame_count(362)
+        self.experimental_long_duration = QCheckBox("Experimental long duration")
+        self.experimental_long_duration.setChecked(False)
+        self.experimental_long_duration.toggled.connect(self._sync_long_duration_mode)
         self.steps = QSpinBox(); self.steps.setRange(1, 100); self.steps.setValue(15)
         self.seed = QSpinBox(); self.seed.setRange(-1, 98_999_999); self.seed.setValue(-1); self.seed.setSpecialValueText("-1 (random)")
         form.addRow("Mode", self.mode)
         rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
-        form.addRow("Frames", self.frames); form.addRow("Steps", self.steps); form.addRow("Seed", self.seed)
+        form.addRow("Frames", self.frames); form.addRow("", self.experimental_long_duration); form.addRow("Steps", self.steps); form.addRow("Seed", self.seed)
         v.addWidget(basic)
 
         pg = QGroupBox("Prompt"); pgl = QVBoxLayout(pg)
@@ -1093,7 +1099,36 @@ class MainWindow(QMainWindow):
             self.frames.setCurrentIndex(idx)
 
     def _nearest_frame_preset(self, wanted: int) -> int:
-        return min(FRAME_PRESETS, key=lambda n: (abs(n - wanted), n))
+        presets = EXPERIMENTAL_FRAME_PRESETS if getattr(self, "experimental_long_duration", None) and self.experimental_long_duration.isChecked() else FRAME_PRESETS
+        return min(presets, key=lambda n: (abs(n - wanted), n))
+
+    def _sync_long_duration_mode(self, enabled):
+        """Expose H3's native-grid long-duration research values without changing normal mode."""
+        current = self._frame_count()
+        presets = EXPERIMENTAL_FRAME_PRESETS if bool(enabled) else FRAME_PRESETS
+        self.frames.blockSignals(True)
+        self.frames.clear()
+        for x in presets:
+            self.frames.addItem(f"{x} frames — {x / 24.0:.2f} s", x)
+        if not enabled and current > NORMAL_FRAME_MAX:
+            current = NORMAL_FRAME_MAX
+        nearest = min(presets, key=lambda n: (abs(n - current), n))
+        idx = self.frames.findData(nearest)
+        if idx >= 0:
+            self.frames.setCurrentIndex(idx)
+        self.frames.blockSignals(False)
+        if enabled:
+            self.frames.setToolTip(
+                "MiniMax H3 long-duration research mode. Values follow the model's native 17k+5 frame grid at 24 FPS, "
+                "through 2385 frames = 99.375 seconds. Values above 30 seconds require this experimental mode. "
+                "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM."
+            )
+        else:
+            self.frames.setToolTip(
+                "Fixed MiniMax H3 frame count at 24 FPS. Normal mode stops at 719 frames = 29.96 seconds. "
+                "Enable Experimental long duration for values above 30 seconds, up to 2385 frames = 99.38 seconds. "
+                "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM. Default: 362 frames."
+            )
 
     def _apply_prompt_builder_payload(self, payload):
         try:
@@ -1118,7 +1153,7 @@ class MainWindow(QMainWindow):
         except Exception:
             seconds = 0.0
         if seconds > 0:
-            wanted = min(1433, max(FRAME_PRESETS[0], int(round(seconds * 24))))
+            wanted = min(NORMAL_FRAME_MAX, max(FRAME_PRESETS[0], int(round(seconds * 24))))
             chosen = self._nearest_frame_preset(wanted)
             self._set_frame_count(chosen)
 
@@ -2156,8 +2191,13 @@ class MainWindow(QMainWindow):
         )
         self.resolved.setToolTip("Exact width × height that will be sent to the backend for the selected aspect ratio.")
         self.frames.setToolTip(
-            "Fixed MiniMax H3 frame count with its duration at 24 FPS. Experimental extended native durations are available up to "
-            "1433 frames = 59.71 seconds. 600 frames = exactly 25.00 seconds. Default: 362 frames."
+            "Fixed MiniMax H3 frame count at 24 FPS. Normal mode stops at 719 frames = 29.96 seconds. "
+            "Enable Experimental long duration for values above 30 seconds, up to 2385 frames = 99.38 seconds. "
+            "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM. Default: 362 frames."
+        )
+        self.experimental_long_duration.setToolTip(
+            "Unlock long-duration research values beyond the normal ~60 second range. H3 uses a native 17k+5 frame grid; "
+            "the list includes 2164 frames (~90.17 s) and 2895 frames (~120.63 s). This is a research switch, not a claim that H3 remains stable for the full range."
         )
         self.steps.setToolTip("Number of diffusion/sampling steps. More steps take longer. Default: 15.")
         self.seed.setToolTip("Random seed. Use -1 for a new random seed each generation. Default: -1 (random).")
@@ -2362,7 +2402,7 @@ class MainWindow(QMainWindow):
 
     def settings_dict(self):
         return {
-            "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "frames": self._frame_count(),
+            "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
             "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 35),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
@@ -2397,6 +2437,8 @@ class MainWindow(QMainWindow):
             saved_res = {"Low / test": "576 × 320", "480p": "832 × 480", "768p": "1344 × 768", "1080p": "1920 × 1088"}.get(saved_res, saved_res)
             if saved_res in RESOLUTION_PRESETS: self.res_class.setCurrentText(saved_res)
             else: self.res_class.setCurrentText(DEFAULT_RESOLUTION)
+            self.experimental_long_duration.setChecked(bool(d.get("experimental_long_duration", False)))
+            self._sync_long_duration_mode(self.experimental_long_duration.isChecked())
             self._set_frame_count(d.get("frames", 362))
             self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", "")); self.continue_video.edit.setText(d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",35)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
@@ -2757,7 +2799,10 @@ class MainWindow(QMainWindow):
         if not prompt: QMessageBox.warning(self,"Prompt required","Enter a prompt before adding the job to the queue."); return
         if not PYTHON.is_file(): QMessageBox.critical(self,"Environment missing",f"Missing {PYTHON}"); return
         mode=self.mode.currentIndex(); w,h=RESOLUTION_PRESETS[self.res_class.currentText()][self.aspect.currentText()]; frames=self._frame_count()
-        if frames>1433: QMessageBox.critical(self,"Invalid frames","This standalone test build allows up to 1433 frames (59.71 seconds at 24 FPS)."); return
+        long_mode = self.experimental_long_duration.isChecked()
+        max_frames = EXPERIMENTAL_FRAME_MAX if long_mode else NORMAL_FRAME_MAX
+        if frames > max_frames:
+            QMessageBox.critical(self, "Invalid frames", f"Maximum frame count for the selected mode is {max_frames} ({max_frames / 24.0:.2f} seconds at 24 FPS)."); return
         # Generation always gets first claim on VRAM. If the integrated Prompt Builder
         # currently has a local LLM loaded, unload it exactly like its Settings button.
         self._unload_prompt_builder_llm_for_generation()
@@ -2767,6 +2812,8 @@ class MainWindow(QMainWindow):
             if lp and float(strength.value()) != 0.0 and not Path(lp).is_file():
                 QMessageBox.critical(self, "LoRA missing", f"Selected LoRA file was not found:\n{lp}"); return
         args=[script,"--width",str(w),"--height",str(h),"--frames",str(frames),"--steps",str(self.steps.value()),"--cfg",str(self.cfg.value()),"--shift",str(self.shift.value()),"--audio-shift",str(self.audio_shift.value()),"--seed",str(self.seed.value()),"--sampler",self.sampler.currentText(),"--scheduler",self.scheduler.currentText(),"--prompt",prompt]
+        if long_mode:
+            args += ["--experimental-long-duration"]
         continue_last=False; continue_from_job_id=None; continue_from_job_number=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False
         if mode==1:
             continue_last=self.continue_last_result.isChecked()

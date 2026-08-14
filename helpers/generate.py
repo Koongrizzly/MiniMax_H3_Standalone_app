@@ -19,7 +19,7 @@ def main():
     ap = argparse.ArgumentParser(description="MiniMax-H3 W4A8 ConvRot standalone generator")
     ap.add_argument("--prompt", default="A cinematic red sports car races through rain-soaked neon streets at night, dynamic tracking camera, realistic reflections and natural engine sound.")
     ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--frames", type=int, default=362); ap.add_argument("--steps", type=int, default=15)
+    ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15)
     ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
     ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
@@ -76,8 +76,10 @@ def main():
 
     if ns.seed is None or int(ns.seed) < 0: ns.seed = int.from_bytes(os.urandom(4), "little") % 99_000_000
     else: ns.seed = int(ns.seed) % 99_000_000
-    if int(ns.frames) > 1433:
-        print("ERROR: maximum allowed requested frame count is 1433 (59.71 seconds at 24 FPS)"); return 2
+    max_frames = 2385 if ns.experimental_long_duration else 719
+    if int(ns.frames) > max_frames:
+        mode_name = "experimental long-duration" if ns.experimental_long_duration else "normal"
+        print(f"ERROR: maximum allowed requested frame count in {mode_name} mode is {max_frames} ({max_frames / 24.0:.3f} seconds at 24 FPS)"); return 2
     width = int(ns.width); height = int(ns.height)
     if width % 32 or height % 32:
         print("ERROR: width and height must be valid preset values divisible by 32"); return 2
@@ -231,6 +233,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="h3_isolated_", dir=str(ROOT / "output")) as td:
         td = Path(td); lat = td / "latents.pt"; frames_dir = td / "frames"; wav = td / "audio.wav"
         sample_cmd = [py, "-m", "runtime.sample_worker", "--diffusion", str(diff), "--text-encoder", str(te), "--prompt", ns.prompt, "--width", str(width), "--height", str(height), "--frames", str(ns.frames), "--steps", str(ns.steps), "--cfg", str(ns.cfg), "--seed", str(ns.seed), "--shift", str(ns.shift), "--audio-shift", str(ns.audio_shift), "--sampler", ns.sampler, "--scheduler", ns.scheduler, "--out", str(lat)]
+        if ns.experimental_long_duration: sample_cmd += ["--experimental-long-duration"]
         if ns.spectrum: sample_cmd += ["--spectrum"]
         sample_env = os.environ.copy()
         comfy_args = []
