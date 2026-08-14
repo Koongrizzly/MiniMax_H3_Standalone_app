@@ -43,6 +43,7 @@ def main():
     ap.add_argument('--lora', action='append', default=[]); ap.add_argument('--lora-strength', action='append', type=float, default=[])
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable MiniMax H3 Spectrum feature forecasting')
+    ap.add_argument('--experimental-long-duration', action='store_true', help='Allow native-grid research durations up to 2385 frames')
     ap.add_argument('--vram-manager', action='store_true')
     ap.add_argument('--vram-managed-stage', action='append', choices=['reference','text','diffusion'], default=[], help='Limit VRAM Manager to selected worker stage(s); omitted means all stages')
     ap.add_argument('--vram-runtime-free-gb', type=float, default=0.5)
@@ -63,7 +64,8 @@ def main():
     torch.set_grad_enabled(False)
     if len(ns.lora) != len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora) > 3: raise ValueError('Maximum 3 LoRAs are supported')
-    if ns.frames > 1433: raise ValueError('Maximum allowed requested frame count is 1433 (59.71 seconds at 24 FPS)')
+    max_frames = 2385 if ns.experimental_long_duration else 719
+    if ns.frames > max_frames: raise ValueError(f'Maximum allowed requested frame count is {max_frames} ({max_frames / 24.0:.3f} seconds at 24 FPS)')
     manager=None
     if ns.vram_manager:
         manager=VRAMManager(comfy, VRAMManagerConfig(

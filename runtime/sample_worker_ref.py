@@ -89,6 +89,7 @@ def main():
     ap.add_argument('--lora',action='append',default=[]); ap.add_argument('--lora-strength',action='append',type=float,default=[])
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable experimental MiniMax H3 Spectrum feature forecasting')
+    ap.add_argument('--experimental-long-duration', action='store_true', help='Allow native-grid research durations up to 2385 frames')
     ap.add_argument('--vram-manager', action='store_true')
     ap.add_argument('--vram-managed-stage', action='append', choices=['reference','text','diffusion'], default=[], help='Limit VRAM Manager to selected worker stage(s); omitted means all stages')
     ap.add_argument('--vram-runtime-free-gb', type=float, default=0.5)
@@ -125,7 +126,8 @@ def main():
             managed_stages=tuple(ns.vram_managed_stage) or None,
         ), verbose=ns.extended_logging)
         manager.install(); manager.set_stage('text')
-    if ns.frames>1433: raise ValueError('Maximum allowed requested frame count is 1433 (59.71 seconds at 24 FPS)')
+    max_frames = 2385 if ns.experimental_long_duration else 719
+    if ns.frames > max_frames: raise ValueError(f'Maximum allowed requested frame count is {max_frames} ({max_frames / 24.0:.3f} seconds at 24 FPS)')
     load_trace_cleanup=(install_comfy_load_trace(comfy) if ns.extended_logging else (lambda: None))
     if ns.extended_logging: log_mem('V8 worker baseline before Ref2VA stages', sync=True)
     print(f'Generation settings: {ns.width}x{ns.height} | requested frames={ns.frames} | steps={ns.steps} | CFG={ns.cfg:g} | shift={ns.shift:g} | audio shift={ns.audio_shift:g} | sampler={ns.sampler} | scheduler={ns.scheduler} | seed={ns.seed}', flush=True)
