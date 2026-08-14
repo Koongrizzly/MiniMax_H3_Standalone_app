@@ -821,7 +821,7 @@ class MainWindow(QMainWindow):
         self.last = FileRow("Last frame image", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
         self.continue_video = VideoPathRow("optional source video to continue")
         self.continue_context = QComboBox()
-        for n in (18, 35, 52, 69, 86, 103): self.continue_context.addItem(f"{n} frames ({n/24:.2f} s)", n)
+        for n in (22, 39, 56, 73, 90, 107): self.continue_context.addItem(f"{n} history frames ({n/24:.2f} s)", n)
         self.continue_context.setCurrentIndex(1)
         self.glue_results = QCheckBox("Glue results")
         self.glue_results.setChecked(False)
@@ -1932,7 +1932,7 @@ class MainWindow(QMainWindow):
         else:
             continue_source=str(job.get("manual_continue_video") or "")
         if continue_source:
-            run_args += ["--continue-video", continue_source, "--continue-context-frames", str(int(job.get("continue_context_frames") or 35))]
+            run_args += ["--continue-video", continue_source, "--continue-context-frames", str(int(job.get("continue_context_frames") or 39))]
             if job.get("continue_last_result") and job.get("continue_audio_memory"):
                 run_args += ["--continue-audio-memory"]
             if job.get("glue_results"):
@@ -1980,9 +1980,9 @@ class MainWindow(QMainWindow):
         self.sage_attention_enabled.setToolTip("This affects transformer attention during sampling only; isolated video/audio VAE workers keep their normal attention path. Default: Off.")
         v.addWidget(self.sage_attention_enabled)
 
-        self.spectrum_enabled = QCheckBox("Enable Spectrum feature forecasting (needs at least 6 steps to get activated)")
+        self.spectrum_enabled = QCheckBox("Enable Spectrum feature forecasting")
         self.spectrum_enabled.setChecked(False)
-        self.spectrum_enabled.setToolTip("Uses the bundled pure-PyTorch MiniMax H3 Spectrum feature forecaster. It starts with real transformer passes, then forecasts selected later feature states. With the current 4-step Turbo LoRA it stays inactive because there are not enough sampling points to forecast safely.")
+        self.spectrum_enabled.setToolTip("Uses the standalone MiniMax H3 Spectrum forecaster. It learns from real H3 target audio/video hidden states and skips selected later transformer evaluations. Conservative scheduling allows a 4-step Euler/Turbo run to forecast one middle step while keeping native refresh and final steps.")
         v.addWidget(self.spectrum_enabled)
 
         self.play_result_finished = QCheckBox("Play result when finished")
@@ -2131,7 +2131,7 @@ class MainWindow(QMainWindow):
             "ComfyUI is licensed under GPL-3.0.\n\n"
             "INT4 model and text-encoder files used by this install are sourced from Winnougan / "
             "MiniMax-H3-INT4_Convrot_ComfyUI on Hugging Face.\n\n"
-            "Spectrum Feature Forecasting support is adapted from the MiniMax H3 Spectrum implementation in WanGP by DeepBeepMeep.\n\n"
+            "Spectrum Feature Forecasting is a standalone MiniMax H3 implementation based on the published Adaptive Spectral Feature Forecasting method by Han et al.\n\n"
             "The integrated Hailuo H3 Prompt Builder is an unofficial community tool created by Bob Doyle Media; "
             "its local server/UI was adapted here with standalone local-LLM and GGUF support."
         )
@@ -2196,8 +2196,9 @@ class MainWindow(QMainWindow):
             "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM. Default: 362 frames."
         )
         self.experimental_long_duration.setToolTip(
-            "Unlock long-duration research values beyond the normal ~60 second range. H3 uses a native 17k+5 frame grid; "
-            "the list includes 2164 frames (~90.17 s) and 2895 frames (~120.63 s). This is a research switch, not a claim that H3 remains stable for the full range."
+            "Unlock experimental H3 durations above the normal 30-second range. Values follow the native 17k+5 frame grid "
+            "up to 2385 frames = 99.38 seconds. The maximum duration that will actually run depends on available system RAM "
+            "and GPU VRAM; this switch exposes research values and does not guarantee that every resolution or hardware setup can reach 100 seconds."
         )
         self.steps.setToolTip("Number of diffusion/sampling steps. More steps take longer. Default: 15.")
         self.seed.setToolTip("Random seed. Use -1 for a new random seed each generation. Default: -1 (random).")
@@ -2210,7 +2211,7 @@ class MainWindow(QMainWindow):
         self.continue_video.setToolTip("Native H3 FL2VA continuation. The model receives a VAE-encoded block of preceding motion plus the source video's final frame as the exact boundary anchor; this is not last-frame-only I2V.")
         self.glue_results.setToolTip("When enabled, keep the complete source video first and append the newly generated continuation after it. No continuation overlap frames are trimmed from either clip during the glue step.")
         self.continue_last_result.setToolTip("Ignore the manual Continue video field and use the exact previous queue job as this job's continuation source. Pending chained jobs wait for that specific job to finish; the output folder is never scanned for the newest file.")
-        self.continue_context.setToolTip("How many final source frames H3 receives for continuation. Values follow the model's 17k+1 overlap grid. 35 frames (~1.46 s) is the default test value.")
+        self.continue_context.setToolTip("How many source-motion history frames H3 receives before the separate final-frame boundary anchor. Values use H3's native 17k+5 temporal grid so source motion and generated motion stay on the same 24 FPS model clock. 39 history frames (~1.63 s) is the default.")
         self.ref_size.setToolTip(
             "How Ref2VA prepares reference images. 'match' follows the generation/reference sizing behavior; "
             "'max' uses the maximum reference sizing path. Default: match."
@@ -2404,7 +2405,7 @@ class MainWindow(QMainWindow):
         return {
             "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
-            "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 35),
+            "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(),
             "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
@@ -2441,7 +2442,7 @@ class MainWindow(QMainWindow):
             self._sync_long_duration_mode(self.experimental_long_duration.isChecked())
             self._set_frame_count(d.get("frames", 362))
             self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", "")); self.continue_video.edit.setText(d.get("continue_video", ""))
-            ctx=int(d.get("continue_context_frames",35)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
+            ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", []))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
@@ -2876,7 +2877,7 @@ class MainWindow(QMainWindow):
         args += ["--output",str(out)]
         model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
         model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
-        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 35) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
+        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
 
