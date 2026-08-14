@@ -1473,7 +1473,7 @@ class MainWindow(QMainWindow):
             if job.get("state")=="finished" and Path(job.get("output","")).is_file():
                 play=menu.addAction("Play clip")
                 loaded=(self.preview_path and Path(self.preview_path)==Path(job.get("output","")))
-                delete_disk=menu.addAction("Delete from disk" + (" (currently loaded)" if loaded else ""))
+                delete_disk=menu.addAction("Delete from disk + queue" + (" (currently loaded)" if loaded else ""))
             if job.get("state") in ("failed","cancelled"):
                 reason=menu.addAction("Show why it failed / stopped")
             menu.addSeparator()
@@ -1532,9 +1532,17 @@ class MainWindow(QMainWindow):
         if self.preview_path and Path(self.preview_path)==path and self.media_player:
             self.media_player.stop(); self.media_player.setSource(QUrl()); self.preview_path=""; self.preview_label.setText("Preview unloaded.")
         try:
-            if path.is_file(): path.unlink()
-            job["output_deleted"]=True; self._save_queue_state(); self._refresh_queue_views()
-        except Exception as exc: QMessageBox.critical(self,"Delete failed",str(exc))
+            if path.is_file():
+                path.unlink()
+            # A deleted result must disappear from queue history as well.  Leaving
+            # a finished record with a missing output makes "Continue last result"
+            # select a source that no longer exists and blocks the next job.
+            deleted_id=job.get("id")
+            self.queue_jobs=[j for j in self.queue_jobs if j.get("id") != deleted_id]
+            self._save_queue_state()
+            self._refresh_queue_views()
+        except Exception as exc:
+            QMessageBox.critical(self,"Delete failed",str(exc))
 
     def _clear_finished_jobs(self):
         # Queue-history cleanup only; generated files remain untouched.
