@@ -117,60 +117,110 @@ def main():
         except Exception:
             return 0.0
 
-    def _concat_source_and_segment(ffmpeg, ffprobe, source, segment, destination, width, height, workdir):
-        """Glue source first, newly generated segment second, without overlap trimming.
+    def _ffprobe_video_duration(ffprobe, path):
+        """Return the video-stream duration, not the container/audio duration."""
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, text=True, check=False,
+            )
+            value=(r.stdout or "").strip()
+            if value and value.upper() != "N/A":
+                return max(0.0, float(value))
+        except Exception:
+            pass
+        return _ffprobe_duration(ffprobe, path)
 
-        Stream-copy concat is tried first because it preserves every encoded frame exactly.
-        If the source is not codec/layout-compatible with the H3 result, fall back to a
-        decoded concat that preserves each clip's complete timeline and normalizes geometry.
+    def _concat_source_and_segment(ffmpeg, ffprobe, source, segment, destination, width, height, workdir):
+        """Join source + continuation with one continuous, frame-locked audio encode.
+
+        Independently encoded AAC streams carry priming/padding at their boundaries.
+        Stream-copying those audio packets can make a tiny source tail or new-clip head
+        audible twice even when H3 generated the correct waveform.  Video is still
+        stream-copied when compatible, but audio is decoded, forced to each clip's exact
+        video duration, concatenated as PCM, then encoded once for the final timeline.
         """
         source = Path(source); segment = Path(segment); destination = Path(destination)
-        concat_list = Path(workdir) / "glue_concat.txt"
+        workdir = Path(workdir)
+        concat_list = workdir / "glue_concat.txt"
         def esc(path):
-            return str(Path(path).resolve()).replace("'", "'\''")
+            return str(Path(path).resolve()).replace("'", "'\\''")
         concat_list.write_text(f"file '{esc(source)}'\nfile '{esc(segment)}'\n", encoding="utf-8")
-        copy_tmp = Path(workdir) / "glued_copy.mp4"
-        print(f"Glue results: source first -> generated result second | source={source.name} | result={segment.name}", flush=True)
-        copy_cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-avoid_negative_ts", "make_zero", str(copy_tmp)]
-        copy = subprocess.run(copy_cmd, cwd=ROOT, check=False)
-        if copy.returncode == 0 and copy_tmp.is_file() and copy_tmp.stat().st_size > 0:
-            if destination.exists(): destination.unlink()
-            shutil.move(str(copy_tmp), str(destination))
-            print("Glue results complete: lossless stream concat used; no source/result frames trimmed.", flush=True)
-            return
-        copy_tmp.unlink(missing_ok=True)
-        print("Glue results: stream layouts differ; using full-timeline re-encode fallback (no overlap frames removed).", flush=True)
+
+        src_d = _ffprobe_video_duration(ffprobe, source)
+        seg_d = _ffprobe_video_duration(ffprobe, segment)
+        if src_d <= 0 or seg_d <= 0:
+            raise RuntimeError(f"Could not determine exact video durations for glue: source={src_d:.6f}s segment={seg_d:.6f}s")
+        print(
+            f"Glue results: exact AV join | source={source.name} {src_d:.6f}s | "
+            f"result={segment.name} {seg_d:.6f}s | audio=32kHz continuous AAC encode",
+            flush=True,
+        )
+
         src_audio = _ffprobe_has_audio(ffprobe, source)
         seg_audio = _ffprobe_has_audio(ffprobe, segment)
-        filter_parts = [
-            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=PTS-STARTPTS[v0]",
-            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=PTS-STARTPTS[v1]",
+
+        def audio_inputs_and_filter():
+            cmd = [ffmpeg, "-y", "-i", str(source), "-i", str(segment)]
+            extra_inputs = 0
+            if not src_audio:
+                cmd += ["-f", "lavfi", "-t", f"{src_d:.9f}", "-i", "anullsrc=r=32000:cl=stereo"]
+                src_a = f"[{2 + extra_inputs}:a]"; extra_inputs += 1
+            else:
+                src_a = "[0:a]"
+            if not seg_audio:
+                cmd += ["-f", "lavfi", "-t", f"{seg_d:.9f}", "-i", "anullsrc=r=32000:cl=stereo"]
+                seg_a = f"[{2 + extra_inputs}:a]"; extra_inputs += 1
+            else:
+                seg_a = "[1:a]"
+            af = ";".join([
+                f"{src_a}aresample=32000,apad,atrim=duration={src_d:.9f},asetpts=PTS-STARTPTS[a0]",
+                f"{seg_a}aresample=32000,apad,atrim=duration={seg_d:.9f},asetpts=PTS-STARTPTS[a1]",
+                "[a0][a1]concat=n=2:v=0:a=1[a]",
+            ])
+            return cmd, af
+
+        # Fast path: preserve video packets exactly, but never stream-copy the two AAC
+        # tracks across their internal encoder-delay boundary.
+        video_tmp = workdir / "glued_video_only.mp4"
+        video_copy_cmd = [
+            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-map", "0:v:0", "-an", "-c:v", "copy", "-avoid_negative_ts", "make_zero", str(video_tmp),
         ]
-        cmd = [ffmpeg, "-y", "-i", str(source), "-i", str(segment)]
-        extra_inputs = 0
-        if not src_audio:
-            d = _ffprobe_duration(ffprobe, source)
-            cmd += ["-f", "lavfi", "-t", f"{d:.6f}", "-i", "anullsrc=r=32000:cl=stereo"]
-            src_a = f"[{2 + extra_inputs}:a]"; extra_inputs += 1
-        else:
-            src_a = "[0:a]"
-        if not seg_audio:
-            d = _ffprobe_duration(ffprobe, segment)
-            cmd += ["-f", "lavfi", "-t", f"{d:.6f}", "-i", "anullsrc=r=32000:cl=stereo"]
-            seg_a = f"[{2 + extra_inputs}:a]"; extra_inputs += 1
-        else:
-            seg_a = "[1:a]"
-        filter_parts += [
-            f"{src_a}aresample=32000,asetpts=PTS-STARTPTS[a0]",
-            f"{seg_a}aresample=32000,asetpts=PTS-STARTPTS[a1]",
-            "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]",
+        copied = subprocess.run(video_copy_cmd, cwd=ROOT, check=False)
+        if copied.returncode == 0 and video_tmp.is_file() and video_tmp.stat().st_size > 0:
+            audio_tmp = workdir / "glued_audio.m4a"
+            acmd, af = audio_inputs_and_filter()
+            acmd += ["-filter_complex", af, "-map", "[a]", "-c:a", "aac", "-b:a", "256k", str(audio_tmp)]
+            subprocess.check_call(acmd, cwd=ROOT)
+            mux_tmp = workdir / "glued_exact_av.mp4"
+            subprocess.check_call([
+                ffmpeg, "-y", "-i", str(video_tmp), "-i", str(audio_tmp),
+                "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-shortest", str(mux_tmp),
+            ], cwd=ROOT)
+            if destination.exists(): destination.unlink()
+            shutil.move(str(mux_tmp), str(destination))
+            print("Glue results complete: video stream copied; audio rebuilt as one exact-duration stream (no AAC join padding).", flush=True)
+            return
+
+        video_tmp.unlink(missing_ok=True)
+        print("Glue results: video streams differ; re-encoding video while keeping the same exact-duration audio join.", flush=True)
+        cmd, af = audio_inputs_and_filter()
+        vf = ";".join([
+            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration={src_d:.9f},setpts=PTS-STARTPTS[v0]",
+            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration={seg_d:.9f},setpts=PTS-STARTPTS[v1]",
+            "[v0][v1]concat=n=2:v=1:a=0[v]",
+        ])
+        re_tmp = workdir / "glued_reencode.mp4"
+        cmd += [
+            "-filter_complex", vf + ";" + af, "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+            "-c:a", "aac", "-b:a", "256k", "-vsync", "0", "-shortest", str(re_tmp),
         ]
-        re_tmp = Path(workdir) / "glued_reencode.mp4"
-        cmd += ["-filter_complex", ";".join(filter_parts), "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k", "-vsync", "0", str(re_tmp)]
         subprocess.check_call(cmd, cwd=ROOT)
         if destination.exists(): destination.unlink()
         shutil.move(str(re_tmp), str(destination))
-        print("Glue results complete: source and generated result concatenated in full, in that order.", flush=True)
+        print("Glue results complete: source and continuation joined on exact video/audio boundaries.", flush=True)
 
     with tempfile.TemporaryDirectory(prefix="h3_isolated_", dir=str(ROOT / "output")) as td:
         td = Path(td); lat = td / "latents.pt"; frames_dir = td / "frames"; wav = td / "audio.wav"
@@ -239,8 +289,15 @@ def main():
         audio_ok = False
         try:
             subprocess.check_call(audio_cmd, cwd=ROOT, env=audio_env)
-            print('Muxing video and audio...', flush=True)
-            cmd = [ffmpeg, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k", "-shortest", str(mux_tmp)]
+            frame_files = sorted(frames_dir.glob("frame_*.png"))
+            if not frame_files:
+                raise RuntimeError("Video decode produced no frames for mux")
+            exact_duration = len(frame_files) / 24.0
+            print(f"Muxing video and audio on exact frame duration: {len(frame_files)} frames / {exact_duration:.6f}s", flush=True)
+            cmd = [ffmpeg, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav),
+                   "-filter:a", f"aresample=32000,apad,atrim=duration={exact_duration:.9f},asetpts=PTS-STARTPTS",
+                   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k",
+                   "-t", f"{exact_duration:.9f}", str(mux_tmp)]
             subprocess.check_call(cmd)
             if segment_out.exists(): segment_out.unlink()
             shutil.move(str(mux_tmp), str(segment_out)); audio_ok = True
