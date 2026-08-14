@@ -640,7 +640,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MiniMax H3 INT4 Standalone")
+        # 1180x900 is only the fallback geometry used after the user explicitly
+        # restores the window.  Normal application startup is maximized.
         self.resize(1180, 900)
+        self._user_window_size_override = False
+        self._window_state_guard_pending = False
         self.proc = None
         self.builder_process = None
         self.builder_port = 0
@@ -2688,6 +2692,42 @@ class MainWindow(QMainWindow):
     def cancel_job(self):
         self._stop_running_job("cancel")
 
+    def _restore_expected_maximized_state(self):
+        """Undo accidental/programmatic restores while respecting the user."""
+        self._window_state_guard_pending = False
+        if self._closing or self._user_window_size_override:
+            return
+        state = self.windowState()
+        if state & Qt.WindowState.WindowMinimized:
+            return
+        if not (state & Qt.WindowState.WindowMaximized):
+            self.showMaximized()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            state = self.windowState()
+            minimized = bool(state & Qt.WindowState.WindowMinimized)
+            maximized = bool(state & Qt.WindowState.WindowMaximized)
+
+            # Native title-bar actions, dragging a maximized window, Win+Arrow,
+            # etc. arrive as spontaneous events.  Those are user decisions and
+            # must never be fought by the application.  Minimizing is also always
+            # allowed; a maximized window will naturally restore maximized.
+            if event.spontaneous() and not minimized:
+                self._user_window_size_override = not maximized
+            elif (
+                not minimized
+                and not maximized
+                and not self._user_window_size_override
+                and not self._window_state_guard_pending
+            ):
+                # Layout refreshes / programmatic show-state changes should not
+                # unexpectedly knock the main window out of maximized mode.
+                self._window_state_guard_pending = True
+                QTimer.singleShot(0, self._restore_expected_maximized_state)
+
+        super().changeEvent(event)
+
     def closeEvent(self, e):
         self._closing = True
         self.save_last()
@@ -2704,5 +2744,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv); app.setApplicationName("MiniMax H3 INT4 Standalone"); w = MainWindow(); w.show(); return app.exec()
+    app = QApplication(sys.argv)
+    app.setApplicationName("MiniMax H3 INT4 Standalone")
+    w = MainWindow()
+    # Start in the state most users keep this control-heavy GUI in.  A later
+    # manual restore/resize is respected by MainWindow.changeEvent().
+    w.showMaximized()
+    return app.exec()
 if __name__ == "__main__": raise SystemExit(main())
