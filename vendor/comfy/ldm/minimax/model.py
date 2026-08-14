@@ -354,7 +354,17 @@ class PackedLayout:
                 audio_target_origin = float(text_len) + sum(_video_t_spans(history_video_frames))
             else:
                 audio_target_origin = float(text_len)
-            audio_history_time = float(text_len)
+            # Audio continuation must live on the SAME clock as target audio.  H3
+            # audio is 40 Hz, so a history window is positioned by its latent-step
+            # width and END-aligned to the target origin.  Starting history at
+            # text_len (the previous implementation) lets its end drift into or
+            # away from target time whenever video-history span and audio length
+            # differ, which presents the boundary sound twice or restarts it.
+            audio_history_steps = sum(
+                max(0, int(akf.get("latent_frame_count", akf["latent"].shape[-1])))
+                for akf in audio_keyframes if akf.get("anchor") == "history"
+            )
+            audio_history_time = audio_target_origin - float(audio_history_steps)
             for akf in audio_keyframes:
                 anchor = akf.get("anchor")
                 length = int(akf.get("latent_frame_count", akf["latent"].shape[-1]))
