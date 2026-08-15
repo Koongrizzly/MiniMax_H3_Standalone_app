@@ -2047,11 +2047,11 @@ class MainWindow(QMainWindow):
         self.vram_runtime_free.setToolTip("Hard safety floor. If CUDA free memory drops below this, the manager asks Comfy to evict model weights. 0.50 GB is the aggressive 24 GB starting point.")
         vf.addRow("Runtime minimum free", self.vram_runtime_free)
 
-        self.vram_text_headroom = QDoubleSpinBox(); self.vram_text_headroom.setRange(0.10, 16.0); self.vram_text_headroom.setDecimals(2); self.vram_text_headroom.setSingleStep(0.25); self.vram_text_headroom.setValue(2.0); self.vram_text_headroom.setSuffix(" GB")
+        self.vram_text_headroom = QDoubleSpinBox(); self.vram_text_headroom.setRange(0.10, 16.0); self.vram_text_headroom.setDecimals(2); self.vram_text_headroom.setSingleStep(0.25); self.vram_text_headroom.setValue(1.0); self.vram_text_headroom.setSuffix(" GB")
         self.vram_text_headroom.setToolTip("Free VRAM target while Qwen/text-encoder weights are first admitted. Increase this first for 12-16 GB cards if prompt encoding spills.")
         vf.addRow("Text encoder load headroom", self.vram_text_headroom)
 
-        self.vram_diffusion_headroom = QDoubleSpinBox(); self.vram_diffusion_headroom.setRange(0.10, 16.0); self.vram_diffusion_headroom.setDecimals(2); self.vram_diffusion_headroom.setSingleStep(0.25); self.vram_diffusion_headroom.setValue(4.0); self.vram_diffusion_headroom.setSuffix(" GB")
+        self.vram_diffusion_headroom = QDoubleSpinBox(); self.vram_diffusion_headroom.setRange(0.10, 16.0); self.vram_diffusion_headroom.setDecimals(2); self.vram_diffusion_headroom.setSingleStep(0.25); self.vram_diffusion_headroom.setValue(1.0); self.vram_diffusion_headroom.setSuffix(" GB")
         self.vram_diffusion_headroom.setToolTip("Free VRAM target when MiniMax diffusion weights are first loaded. This room is for the first-step activations. Once sampling runs, Runtime minimum free becomes the floor.")
         vf.addRow("Diffusion load headroom", self.vram_diffusion_headroom)
 
@@ -2061,7 +2061,7 @@ class MainWindow(QMainWindow):
 
 
         self.vram_residency_fill = QCheckBox("Fill unused dedicated VRAM with model weights")
-        self.vram_residency_fill.setChecked(True)
+        self.vram_residency_fill.setChecked(False)
         self.vram_residency_fill.setToolTip("Optional post-warm-up fill. With Static partial, Comfy already loads a larger initial resident weight set; this can use any remaining safe headroom. With DynamicVRAM this is retained mainly for comparison.")
         vf.addRow(self.vram_residency_fill)
 
@@ -2090,8 +2090,8 @@ class MainWindow(QMainWindow):
         self.vram_async_streams.setToolTip("Comfy async weight-offload streams. 2 is its normal NVIDIA default. 0 disables async offload; more is not always faster.")
         vf.addRow("Async offload streams", self.vram_async_streams)
 
-        self.vram_video_vae_reserve = QDoubleSpinBox(); self.vram_video_vae_reserve.setRange(0.10, 16.0); self.vram_video_vae_reserve.setDecimals(2); self.vram_video_vae_reserve.setSingleStep(0.25); self.vram_video_vae_reserve.setValue(6.0); self.vram_video_vae_reserve.setSuffix(" GB")
-        self.vram_video_vae_reserve.setToolTip("Reserve passed to the isolated video-VAE worker. Current proven default is 6 GB; reduce only after sampling-side VRAM is stable.")
+        self.vram_video_vae_reserve = QDoubleSpinBox(); self.vram_video_vae_reserve.setRange(0.10, 16.0); self.vram_video_vae_reserve.setDecimals(2); self.vram_video_vae_reserve.setSingleStep(0.25); self.vram_video_vae_reserve.setValue(2.0); self.vram_video_vae_reserve.setSuffix(" GB")
+        self.vram_video_vae_reserve.setToolTip("Reserve passed to the isolated video-VAE worker. Fresh-install default is 2 GB.")
         vf.addRow("Video VAE reserve", self.vram_video_vae_reserve)
 
         self.vram_video_vae_tile_size = QSpinBox(); self.vram_video_vae_tile_size.setRange(128, 1024); self.vram_video_vae_tile_size.setSingleStep(32); self.vram_video_vae_tile_size.setValue(256); self.vram_video_vae_tile_size.setSuffix(" px")
@@ -2102,14 +2102,10 @@ class MainWindow(QMainWindow):
         self.vram_video_vae_tile_overlap.setToolTip("Overlap between MiniMax video-VAE spatial tiles. Safe/current default is 128 px. 64 px is a speed test candidate, but lower overlap can make tile boundaries visible in the final MP4. Overlap must stay smaller than tile size.")
         vf.addRow("Video VAE tile overlap", self.vram_video_vae_tile_overlap)
 
-        self.vram_audio_vae_reserve = QDoubleSpinBox(); self.vram_audio_vae_reserve.setRange(0.10, 16.0); self.vram_audio_vae_reserve.setDecimals(2); self.vram_audio_vae_reserve.setSingleStep(0.25); self.vram_audio_vae_reserve.setValue(4.0); self.vram_audio_vae_reserve.setSuffix(" GB")
-        self.vram_audio_vae_reserve.setToolTip("Reserve passed to the isolated audio-VAE worker. Current default is 4 GB.")
+        self.vram_audio_vae_reserve = QDoubleSpinBox(); self.vram_audio_vae_reserve.setRange(0.10, 16.0); self.vram_audio_vae_reserve.setDecimals(2); self.vram_audio_vae_reserve.setSingleStep(0.25); self.vram_audio_vae_reserve.setValue(1.0); self.vram_audio_vae_reserve.setSuffix(" GB")
+        self.vram_audio_vae_reserve.setToolTip("Reserve passed to the isolated audio-VAE worker. Fresh-install default is 1 GB.")
         vf.addRow("Audio VAE reserve", self.vram_audio_vae_reserve)
 
-        self.vram_keep_text = QCheckBox("Keep text encoder after conditioning (experimental)")
-        self.vram_keep_text.setChecked(False)
-        self.vram_keep_text.setToolTip("Off is safest and frees Qwen before diffusion. This does not keep it warm between separate queue runs yet; persistent warm workers are the next project after V1 is stable.")
-        vf.addRow(self.vram_keep_text)
         v.addWidget(vg)
 
         lg = QGroupBox("Logging"); lv = QVBoxLayout(lg)
@@ -2425,7 +2421,6 @@ class MainWindow(QMainWindow):
             "vram_block_check_interval": self.vram_block_interval.value(), "vram_async_streams": self.vram_async_streams.value(),
             "vram_video_vae_reserve_gb": self.vram_video_vae_reserve.value(), "vram_audio_vae_reserve_gb": self.vram_audio_vae_reserve.value(),
             "vram_video_vae_tile_size": self.vram_video_vae_tile_size.value(), "vram_video_vae_tile_overlap": self.vram_video_vae_tile_overlap.value(),
-            "vram_keep_text_encoder": self.vram_keep_text.isChecked(),
             "fl2va_model": self.fl2va_model.path(), "ref2va_model": self.ref2va_model.path(), "text_encoder_model": self.text_encoder_model.path(),
             "video_vae_model": self.video_vae_model.path(), "audio_vae_model": self.audio_vae_model.path(),
             "loras": [{"path": row.path(), "strength": strength.value()} for row, strength in self.lora_rows],
@@ -2468,21 +2463,20 @@ class MainWindow(QMainWindow):
             idx = self.vram_residency_engine.findData(engine)
             self.vram_residency_engine.setCurrentIndex(idx if idx >= 0 else 0)
             self.vram_runtime_free.setValue(float(d.get("vram_runtime_free_gb", 0.50)))
-            self.vram_text_headroom.setValue(float(d.get("vram_text_headroom_gb", 2.0)))
-            self.vram_diffusion_headroom.setValue(float(d.get("vram_diffusion_headroom_gb", 4.0)))
+            self.vram_text_headroom.setValue(float(d.get("vram_text_headroom_gb", 1.0)))
+            self.vram_diffusion_headroom.setValue(float(d.get("vram_diffusion_headroom_gb", 1.0)))
             self.vram_offload_chunk.setValue(int(d.get("vram_offload_chunk_mb", 512)))
             self.vram_max_weights.setValue(float(d.get("vram_max_resident_weights_gb", 0.0)))
-            self.vram_residency_fill.setChecked(bool(d.get("vram_residency_fill", True)))
+            self.vram_residency_fill.setChecked(bool(d.get("vram_residency_fill", False)))
             self.vram_residency_target_free.setValue(float(d.get("vram_residency_target_free_gb", 0.50)))
             self.vram_residency_warmup.setValue(int(d.get("vram_residency_warmup_blocks", 2)))
             self.vram_residency_refill_interval.setValue(int(d.get("vram_residency_refill_interval", 1)))
             self.vram_block_interval.setValue(int(d.get("vram_block_check_interval", 1)))
             self.vram_async_streams.setValue(int(d.get("vram_async_streams", 2)))
-            self.vram_video_vae_reserve.setValue(float(d.get("vram_video_vae_reserve_gb", 6.0)))
-            self.vram_audio_vae_reserve.setValue(float(d.get("vram_audio_vae_reserve_gb", 4.0)))
+            self.vram_video_vae_reserve.setValue(float(d.get("vram_video_vae_reserve_gb", 2.0)))
+            self.vram_audio_vae_reserve.setValue(float(d.get("vram_audio_vae_reserve_gb", 1.0)))
             self.vram_video_vae_tile_size.setValue(int(d.get("vram_video_vae_tile_size", 256)))
             self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 128)))
-            self.vram_keep_text.setChecked(bool(d.get("vram_keep_text_encoder", False)))
             self.fl2va_model.edit.setText(d.get("fl2va_model", "")); self.ref2va_model.edit.setText(d.get("ref2va_model", "")); self.text_encoder_model.edit.setText(d.get("text_encoder_model", "")); self.video_vae_model.edit.setText(d.get("video_vae_model", "")); self.audio_vae_model.edit.setText(d.get("audio_vae_model", ""))
             saved_loras = d.get("loras", []) or []
             for i, (row, strength) in enumerate(self.lora_rows):
@@ -2854,7 +2848,6 @@ class MainWindow(QMainWindow):
             args += ["--vram-manager-auto" if self.vram_manager_auto_bypass.isChecked() else "--vram-manager"]
             args += ["--vram-residency-engine", str(self.vram_residency_engine.currentData() or "static"), "--vram-runtime-free-gb", str(self.vram_runtime_free.value()), "--vram-text-headroom-gb", str(self.vram_text_headroom.value()), "--vram-diffusion-headroom-gb", str(self.vram_diffusion_headroom.value()), "--vram-offload-chunk-mb", str(self.vram_offload_chunk.value()), "--vram-max-resident-weights-gb", str(self.vram_max_weights.value()), "--vram-block-check-interval", str(self.vram_block_interval.value()), "--vram-async-streams", str(self.vram_async_streams.value()), "--vram-video-vae-reserve-gb", str(self.vram_video_vae_reserve.value()), "--vram-audio-vae-reserve-gb", str(self.vram_audio_vae_reserve.value()), "--vram-residency-target-free-gb", str(self.vram_residency_target_free.value()), "--vram-residency-warmup-blocks", str(self.vram_residency_warmup.value()), "--vram-residency-refill-interval", str(self.vram_residency_refill_interval.value())]
             args += ["--vram-residency-fill" if self.vram_residency_fill.isChecked() else "--no-vram-residency-fill"]
-            if self.vram_keep_text.isChecked(): args += ["--vram-keep-text-encoder"]
         if self.spectrum_enabled.isChecked(): args += ["--spectrum"]
         if self.sage_attention_enabled.isChecked(): args += ["--sage-attention"]
         # Video-VAE tiling is independent from sampling-side VRAM Manager activation.
