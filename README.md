@@ -23,11 +23,15 @@ It supports:
 
 - Integrated H3 Prompt Builder 
 
-- Automatic VRAM management.
+- Automatic VRAM management with override features
 
 - Optional Spectrum Feature Forecasting
 
 - Optional SageAttention acceleration
+
+- System hud with job progress
+
+- options for extended logging and debugging 
 
 - Automatic setup, first time use downloads ffmpeg bundle and llama server when needed
 
