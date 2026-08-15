@@ -1,39 +1,35 @@
-MiniMax H3 INT4 Standalone
+# MiniMax H3 INT4 Standalone
 ---
-
-A Windows desktop application for running MiniMax H3 locally on NVIDIA RTX GPUs using pre-quantized INT4 / W4A8 ConvRot model weights.
-(This project provides a standalone PySide6 GUI for MiniMax H3 video generation without requiring the user to install or launch ComfyUI. A minimal comfyui backend to load the models runs in the background)
+---
+- A Windows desktop application for running MiniMax H3 locally on NVIDIA RTX GPUs using pre-quantized INT4 / W4A8 ConvRot model weights.
+- This project provides a standalone PySide6 GUI for MiniMax H3 video generation without requiring the user to install or launch ComfyUI. A minimal comfyui backend to load the models runs in the background
 ---
 
 It supports:
 
-Text → video + audio (T2VA)
+- Text → video + audio (T2VA)
 
-First/last image/video → video + audio (FL2VA)
+- First/last image/video → video + audio (FL2VA)
 
-Video To Video with sound memory + 'use last finished job' feature for automation (FL2VA)
+- Video To Video with sound memory + 'use last finished job' feature for automation (FL2VA)
 
-Reference image/video/audio → video + audio (Ref2VA)
+- Reference image/video/audio → video + audio (Ref2VA)
 
-Native MiniMax H3 stereo audio generation
+- Up to 30 seconds at 24 FPS by default + experimental : up to 100 seconds !
 
-Up to 30 seconds at 24 FPS + experimental : up to 100 seconds !
+- MiniMax H3 4 step LoRA included in the installer
 
-MiniMax H3 4 step LoRA included in the installer
+- Built-in generation queue with preview pane
 
-Built-in generation queue
+- Integrated H3 Prompt Builder 
 
-Image/reference previews
+- Automatic VRAM management.
 
-Integrated H3 Prompt Builder 
+- Optional Spectrum Feature Forecasting
 
-Automatic VRAM management for lower-VRAM GPUs
+- Optional SageAttention acceleration
 
-Optional Spectrum Feature Forecasting
-
-Optional SageAttention acceleration
-
-Automatic model and FFmpeg setup
+- Automatic setup, first time use downloads ffmpeg bundle and llama server when needed
 
 ---
 
@@ -67,9 +63,6 @@ Miniconda or Anaconda (not included in the installer)
 Enough free disk space for the selected models (40+ gigabyte)
 
 Internet connection for the first installation/model download
-
-
-GPU / VRAM
 
 This build was created specifically to make MiniMax H3 practical on consumer RTX hardware.
 
