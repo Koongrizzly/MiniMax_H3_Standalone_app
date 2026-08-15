@@ -1,8 +1,9 @@
 MiniMax H3 INT4 Standalone
+---
 
 A Windows desktop application for running MiniMax H3 locally on NVIDIA RTX GPUs using pre-quantized INT4 / W4A8 ConvRot model weights.
 (This project provides a standalone PySide6 GUI for MiniMax H3 video generation without requiring the user to install or launch ComfyUI. A minimal comfyui backend to load the models runs in the background)
-
+---
 
 It supports:
 
@@ -34,7 +35,7 @@ Optional SageAttention acceleration
 
 Automatic model and FFmpeg setup
 
-
+---
 
 What is MiniMax H3?
 
@@ -52,7 +53,7 @@ This standalone application focuses on running the H3-Base models locally with c
 
 Official MiniMax H3: Hugging Face: https://huggingface.co/MiniMaxAI/MiniMax-H3 / MiniMax: https://www.minimax.io / MiniMax GitHub: https://github.com/MiniMax-AI
 
-
+---
 
 Quick install / Requirements
 
@@ -131,6 +132,7 @@ Large files use a multi-connection HTTP downloader to improve Hugging Face trans
 After installation, double-click:
 start.bat
 
+---
 
 Prompt Builder
 The application contains an integrated version of the Hailuo H3 Prompt Builder, an unofficial community prompt-building tool created by Bob Doyle Media.
@@ -145,7 +147,6 @@ MiniMax H3 INT4 ConvRot repository:https://huggingface.co/Winnougan/MiniMax-H3-I
 Winnougan Hugging Face:https://huggingface.co/Winnougan.
 Please respect the licenses and usage terms of the original MiniMax H3 model and every upstream quantized checkpoint.
 
-
 ComfyUI components
 Although this is a standalone desktop application and does not require the user to run ComfyUI, parts of the backend use code/components originating from ComfyUI / Comfy-Org, including MiniMax H3 model loading, comfy_extras H3 support and VAE/model-management components.
 ComfyUI is licensed under GPL-3.0.
@@ -153,6 +154,7 @@ ComfyUI GitHub: https://github.com/Comfy-Org/ComfyUI
 ComfyUI documentation: https://docs.comfy.org/
 Please see the repository license files for the licensing requirements that apply to redistributed ComfyUI-derived code.
 
+---
 
 Troubleshooting
 
@@ -179,6 +181,8 @@ Enable extended logging and inspect the VRAM Manager output. Large jobs may requ
 SageAttention changes the result
 
 Disable SageAttention. Standard attention is the recommended baseline when exact seed behavior, audio quality or maximum fidelity matters more than speed.
+
+---
 
 Credits
 
@@ -229,6 +233,8 @@ Triton-Windows: https://github.com/woct0rdho/triton-windows
 Standalone application
 
 PySide6 GUI and standalone installer by Contrinsan.
+
+---
 
 Disclaimer
 
