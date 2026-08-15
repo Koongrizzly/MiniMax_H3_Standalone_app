@@ -683,15 +683,28 @@ class MiniMaxH3Model(nn.Module):
         # rotation table computed once per forward, consumed by the kitchen split-half rope
         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
 
-        # blocks / optional training-free Spectrum forecast
+        # Target streams are the only H3 rows Spectrum is allowed to forecast.
+        # Text/reference/conditioning rows never enter forecast history.
+        video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
+        audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
+        va, vb, _ = video_seg
+        aa, ab, _ = audio_seg
+
+        # Optional training-free Spectrum forecast. Forecast steps skip all H3
+        # transformer blocks, but keep the native current-step FinalLayer below.
         spectrum = transformer_options.get("minimax_h3_spectrum")
         if spectrum is not None:
             spectrum.begin_step(float(sigma_v))
 
         if spectrum is not None and spectrum.forecasting:
-            # Forecast the post-transformer feature and skip all 50 expensive DiT blocks.
-            # Embedding and final projection still run normally for the current H3 timestep.
-            h = spectrum.predict(device=device, dtype=dtype)
+            target = spectrum.predict_target(device=device, dtype=dtype)
+            audio_rows = ab - aa
+            video_rows = vb - va
+            if target.shape[0] != audio_rows + video_rows or target.shape[1:] != h.shape[1:]:
+                raise RuntimeError("MiniMax H3 Spectrum target topology no longer matches native packed layout")
+            h[aa:ab] = target[:audio_rows]
+            h[va:vb] = target[audio_rows:audio_rows + video_rows]
+            del target
         else:
             patches_replace = transformer_options.get("patches_replace", {})
             blocks_replace = patches_replace.get("dit", {})
@@ -711,14 +724,11 @@ class MiniMaxH3Model(nn.Module):
             if prefetch_queue is not None:
                 comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
             if spectrum is not None:
-                spectrum.observe(h)
+                spectrum.observe_target(torch.cat((h[aa:ab], h[va:vb]), dim=0))
 
         if spectrum is not None:
             spectrum.finish_step()
 
-        # target streams are single contiguous segments (audio then video, last two)
-        video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
-        audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
         v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
 
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
