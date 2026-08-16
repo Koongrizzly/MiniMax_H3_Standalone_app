@@ -1315,6 +1315,35 @@ def _terminate_generation_process_tree() -> None:
             pass
 
 
+def _recreate_output_path(raw_dir: Path, shot_index: int) -> Tuple[Path, bool]:
+    """Return a writable output path for a shot recreation.
+
+    Prefer the stable shot_###.mp4 filename. If Windows has that file locked
+    (for example by an external media player), do not fail the generation: create
+    a versioned replacement and let the project point at that new file instead.
+    """
+    preferred = raw_dir / f"shot_{shot_index:03d}.mp4"
+    if not preferred.exists():
+        return preferred, False
+    try:
+        preferred.unlink()
+        return preferred, False
+    except PermissionError:
+        pass
+    except OSError:
+        # Treat any Windows sharing/access problem as a locked output. The new
+        # version is safer than risking a failed render after several minutes.
+        pass
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    candidate = raw_dir / f"shot_{shot_index:03d}_retry_{stamp}.mp4"
+    serial = 2
+    while candidate.exists():
+        candidate = raw_dir / f"shot_{shot_index:03d}_retry_{stamp}_{serial}.mp4"
+        serial += 1
+    return candidate, True
+
+
 def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -> List[Dict[str, Any]]:
     global _ACTIVE_GENERATION_PROCESS
     _GENERATION_CANCEL.clear()
@@ -1343,7 +1372,10 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         progress(f"Generating shot {shot.index} ({pos}/{len(targets)})...")
         audio_chunk = audio_dir / f"shot_{shot.index:03d}.wav"
         _extract_audio_slice(project.audio_path, audio_chunk, shot.generation_start, shot.frames / FPS)
-        out_path = raw_dir / f"shot_{shot.index:03d}.mp4"
+        out_path, used_retry_name = _recreate_output_path(raw_dir, shot.index)
+        if used_retry_name:
+            progress(f"Shot {shot.index}: previous clip is locked by another program; rendering replacement as {out_path.name}.")
+        shot.output_path = str(out_path)
         selected_names = [n for n in shot.reference_names if n in refs_by_name]
         if not selected_names:
             # Older/restored projects can have an empty shot assignment even though valid
@@ -2596,7 +2628,11 @@ class MiniMaxMusicClipWidget(QWidget):
         audio_dir.mkdir(parents=True, exist_ok=True)
         audio_chunk = audio_dir / f"shot_{shot.index:03d}.wav"
         _extract_audio_slice(self.project.audio_path, audio_chunk, shot.generation_start, shot.frames / FPS)
-        out_path = raw_dir / f"shot_{shot.index:03d}.mp4"
+        out_path, used_retry_name = _recreate_output_path(raw_dir, shot.index)
+        if used_retry_name:
+            self.status.setText(
+                f"Shot {shot.index}: existing clip is open/locked; queued replacement will use {out_path.name}."
+            )
         refs_by_name = {r.name: r for r in self.project.references if r.enabled and Path(r.path).is_file()}
         selected_names = [n for n in shot.reference_names if n in refs_by_name]
         if not selected_names:
@@ -2660,6 +2696,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "prompt": generation_prompt,
             "music_shot_index": int(shot.index),
             "music_project_output": str(out_dir),
+            "music_recreated_to_new_name": bool(used_retry_name),
         }
 
     def _queue_shots(self, indices: Sequence[int]) -> None:
