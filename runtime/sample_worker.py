@@ -63,11 +63,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_QWEN_PREFLIGHT_20260816B"
+        expected = "V11_2_QWEN_ADMISSION_20260816C"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.1 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.2 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     torch.set_grad_enabled(False)
     if len(ns.lora) != len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora) > 3: raise ValueError('Maximum 3 LoRAs are supported')
@@ -143,12 +143,21 @@ def main():
         qwen_patch=_install_qwen_layer_trace(manager)
     print('Loading W4A8 text encoder...', flush=True)
     clip=comfy.sd.load_clip([ns.text_encoder], clip_type=comfy.sd.CLIPType.MINIMAX)
-    if ns.extended_logging: log_mem('after text encoder load')
+    if ns.extended_logging: log_mem('after text encoder object load')
+    # build_conditioning() tokenizes internally, so make a matching token set here
+    # solely to force the lazy Qwen residency load under V11.2 admission control.
     if manager is not None and manager.is_stage_managed('text'):
+        admission_images=prepared_keyframes[0] if prepared_keyframes is not None else []
+        admission_tokens=clip.tokenize(ns.prompt, images=admission_images)
+        manager.begin_text_conditioning_admission()
+        clip.load_model(admission_tokens)
         manager.prepare_text_conditioning(reason='FL2VA pre-Qwen conditioning')
+        del admission_tokens
     print('Encoding prompt and building conditioning...', flush=True)
     if ns.extended_logging: log_mem('before text encoder conditioning')
     positive,negative,latent,actual_frames=build_conditioning(clip,vv,ns.prompt,ns.width,ns.height,ns.frames,ns.first_frame,ns.last_frame,prepared_keyframes=prepared_keyframes,prepared_audio_keyframes=prepared_audio_keyframes)
+    if manager is not None and manager.is_stage_managed('text'):
+        manager.end_text_conditioning_admission()
     if ns.extended_logging:
         log_mem('after text encoder conditioning', latent.get('samples') if isinstance(latent,dict) and torch.is_tensor(latent.get('samples')) else None)
         if torch.cuda.is_available(): print(f'[PEAK] text encoder CUDA peak allocated={_fmt_bytes(torch.cuda.max_memory_allocated())} reserved={_fmt_bytes(torch.cuda.max_memory_reserved())}', flush=True)

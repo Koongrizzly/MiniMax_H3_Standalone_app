@@ -117,11 +117,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_QWEN_PREFLIGHT_20260816B"
+        expected = "V11_2_QWEN_ADMISSION_20260816C"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.1 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.2 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     if len(ns.lora)!=len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora)>3: raise ValueError('Maximum 3 LoRAs are supported')
     manager=None
@@ -188,12 +188,20 @@ def main():
     if ns.extended_logging or (manager is not None and manager.is_stage_managed('text')):
         qwen_patch=_install_qwen_layer_trace(manager)
     print('Loading W4A8 text encoder for Ref2VA...',flush=True); clip=comfy.sd.load_clip([ns.text_encoder],clip_type=comfy.sd.CLIPType.MINIMAX)
-    if ns.extended_logging: log_mem('after text encoder load')
+    if ns.extended_logging: log_mem('after text encoder object load')
+    tokens=clip.tokenize(ns.prompt,minimax_ref_items=ref_items)
     if manager is not None and manager.is_stage_managed('text'):
+        manager.begin_text_conditioning_admission()
+        # comfy.sd.load_clip() is lazy: this is the first real Qwen CUDA residency
+        # load.  Do it under the V11.2 activation reserve, then verify actual free
+        # VRAM before the first transformer forward.
+        clip.load_model(tokens)
         manager.prepare_text_conditioning(reason='Ref2VA pre-Qwen conditioning')
     print('Encoding prompt and Ref2VA conditioning...', flush=True)
     if ns.extended_logging: log_mem('before text encoder conditioning')
-    tokens=clip.tokenize(ns.prompt,minimax_ref_items=ref_items); positive=clip.encode_from_tokens_scheduled(tokens)
+    positive=clip.encode_from_tokens_scheduled(tokens)
+    if manager is not None and manager.is_stage_managed('text'):
+        manager.end_text_conditioning_admission()
     if ns.extended_logging:
         log_mem('after text encoder conditioning')
         if torch.cuda.is_available(): print(f'[PEAK] text encoder CUDA peak allocated={_fmt_bytes(torch.cuda.max_memory_allocated())} reserved={_fmt_bytes(torch.cuda.max_memory_reserved())}', flush=True)

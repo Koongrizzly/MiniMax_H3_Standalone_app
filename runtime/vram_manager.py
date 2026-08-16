@@ -7,8 +7,8 @@ import torch
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
 
-VRAM_MANAGER_SIGNATURE = "V11_QWEN_PREFLIGHT_20260816B"
-VRAM_MANAGER_VERSION = "V11.1"
+VRAM_MANAGER_SIGNATURE = "V11_2_QWEN_ADMISSION_20260816C"
+VRAM_MANAGER_VERSION = "V11.2"
 
 
 @dataclass
@@ -73,6 +73,7 @@ class VRAMManager:
         self._orig_extra_reserved_vram = getattr(self.mm, "EXTRA_RESERVED_VRAM", 0)
         self._allocator_guard_active = False
         self._pinned_guard_active = False
+        self._text_conditioning_target_bytes = 0
 
     @staticmethod
     def _gb(n: int) -> str:
@@ -265,31 +266,66 @@ class VRAMManager:
         frac = min(0.85, max(0.40, frac))
         return max(floor, int(float(total) * frac))
 
-    def prepare_text_conditioning(self, reason: str = "pre-Qwen conditioning") -> int:
-        """Make the text stage safe before its first large activation allocation."""
+    def begin_text_conditioning_admission(self) -> int:
+        """Reserve Qwen activation runway before its first CUDA residency load.
+
+        comfy.sd.load_clip() only creates the CLIP/Qwen object; the GPU residency
+        load happens lazily from CLIP.load_model(tokens) inside encode.  V11.1 ran
+        its preflight before that lazy load, so it always saw an almost-empty card.
+        V11.2 arms Comfy's EXTRA_RESERVED_VRAM with the activation target first so
+        the lazy loader chooses partial Qwen residency from the outset.
+        """
         if not self.is_stage_managed("text") or self.stage != "text":
+            self._text_conditioning_target_bytes = 0
             return 0
-        # The text allocator ceiling must already be active here.  Re-sync so this
-        # remains true if a caller arrived from a native/reference stage.
         self._sync_stage_guards(True)
         target = self.text_activation_target_bytes()
+        self._text_conditioning_target_bytes = int(target)
+        self._set_comfy_reserve(target)
         free_before, total = self._cuda_free()
         self._log(
-            f"V11 Qwen preflight | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"V11.2 Qwen admission armed | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"reserved activation runway={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
+            force=True,
+        )
+        return target
+
+    def prepare_text_conditioning(self, reason: str = "pre-Qwen conditioning") -> int:
+        """Verify/trim Qwen residency after the constrained lazy GPU load."""
+        if not self.is_stage_managed("text") or self.stage != "text":
+            return 0
+        self._sync_stage_guards(True)
+        target = int(self._text_conditioning_target_bytes or self.text_activation_target_bytes())
+        self._text_conditioning_target_bytes = target
+        self._set_comfy_reserve(target)
+        free_before, total = self._cuda_free()
+        self._log(
+            f"V11.2 Qwen preflight after load | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
             f"target free={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
             force=True,
         )
         freed = self.enforce_loaded(reason=reason, target_free=target)
-        # Offloading can leave large reusable cache blocks behind.  At a stage
-        # boundary we prefer genuine free dedicated VRAM over preserving that cache.
         self.trim_cuda_cache(reason=reason, force=True)
         free_after, _ = self._cuda_free()
         self._log(
-            f"V11 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
+            f"V11.2 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
             f"CUDA free={self._gb(free_after) if free_after is not None else 'n/a'} | target={self._gb(target)}",
             force=True,
         )
         return freed
+
+    def end_text_conditioning_admission(self):
+        """Release the temporary Qwen activation reserve after conditioning."""
+        if self._text_conditioning_target_bytes:
+            self._log(
+                f"V11.2 Qwen admission released | activation runway was={self._gb(self._text_conditioning_target_bytes)}",
+                force=True,
+            )
+        self._text_conditioning_target_bytes = 0
+        if self.is_stage_managed(self.stage):
+            self._set_comfy_reserve(self.runtime_floor_bytes())
+        else:
+            self._set_comfy_reserve(int(self._orig_extra_reserved_vram or 0))
 
     def install(self):
         if self._orig_load_models_gpu is not None:
@@ -302,6 +338,12 @@ class VRAMManager:
                 return manager._orig_load_models_gpu(models, *args, **kwargs)
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
+            # V11.2: while Qwen conditioning admission is armed, keep the large
+            # activation runway visible to *every* Comfy load call.  encode() calls
+            # CLIP.load_model(tokens) again, so dropping back to the 0.5 GiB runtime
+            # reserve here would simply pull the offloaded Qwen weights back in.
+            if manager.stage == "text" and manager._text_conditioning_target_bytes > 0:
+                reserve = max(reserve, int(manager._text_conditioning_target_bytes))
             manager._set_comfy_reserve(reserve)
 
             # V5: MiniMax can report a sampling requirement larger than the GPU.
@@ -390,7 +432,10 @@ class VRAMManager:
                 manager.log_residency("after Comfy initial load", force=True)
                 # V2 does NOT force-fill here: at this point the first-step activation
                 # footprint is still unknown. Residency fill begins only after warm-up.
-                manager._set_comfy_reserve(manager.runtime_floor_bytes())
+                if manager.stage == "text" and manager._text_conditioning_target_bytes > 0:
+                    manager._set_comfy_reserve(int(manager._text_conditioning_target_bytes))
+                else:
+                    manager._set_comfy_reserve(manager.runtime_floor_bytes())
             else:
                 manager.enforce_loaded(reason=f"{manager.stage} reload")
             return out
