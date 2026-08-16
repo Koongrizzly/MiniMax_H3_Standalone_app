@@ -9,6 +9,20 @@ if str(_APP_ROOT) not in sys.path:
 
 from runtime.paths import ROOT
 from runtime.validate_models import validate
+from runtime import vram_manager as _vram_manager_module
+
+_EXPECTED_VRAM_SIGNATURE = "V11_QWEN_PREFLIGHT_20260816B"
+
+def _verify_vram_runtime():
+    actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
+    if actual != _EXPECTED_VRAM_SIGNATURE:
+        path = getattr(_vram_manager_module, "__file__", "unknown")
+        raise RuntimeError(
+            "VRAM Manager patch mismatch: the launcher is V11.1 but the loaded "
+            f"runtime/vram_manager.py is not. Loaded: {path} | signature={actual!r}. "
+            "Re-extract the patch into the MiniMax app root so both helpers/ and runtime/ are replaced."
+        )
+    return str(getattr(_vram_manager_module, "__file__", "unknown"))
 from runtime.ffmpeg_tools import ensure_ffmpeg_tools, tool_path
 
 
@@ -44,6 +58,9 @@ def main():
     ap.add_argument("--vram-residency-refill-interval", type=int, default=1)
     ap.add_argument("--vram-keep-text-encoder", action="store_true")
     ns = ap.parse_args()
+    if ns.vram_manager:
+        runtime_path = _verify_vram_runtime()
+        print(f"[VRAM-MGR] V11.1 runtime verified: {runtime_path}", flush=True)
     if ns.video_vae_tile_size < 128: print("ERROR: video VAE tile size must be at least 128 px"); return 2
     if ns.video_vae_tile_overlap < 0 or ns.video_vae_tile_overlap >= ns.video_vae_tile_size: print("ERROR: video VAE tile overlap must be >= 0 and smaller than tile size"); return 2
     if len(ns.lora) != len(ns.lora_strength): print("ERROR: each --lora needs one matching --lora-strength"); return 2
