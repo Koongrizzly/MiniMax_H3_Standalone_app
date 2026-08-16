@@ -660,6 +660,11 @@ class MainWindow(QMainWindow):
         self._window_state_guard_pending = False
         self._layout_refresh_pending = False
         self._main_scroll_pages = []
+        self._font_size_pt = 10
+        self._font_apply_timer = QTimer(self)
+        self._font_apply_timer.setSingleShot(True)
+        self._font_apply_timer.setInterval(1800)
+        self._font_apply_timer.timeout.connect(self._apply_pending_font_size)
         self.proc = None
         self.builder_process = None
         self.builder_port = 0
@@ -778,7 +783,7 @@ class MainWindow(QMainWindow):
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.
         bar = QWidget(); bar.setObjectName("bottomBar")
         controls = QHBoxLayout(bar); controls.setContentsMargins(8, 8, 8, 8)
-        self.gen = QPushButton("Generate"); self.gen.setObjectName("primary"); self.gen.clicked.connect(self.generate)
+        self.gen = QPushButton("Generate"); self.gen.setObjectName("primary"); self.gen.clicked.connect(self._main_generate_action)
         self.cancel = QPushButton("Cancel"); self.cancel.clicked.connect(self.cancel_job); self.cancel.setEnabled(False)
         val = QPushButton("Validate install"); val.clicked.connect(self.validate_install)
         self.openout = QPushButton("Open output folder"); self.openout.clicked.connect(self.open_output_folder)
@@ -786,6 +791,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(bar, 0)
         self.setCentralWidget(root)
         self._add_tooltips()
+        self.tabs.currentChanged.connect(self._sync_main_generate_button)
+        self._sync_main_generate_button(self.tabs.currentIndex())
 
         for cls in (QComboBox, QSpinBox, QDoubleSpinBox):
             for w in self.findChildren(cls):
@@ -1972,7 +1979,7 @@ class MainWindow(QMainWindow):
             from minimax_music_clip import MiniMaxMusicClipWidget
             self.music_clip_widget = MiniMaxMusicClipWidget(page, queue_adapter=self._enqueue_music_clip_job)
             lay.addWidget(self.music_clip_widget, 1)
-            self.tabs.addTab(page, "Music Clip Creator")
+            self.music_clip_tab_index = self.tabs.addTab(page, "Music Clip Creator")
         except Exception as exc:
             self.music_clip_widget = None
             msg = QLabel(
@@ -1982,7 +1989,31 @@ class MainWindow(QMainWindow):
             msg.setTextInteractionFlags(Qt.TextSelectableByMouse)
             lay.addWidget(msg)
             lay.addStretch(1)
-            self.tabs.addTab(page, "Music Clip Creator")
+            self.music_clip_tab_index = self.tabs.addTab(page, "Music Clip Creator")
+
+    def _sync_main_generate_button(self, index=None):
+        is_music = (
+            getattr(self, "music_clip_widget", None) is not None
+            and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
+        )
+        if hasattr(self, "gen"):
+            self.gen.setText("Create video clip" if is_music else "Generate")
+            self.gen.setToolTip(
+                "Analyze the selected song, use Whisper lyric timing when enabled, build the H3 shot list, queue every missing clip, then queue final trim/assembly."
+                if is_music else "Add the current MiniMax generation job to the queue."
+            )
+
+    def _main_generate_action(self):
+        if (
+            getattr(self, "music_clip_widget", None) is not None
+            and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
+        ):
+            try:
+                self.music_clip_widget.create_video_clip()
+            except Exception as exc:
+                QMessageBox.critical(self, "Create video clip failed", str(exc))
+            return
+        self.generate()
 
     def _enqueue_music_clip_job(self, spec):
         """Add one Music Clip Creator unit to the standalone MiniMax queue.
@@ -2084,6 +2115,24 @@ class MainWindow(QMainWindow):
             "When enabled, checks for application updates 10 seconds after startup."
         )
         v.addWidget(self.auto_update_enabled)
+
+        fontg = QGroupBox("Interface font size")
+        fontv = QVBoxLayout(fontg)
+        fontrow = QHBoxLayout()
+        self.font_size_slider = QSlider(Qt.Orientation.Horizontal, fontg)
+        self.font_size_slider.setRange(5, 15)
+        self.font_size_slider.setValue(10)
+        self.font_size_slider.setSingleStep(1)
+        self.font_size_slider.setPageStep(1)
+        self.font_size_label = QLabel("10 pt (default)", fontg)
+        self.font_size_label.setMinimumWidth(105)
+        self.font_size_slider.setToolTip("Changes the font size across the whole application. Range is 5 points smaller to 5 points larger than the 10 pt default. The GUI updates about two seconds after you stop moving the slider.")
+        fontrow.addWidget(QLabel("Font size:", fontg))
+        fontrow.addWidget(self.font_size_slider, 1)
+        fontrow.addWidget(self.font_size_label)
+        fontv.addLayout(fontrow)
+        v.addWidget(fontg)
+        self.font_size_slider.valueChanged.connect(self._font_size_slider_changed)
 
         outg = QGroupBox("Output"); of = QFormLayout(outg)
         self.output_folder = FolderRow(f"Blank = default: {DEFAULT_OUTPUT_DIR}")
@@ -2332,25 +2381,54 @@ class MainWindow(QMainWindow):
         self.cancel.setToolTip("Cancel the currently running queue job completely. Use the Queue tab context menu to cancel and move it back to Pending instead.")
         self.openout.setToolTip("Open the configured output folder in Windows Explorer.")
 
+    def _update_font_size_label(self, value):
+        if not hasattr(self, "font_size_label"):
+            return
+        value = int(value)
+        suffix = " (default)" if value == 10 else (f" (+{value - 10})" if value > 10 else f" ({value - 10})")
+        self.font_size_label.setText(f"{value} pt{suffix}")
+
+    def _font_size_slider_changed(self, value):
+        self._update_font_size_label(value)
+        self.status.setText(f"Font size: {int(value)} pt — applying when slider movement stops…")
+        self._font_apply_timer.start()
+
+    def _apply_pending_font_size(self):
+        if not hasattr(self, "font_size_slider"):
+            return
+        self._font_size_pt = int(self.font_size_slider.value())
+        self._apply_style()
+        self._schedule_layout_refresh()
+        try:
+            self.save_last()
+        except Exception:
+            pass
+        self.status.setText(f"Font size applied globally: {self._font_size_pt} pt")
+
     def _apply_style(self):
-        self.setStyleSheet("""
-        QMainWindow,QWidget { background:#11151b; color:#e8eef6; font-size:10pt; }
+        base = max(5, min(15, int(getattr(self, "_font_size_pt", 10))))
+        title = base + 7
+        hud = base + 5
+        style = """
+        QMainWindow,QWidget { background:#11151b; color:#e8eef6; font-size:__BASE__pt; }
         QTabWidget::pane { border:1px solid #263545; border-radius:7px; }
         QTabBar::tab { background:#171f28; border:1px solid #2e4051; padding:8px 18px; min-width:110px; }
         QTabBar::tab:selected { background:#1d3040; color:#82e7ff; }
         QGroupBox { border:1px solid #2a3948; border-radius:8px; margin-top:10px; padding:10px; font-weight:600; }
         QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 5px; color:#75d8ff; }
-        QLineEdit,QPlainTextEdit,QComboBox,QSpinBox,QDoubleSpinBox,QListWidget,QTreeWidget { background:#0b0f14; border:1px solid #334556; border-radius:5px; padding:5px; selection-background-color:#176c89; }
+        QLineEdit,QPlainTextEdit,QComboBox,QSpinBox,QDoubleSpinBox,QListWidget,QTreeWidget,QTableWidget { background:#0b0f14; border:1px solid #334556; border-radius:5px; padding:5px; selection-background-color:#176c89; }
         QPushButton { background:#1b2732; border:1px solid #3c5267; border-radius:5px; padding:6px 11px; }
         QPushButton:hover { background:#243544; } QPushButton:disabled { color:#66717a; background:#15191e; }
         QPushButton#primary { background:#126680; border-color:#28b6df; font-weight:700; padding:9px 28px; }
         QWidget#bottomBar { border:1px solid #2e4051; border-radius:7px; background:#0d1319; }
-        QLabel#title { font-size:17pt; font-weight:700; color:#7de3ff; } QLabel#status { color:#a8bac9; }
-        QLabel#systemHud { background:#0d1319; border:1px solid #263545; border-radius:7px; padding:6px 10px; font-size:15pt; }
+        QLabel#title { font-size:__TITLE__pt; font-weight:700; color:#7de3ff; } QLabel#status { color:#a8bac9; }
+        QLabel#systemHud { background:#0d1319; border:1px solid #263545; border-radius:7px; padding:6px 10px; font-size:__HUD__pt; }
         QLabel#queueSummary { color:#82e7ff; font-weight:600; padding:3px 6px; }
         QLabel#imageThumb { background:#0b0f14; border:1px solid #334556; border-radius:8px; color:#9ab8d8; padding:4px; }
         QScrollBar:vertical { background:#0c1116; width:14px; margin:0; } QScrollBar::handle:vertical { background:#395166; min-height:30px; border-radius:6px; }
-        """)
+        """
+        style = style.replace("__BASE__", str(base)).replace("__TITLE__", str(title)).replace("__HUD__", str(hud))
+        self.setStyleSheet(style)
 
     def _sync_resolution(self):
         label = self.res_class.currentText()
@@ -2492,6 +2570,7 @@ class MainWindow(QMainWindow):
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
             "auto_update_enabled": self.auto_update_enabled.isChecked(),
+            "font_size_pt": int(self.font_size_slider.value()) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
             "play_result_finished": self.play_result_finished.isChecked(),
             "play_result_queue_player": self.play_result_queue_player.isChecked(),
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
@@ -2534,6 +2613,13 @@ class MainWindow(QMainWindow):
             self.tile_debugging.setChecked(bool(d.get("tile_debugging", False)))
             self.system_hud_toggle.setChecked(bool(d.get("system_hud", True)))
             self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
+            saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
+            self.font_size_slider.blockSignals(True)
+            self.font_size_slider.setValue(saved_font)
+            self.font_size_slider.blockSignals(False)
+            self._font_size_pt = saved_font
+            self._update_font_size_label(saved_font)
+            self._apply_style()
             self.play_result_finished.setChecked(bool(d.get("play_result_finished", False)))
             self.play_result_queue_player.setChecked(bool(d.get("play_result_queue_player", False)))
             self.play_result_queue_player.setVisible(self.play_result_finished.isChecked())

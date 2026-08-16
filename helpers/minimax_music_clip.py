@@ -60,6 +60,9 @@ try:
         QProgressBar,
         QPushButton,
         QSlider,
+        QScrollArea,
+        QFrame,
+        QSizePolicy,
         QSpinBox,
         QDoubleSpinBox,
         QTabWidget,
@@ -1544,6 +1547,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project_path = ""
         self.worker: Optional[FunctionWorker] = None
         self._autosave_last_text = ""
+        self._one_click_active = False
         self._build_ui()
         # Restore the complete working session first. The older small settings file
         # remains only as a fallback for installs that do not have a session save yet.
@@ -1593,9 +1597,34 @@ class MiniMaxMusicClipWidget(QWidget):
         footer.addWidget(self.status, 2)
         outer.addLayout(footer)
 
+    def _scrollable_tab_body(self, page: QWidget) -> tuple[QVBoxLayout, QWidget, QVBoxLayout]:
+        """Create a vertically scrollable tab body plus a fixed bottom area.
+
+        The returned outer layout belongs to the tab page. Add normal content to
+        body_layout and add action rows directly to outer after the scroll area so
+        buttons stay visible at the bottom while only the content scrolls.
+        """
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(6)
+        scroll = QScrollArea(page)
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget(scroll)
+        body.setMinimumWidth(0)
+        body.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(2, 2, 2, 2)
+        body_layout.setSpacing(6)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        return outer, body, body_layout
+
     def _build_project_tab(self) -> None:
-        lay = QVBoxLayout(self.page_project)
-        audio_box = QGroupBox("Song", self.page_project)
+        outer, body, lay = self._scrollable_tab_body(self.page_project)
+        audio_box = QGroupBox("Song", body)
         form = QFormLayout(audio_box)
         row = QHBoxLayout()
         self.edit_audio = QLineEdit(audio_box)
@@ -1613,7 +1642,7 @@ class MiniMaxMusicClipWidget(QWidget):
         form.addRow("Project title:", self.edit_title)
         lay.addWidget(audio_box)
 
-        brief = QGroupBox("Creative brief", self.page_project)
+        brief = QGroupBox("Creative brief", body)
         bf = QFormLayout(brief)
         self.edit_idea = QPlainTextEdit(brief); self.edit_idea.setMaximumHeight(90)
         self.edit_style = QLineEdit(brief)
@@ -1635,7 +1664,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_save_as = QPushButton("Save project as...", self.page_project)
         actions.addWidget(self.btn_new); actions.addWidget(self.btn_open); actions.addWidget(self.btn_save); actions.addWidget(self.btn_save_as); actions.addStretch(1)
         lay.addStretch(1)
-        lay.addLayout(actions)
+        outer.addLayout(actions)
 
         self.btn_audio.clicked.connect(self._browse_audio)
         self.btn_output.clicked.connect(self._browse_output)
@@ -1645,15 +1674,15 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_save_as.clicked.connect(lambda: self._save_project(force_as=True))
 
     def _build_refs_tab(self) -> None:
-        lay = QVBoxLayout(self.page_refs)
+        outer, body, lay = self._scrollable_tab_body(self.page_refs)
         info = QLabel(
             "Project references are sent directly to MiniMax Ref2VA. Choose what each image is for: Character, Background / Location, Object / Prop, Style / Mood, or Picture / Composition anchor. "
             "MiniMax then receives the correct <Subject N> or <Picture N> relationship automatically. Use Image purpose details only for consistency rules the model cannot infer by itself. "
             "Each shot can use a different subset; up to 9 images can be passed to one Ref2VA job.",
-            self.page_refs,
+            body,
         )
         info.setWordWrap(True); lay.addWidget(info)
-        self.refs_table = QTableWidget(0, 6, self.page_refs)
+        self.refs_table = QTableWidget(0, 6, body)
         self.refs_table.setHorizontalHeaderLabels(["Use", "Preview", "Name", "Reference role", "Path", "Image description / purpose"])
         self.refs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.refs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -1662,18 +1691,19 @@ class MiniMaxMusicClipWidget(QWidget):
         self.refs_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.refs_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.refs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.refs_table.setMinimumHeight(320)
         lay.addWidget(self.refs_table, 1)
         row = QHBoxLayout()
         self.btn_add_ref = QPushButton("Add reference image...", self.page_refs)
         self.btn_remove_ref = QPushButton("Remove selected", self.page_refs)
         row.addWidget(self.btn_add_ref); row.addWidget(self.btn_remove_ref); row.addStretch(1)
-        lay.addLayout(row)
+        outer.addLayout(row)
         self.btn_add_ref.clicked.connect(self._add_reference)
         self.btn_remove_ref.clicked.connect(self._remove_reference)
 
     def _build_analysis_tab(self) -> None:
-        lay = QVBoxLayout(self.page_analysis)
-        box = QGroupBox("Analysis", self.page_analysis)
+        outer, body, lay = self._scrollable_tab_body(self.page_analysis)
+        box = QGroupBox("Analysis", body)
         form = QFormLayout(box)
         self.spin_sensitivity = QSpinBox(box); self.spin_sensitivity.setRange(0, 20); self.spin_sensitivity.setValue(10)
         self.spin_sensitivity.setToolTip("Beat detector sensitivity. 0 = strict/fewer peaks, 10 = normal, 20 = loose/more peaks.")
@@ -1696,14 +1726,15 @@ class MiniMaxMusicClipWidget(QWidget):
         )
         self.btn_clear_lyrics = QPushButton("Treat as instrumental", self.page_analysis)
         row.addWidget(self.btn_analyze); row.addWidget(self.btn_whisper); row.addWidget(self.btn_download_whisper); row.addWidget(self.btn_clear_lyrics); row.addStretch(1)
-        self.analysis_summary = QLabel("No analysis yet.", self.page_analysis); self.analysis_summary.setWordWrap(True); lay.addWidget(self.analysis_summary)
-        self.lyrics_table = QTableWidget(0, 3, self.page_analysis)
+        self.analysis_summary = QLabel("No analysis yet.", body); self.analysis_summary.setWordWrap(True); lay.addWidget(self.analysis_summary)
+        self.lyrics_table = QTableWidget(0, 3, body)
         self.lyrics_table.setHorizontalHeaderLabels(["Start", "End", "Whisper phrase"])
         self.lyrics_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.lyrics_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.lyrics_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.lyrics_table.setMinimumHeight(360)
         lay.addWidget(self.lyrics_table, 1)
-        lay.addLayout(row)
+        outer.addLayout(row)
         self.btn_analyze.clicked.connect(self._start_analysis)
         self.btn_whisper.clicked.connect(self._start_whisper)
         self.btn_download_whisper.clicked.connect(self._download_whisper_cpp)
@@ -1711,7 +1742,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self._update_whisper_buttons()
 
     def _build_director_tab(self) -> None:
-        lay = QVBoxLayout(self.page_director)
+        outer, body, lay = self._scrollable_tab_body(self.page_director)
         top = QHBoxLayout()
         self.btn_plan = QPushButton("Create / rebuild shot plan", self.page_director)
         self.btn_refresh_prompts = QPushButton("Rebuild H3 Ref2VA prompts", self.page_director)
@@ -1719,9 +1750,9 @@ class MiniMaxMusicClipWidget(QWidget):
         note = QLabel(
             "Prompts are built in MiniMax-H3 full-reference format: subject definitions, reference retention, shot-by-shot description and explicit audio roles. "
             "Lyric/section boundaries that fall inside a generated clip become timestamped H3 shots while the supplied audio continues across the cut.",
-            self.page_director,
+            body,
         ); note.setWordWrap(True); lay.addWidget(note)
-        self.shot_table = QTableWidget(0, 10, self.page_director)
+        self.shot_table = QTableWidget(0, 10, body)
         self.shot_table.setHorizontalHeaderLabels([
             "#", "Song range", "Edit", "MiniMax frames", "Gen", "Section", "Lyrics", "Internal cuts", "References", "Prompt"
         ])
@@ -1731,19 +1762,19 @@ class MiniMaxMusicClipWidget(QWidget):
         self.shot_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.shot_table.verticalHeader().setDefaultSectionSize(72)
         self.shot_table.verticalHeader().setMinimumSectionSize(56)
+        self.shot_table.setMinimumHeight(420)
         lay.addWidget(self.shot_table, 1)
 
-        prompt_box = QGroupBox("Selected shot H3 prompt", self.page_director)
+        prompt_box = QGroupBox("Selected shot H3 prompt", body)
         prompt_lay = QVBoxLayout(prompt_box)
         self.shot_prompt_editor = QPlainTextEdit(prompt_box)
         self.shot_prompt_editor.setPlaceholderText("Select a shot above to view or edit its complete MiniMax-H3 Ref2VA prompt.")
-        self.shot_prompt_editor.setMinimumHeight(150)
-        self.shot_prompt_editor.setMaximumHeight(240)
+        self.shot_prompt_editor.setMinimumHeight(260)
         self.shot_prompt_editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         prompt_lay.addWidget(self.shot_prompt_editor)
         lay.addWidget(prompt_box)
 
-        lay.addLayout(top)
+        outer.addLayout(top)
         self.btn_plan.clicked.connect(self._create_plan)
         self.btn_refresh_prompts.clicked.connect(self._rebuild_prompts)
         self.shot_table.itemChanged.connect(self._shot_table_item_changed)
@@ -1751,7 +1782,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.shot_prompt_editor.textChanged.connect(self._selected_shot_prompt_changed)
 
     def _build_generate_tab(self) -> None:
-        lay = QVBoxLayout(self.page_generate)
+        outer, body, lay = self._scrollable_tab_body(self.page_generate)
         row = QHBoxLayout()
         self.btn_generate_selected = QPushButton("Generate selected shot", self.page_generate)
         self.btn_generate_all = QPushButton("Generate all missing shots", self.page_generate)
@@ -1763,10 +1794,10 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_assemble = QPushButton("Assemble final music video", self.page_generate)
         self.btn_open_output = QPushButton("Open output folder", self.page_generate)
         row.addWidget(self.btn_generate_selected); row.addWidget(self.btn_generate_all); row.addWidget(self.btn_stop_generation); row.addWidget(self.btn_assemble); row.addWidget(self.btn_open_output); row.addStretch(1)
-        self.label_job_seed = QLabel("Job seed: auto (first generation locks one random seed for the whole job). Edit a shot's Seed value below to override it for retries.", self.page_generate)
+        self.label_job_seed = QLabel("Job seed: auto (first generation locks one random seed for the whole job). Edit a shot's Seed value below to override it for retries.", body)
         self.label_job_seed.setWordWrap(True)
         lay.addWidget(self.label_job_seed)
-        self.review_table = QTableWidget(0, 6, self.page_generate)
+        self.review_table = QTableWidget(0, 6, body)
         self.review_table.setHorizontalHeaderLabels(["#", "Status", "Frames", "Edit range", "Output", "Seed"])
         self.review_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -1775,9 +1806,10 @@ class MiniMaxMusicClipWidget(QWidget):
         self.review_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.review_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.review_table.setMinimumHeight(320)
         lay.addWidget(self.review_table, 1)
 
-        preview_box = QGroupBox("Selected clip preview", self.page_generate)
+        preview_box = QGroupBox("Selected clip preview", body)
         preview_lay = QVBoxLayout(preview_box)
         self.review_preview = QLabel("Select a generated shot to preview it.", preview_box)
         self.review_preview.setAlignment(Qt.AlignCenter)
@@ -1791,7 +1823,7 @@ class MiniMaxMusicClipWidget(QWidget):
         preview_actions.addWidget(self.btn_play_clip); preview_actions.addWidget(self.btn_open_clip_folder); preview_actions.addStretch(1)
         preview_lay.addLayout(preview_actions)
         lay.addWidget(preview_box)
-        lay.addLayout(row)
+        outer.addLayout(row)
 
         self.btn_generate_selected.clicked.connect(self._generate_selected)
         self.btn_generate_all.clicked.connect(self._generate_all)
@@ -1805,8 +1837,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.review_table.cellDoubleClicked.connect(lambda _r, _c: self._play_selected_clip())
 
     def _build_settings_tab(self) -> None:
-        lay = QVBoxLayout(self.page_settings)
-        gen = QGroupBox("MiniMax generation", self.page_settings)
+        outer, body, lay = self._scrollable_tab_body(self.page_settings)
+        gen = QGroupBox("MiniMax generation", body)
         form = QFormLayout(gen)
         self.combo_resolution = QComboBox(gen); self.combo_resolution.addItems(list(RESOLUTION_PRESETS.keys())); self.combo_resolution.setCurrentText("832 × 480")
         self.combo_aspect = QComboBox(gen); self.combo_aspect.addItems(["16:9", "9:16", "1:1"])
@@ -1854,7 +1886,7 @@ class MiniMaxMusicClipWidget(QWidget):
         explanation = QLabel(
             "Timing rule: the song timeline is authoritative. MiniMax valid frame counts determine how much source footage is generated, "
             "then FFmpeg trims each source clip to its exact edit slot. Small timing mismatches are repaired during assembly instead of aborting.",
-            self.page_settings,
+            body,
         ); explanation.setWordWrap(True); lay.addWidget(explanation); lay.addStretch(1)
         self.slider_frames.valueChanged.connect(self._update_frame_label)
         self._update_frame_label()
@@ -2039,6 +2071,147 @@ class MiniMaxMusicClipWidget(QWidget):
             kind = _normalise_reference_kind(role_widget.currentText() if isinstance(role_widget, QComboBox) else txt(3))
             refs.append(ReferenceAsset(name=txt(2) or Path(txt(4)).stem, kind=kind, path=txt(4), description=txt(5), enabled=bool(self.refs_table.item(row,0) and self.refs_table.item(row,0).checkState() == Qt.Checked)))
         return refs[:9]
+
+    # ---- one-click video clip workflow ----
+    def create_video_clip(self) -> None:
+        """Run the user-facing Music Clip workflow and enqueue the complete video.
+
+        The standalone host routes its fixed bottom Generate button here while the
+        Music Clip Creator tab is selected. Analysis/transcription/planning happen
+        first; normal MiniMax queue jobs are then created for the physical shots,
+        followed by one final trim/assembly queue job.
+        """
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Music Clip Creator busy", "Wait for the current analysis or Whisper task to finish first.")
+            return
+
+        audio = self.edit_audio.text().strip()
+        if not audio or not Path(audio).is_file():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select master song for the video clip", "",
+                "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All files (*.*)"
+            )
+            if not path:
+                return
+            self.edit_audio.setText(path)
+            if not self.edit_title.text().strip():
+                self.edit_title.setText(Path(path).stem)
+            if self.edit_output.text().strip() in ("", str(OUTPUT_ROOT)):
+                self.edit_output.setText(str(OUTPUT_ROOT / _safe_stem(path)))
+            audio = path
+
+        self._pull_ui()
+        self.project.audio_path = audio
+        self._one_click_active = True
+        # Show the stage that is actually running; the user can still inspect/change tabs.
+        self.tabs.setCurrentIndex(2)
+        self._set_busy("Video clip: analyzing track structure...")
+        self._run_worker(_analysis_task, self._one_click_analysis_done, audio, int(self.project.beat_sensitivity))
+
+    def _one_click_start_worker_when_idle(self, fn, success, *args) -> None:
+        # FunctionWorker emits its success signal immediately before QThread emits
+        # finished. Wait for that tiny handoff window so chained one-click stages do
+        # not trip the normal "A job is already running" protection.
+        if self.worker is not None and self.worker.isRunning():
+            QTimer.singleShot(60, lambda: self._one_click_start_worker_when_idle(fn, success, *args))
+            return
+        self._run_worker(fn, success, *args)
+
+    def _one_click_analysis_done(self, result: AnalysisResult) -> None:
+        self.project.analysis = result
+        self._populate_analysis()
+        self._write_autosave(force=True)
+
+        if not bool(self.check_whisper_timing.isChecked()):
+            self._one_click_build_plan_and_queue()
+            return
+
+        if _whisper_cpp_ready():
+            self._set_busy("Video clip: transcribing lyrics with Whisper.cpp...")
+            self._one_click_start_worker_when_idle(_whisper_task, self._one_click_whisper_done, self.project.audio_path)
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Whisper.cpp not installed",
+            "Lyric-aware timing is enabled, but portable Whisper.cpp Small is not installed yet.\n\n"
+            "Download it now to presets/bin/whisper?\n\n"
+            "Choose No to continue this video with beat/energy timing only.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._set_busy("Video clip: downloading portable Whisper.cpp Small...")
+            self._one_click_start_worker_when_idle(_download_whisper_cpp_task, self._one_click_whisper_downloaded)
+        else:
+            # Do not accidentally reuse lyrics from an older song/session.
+            self.project.lyrics = []
+            self._populate_analysis()
+            self._one_click_build_plan_and_queue()
+
+    def _one_click_whisper_downloaded(self, _path: str) -> None:
+        self._update_whisper_buttons()
+        self._set_busy("Video clip: transcribing lyrics with Whisper.cpp...")
+        self._one_click_start_worker_when_idle(_whisper_task, self._one_click_whisper_done, self.project.audio_path)
+
+    def _one_click_whisper_done(self, lyrics: List[LyricSegment]) -> None:
+        self.project.lyrics = list(lyrics or [])
+        self._populate_analysis()
+        self._write_autosave(force=True)
+        self._one_click_build_plan_and_queue()
+
+    def _one_click_build_plan_and_queue(self) -> None:
+        self.tabs.setCurrentIndex(3)
+        self._pull_ui()
+        if self.project.analysis.duration <= 0:
+            self.project.analysis.duration = probe_duration(self.project.audio_path)
+        try:
+            self.project.shots = build_shot_plan(self.project)
+            for shot in self.project.shots:
+                shot.reference_names = auto_assign_references(self.project, shot)
+                shot.prompt = build_default_prompt(self.project, shot)
+            self._populate_shots()
+            self._populate_review()
+            self._write_autosave(force=True)
+        except Exception as exc:
+            self._one_click_active = False
+            self._set_ready("Video clip planning failed.")
+            QMessageBox.critical(self, "Video clip planning failed", str(exc))
+            return
+
+        if not self.project.shots:
+            self._one_click_active = False
+            self._set_ready("No shots were created.")
+            QMessageBox.warning(self, "No shots", "The Director did not create any shots for this track.")
+            return
+
+        self.tabs.setCurrentIndex(4)
+        self._sync_existing_generated_outputs()
+        missing = [
+            shot.index for shot in self.project.shots
+            if not shot.output_path or not Path(shot.output_path).is_file() or shot.status == "Failed"
+        ]
+
+        if self._queue_mode_active():
+            if missing:
+                self._queue_shots(missing)
+            # Assembly is deliberately enqueued last. The standalone queue therefore
+            # reaches it only after all physical shot jobs ahead of it have finished.
+            self._queue_assembly()
+            self._one_click_active = False
+            self._set_ready(
+                f"Video clip queued: {len(missing)} shot{'s' if len(missing) != 1 else ''} + final trim/assembly."
+                if missing else "All shot files already exist; final trim/assembly queued."
+            )
+            return
+
+        # Direct/standalone helper fallback: generate first; assembly remains the
+        # explicit next action because there is no host queue dependency mechanism.
+        self._one_click_active = False
+        if missing:
+            self._generate_indices(missing)
+        else:
+            self._assemble()
 
     # ---- analysis ----
     def _require_audio(self) -> Optional[str]:
