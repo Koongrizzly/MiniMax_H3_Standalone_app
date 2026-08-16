@@ -332,6 +332,7 @@ class MusicProject:
     phrase_snap_tolerance: float = 1.25
     beat_sensitivity: int = 10
     whisper_timing_enabled: bool = True
+    visible_lyric_subtitles: bool = False
     job_seed: int = -1
     steps: int = 15
     cfg: float = 1.0
@@ -810,6 +811,20 @@ def build_h3_reference_prompt(
     def labels(items: Sequence[Tuple[int, int, ReferenceAsset]]) -> str:
         return ", ".join(f"<Subject {subject_no}>" for subject_no, _picture_no, _ref in items if subject_no)
 
+    # Keep the visual-text rule close to the reference definitions so written lyrics are
+    # not mistaken for a request to create karaoke/subtitle graphics later in the prompt.
+    sections.append("visual_text_policy:")
+    if bool(getattr(project, "visible_lyric_subtitles", False)):
+        sections.append(
+            "Visible lyric subtitles are enabled. The current lyric phrase from <Audio 1> may appear as synchronized readable subtitle/lyric text. "
+            "Do not invent unrelated captions, title cards, logos, lower-thirds or other text. Text explicitly requested as a physical part of the scene may also remain visible."
+        )
+    else:
+        sections.append(
+            "Lyrics and dialogue inside <d>...</d> are audio/performance instructions only. They are heard and lip-synced, never displayed as subtitles, captions, karaoke lyrics, lyric overlays, title cards, lower-thirds or floating text. "
+            "Only text explicitly requested as a physical part of a scene, object, poster, sign, monitor or interface may be visible. Do not turn spoken or sung words into on-screen text."
+        )
+
     # 2) summary
     story = re.sub(r"\s+", " ", project.main_idea.strip()) if project.main_idea.strip() else "the current music-video story"
     summary_bits = [f"[reference generation + audio reuse] Create a music-video shot for {story}."]
@@ -903,19 +918,31 @@ def build_h3_reference_prompt(
 
     if shot.lyrics.strip():
         lyric = re.sub(r"\s+", " ", shot.lyrics.strip())
+        visible_subtitles = bool(getattr(project, "visible_lyric_subtitles", False))
         if len(characters) == 1:
             performer = f"<Subject {characters[0][0]}>"
-            shot1.append(
-                f"When <Audio 1> reaches the lyric phrase <d>[Original language] {lyric}</d>, {performer} is the singer/performer and lip-syncs/sings it in time with the supplied audio."
-            )
+            if visible_subtitles:
+                shot1.append(
+                    f"Lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. Visible lyric subtitles are enabled, so the current phrase may also appear as synchronized readable subtitle text."
+                )
+            else:
+                shot1.append(
+                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. These lyric words are heard and lip-synced only; do not display them anywhere in the image."
+                )
         elif len(characters) > 1:
+            suffix = " Visible lyric subtitles are enabled for this phrase." if visible_subtitles else " The lyric words are audio-only and must not be displayed visually."
             shot1.append(
-                f"When <Audio 1> reaches the lyric phrase <d>[Original language] {lyric}</d>, only the character whose user-defined purpose identifies them as the singer/lead vocalist performs the lyric; keep every other referenced character in their defined role."
+                f"Lyric performance: <d>[Original language] {lyric}</d>. Only the character whose user-defined purpose identifies them as the singer/lead vocalist performs the lyric; keep every other referenced character in their defined role." + suffix
             )
         else:
-            shot1.append(
-                f"When <Audio 1> reaches the lyric phrase <d>[Original language] {lyric}</d>, synchronize the visible performance and mouth movement to the supplied audio."
-            )
+            if visible_subtitles:
+                shot1.append(
+                    f"Lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. Visible lyric subtitles are enabled and may show the current phrase."
+                )
+            else:
+                shot1.append(
+                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. These words are heard only and must not appear visually."
+                )
     else:
         shot1.append("This section contains no supplied lyric phrase; keep the instrumental/vocal-free part of <Audio 1> intact and do not introduce a new vocal performance.")
     sections.append(" ".join(shot1))
@@ -930,7 +957,10 @@ def build_h3_reference_prompt(
             "Keep the same character identities, performer roles, props and background/location roles. <Audio 1> continues seamlessly across the cut with unchanged musical timing and vocal continuity."
         )
 
-    sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. No visible subtitles or captions.")
+    if bool(getattr(project, "visible_lyric_subtitles", False)):
+        sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. Do not invent unrelated captions or title cards beyond the explicitly enabled lyric subtitles and explicitly requested physical scene text.")
+    else:
+        sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. No visible lyric subtitles, captions, karaoke text, lyric overlays or title cards; only explicitly requested physical scene text may appear.")
 
     # 5/6) audio sections. The master/reference song is the only music layer we want.
     sections.append("overall_soundscape:")
@@ -1750,6 +1780,13 @@ class MiniMaxMusicClipWidget(QWidget):
             "Beat/energy analysis becomes supporting information. Off: use the normal beat/energy duration planner. If no lyrics are loaded, normal planning is used automatically."
         )
         form.addRow("Lyric-aware planning:", self.check_whisper_timing)
+        self.check_visible_lyric_subtitles = QCheckBox("Generate visible lyric subtitles", box)
+        self.check_visible_lyric_subtitles.setChecked(False)
+        self.check_visible_lyric_subtitles.setToolTip(
+            "Off (default): Whisper lyrics are audio/performance timing guidance only and must not appear as subtitles, captions, karaoke text or lyric overlays. "
+            "On: MiniMax may render the current lyric phrase as visible subtitles. Text explicitly requested as a physical part of the scene remains independent of this option."
+        )
+        form.addRow("Visible lyrics:", self.check_visible_lyric_subtitles)
         lay.addWidget(box)
         row = QHBoxLayout()
         self.btn_analyze = QPushButton("Analyze track", self.page_analysis)
@@ -1942,6 +1979,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.camera_choreography = self.edit_camera.text().strip()
         self.project.beat_sensitivity = self.spin_sensitivity.value()
         self.project.whisper_timing_enabled = self.check_whisper_timing.isChecked()
+        self.project.visible_lyric_subtitles = self.check_visible_lyric_subtitles.isChecked()
         self.project.resolution = self.combo_resolution.currentText()
         self.project.aspect = self.combo_aspect.currentText()
         self.project.max_frames = MUSIC_FRAME_GRID[self.slider_frames.value()]
@@ -1967,6 +2005,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_idea.setPlainText(p.main_idea); self.edit_style.setText(p.style_theme); self.edit_subjects.setPlainText(p.characters_subjects); self.edit_world.setText(p.locations_world); self.edit_camera.setText(p.camera_choreography)
         self.spin_sensitivity.setValue(p.beat_sensitivity)
         self.check_whisper_timing.setChecked(bool(getattr(p, "whisper_timing_enabled", True)))
+        self.check_visible_lyric_subtitles.setChecked(bool(getattr(p, "visible_lyric_subtitles", False)))
         self.combo_resolution.setCurrentText(p.resolution if p.resolution in RESOLUTION_PRESETS else "832 × 480")
         self.combo_aspect.setCurrentText(p.aspect if p.aspect in ("16:9", "9:16", "1:1") else "16:9")
         nearest_idx = min(range(len(MUSIC_FRAME_GRID)), key=lambda i: abs(MUSIC_FRAME_GRID[i] - int(p.max_frames or MUSIC_FRAME_DEFAULT_MAX)))
@@ -2017,7 +2056,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "vram_offload_chunk_mb", "vram_max_resident_weights_gb", "vram_block_check_interval",
             "vram_async_streams", "vram_video_vae_reserve_gb", "vram_audio_vae_reserve_gb",
             "vram_residency_fill", "vram_residency_target_free_gb", "vram_residency_warmup_blocks",
-            "vram_residency_refill_interval", "sage_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled",
+            "vram_residency_refill_interval", "sage_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
         ):
             setattr(self.project, name, getattr(old, name))
         self.project_path = ""
