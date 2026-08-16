@@ -43,7 +43,16 @@ def load_audio(path):
 def encode_audio(vae,audio):
     w=audio['waveform']; sr=audio['sample_rate']; vsr=getattr(vae,'audio_sample_rate',32000)
     if sr!=vsr: w=torchaudio.functional.resample(w,sr,vsr)
-    z=vae.encode(w[:1].movedim(1,-1)); return z,z.shape[-1]
+    # Ref2VA audio encoding is inference-only. Running the MiniMax audio VAE with
+    # autograd enabled can retain a very large encoder/attention graph for long
+    # reference clips. On a 24 GB Windows GPU that graph can consume the whole
+    # card and spill into shared GPU memory before Qwen even starts.
+    # Keep no graph at all and move the tiny 40 Hz reference latent to CPU
+    # immediately, before leaving this helper.
+    with torch.inference_mode():
+        z=vae.encode(w[:1].movedim(1,-1))
+        z=z.detach().cpu()
+    return z,z.shape[-1]
 
 
 
