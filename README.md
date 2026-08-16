@@ -133,27 +133,6 @@ After installation, double-click:
 start.bat
 
 ---
-
-Prompt Builder
-The application contains an integrated version of the Hailuo H3 Prompt Builder, an unofficial community prompt-building tool created by Bob Doyle Media.
-The local integration was adapted for this standalone application and includes support for local LLM/GGUF workflows trough llama cpp server (auto downloads at first use).
-Credits to Bob Doyle Media: Website: https://www.bobdoylemedia.com YouTube: https://www.youtube.com/@BobDoyleMedia
-The Prompt Builder is a community tool and is not an official MiniMax product.
-
-INT4 / W4A8 ConvRot models
-The standalone uses community pre-quantized MiniMax H3 INT4 / W4A8 ConvRot model and text-encoder files.
-Credit for the INT4 ConvRot MiniMax H3 weights used as the basis for this setup goes to Winnougan.
-MiniMax H3 INT4 ConvRot repository:https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI
-Winnougan Hugging Face:https://huggingface.co/Winnougan.
-Please respect the licenses and usage terms of the original MiniMax H3 model and every upstream quantized checkpoint.
-
-ComfyUI components
-Although this is a standalone desktop application and does not require the user to run ComfyUI, parts of the backend use code/components originating from ComfyUI / Comfy-Org, including MiniMax H3 model loading, comfy_extras H3 support and VAE/model-management components.
-ComfyUI is licensed under GPL-3.0.
-ComfyUI GitHub: https://github.com/Comfy-Org/ComfyUI
-ComfyUI documentation: https://docs.comfy.org/
-Please see the repository license files for the licensing requirements that apply to redistributed ComfyUI-derived code.
-
 ---
 
 Troubleshooting
