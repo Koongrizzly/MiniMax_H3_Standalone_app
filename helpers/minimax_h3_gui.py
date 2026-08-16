@@ -772,6 +772,7 @@ class MainWindow(QMainWindow):
         self._build_generation_tab()
         self._build_prompt_builder_tab()
         self._build_queue_tab()
+        self._build_music_clip_tab()
         self._build_settings_tab()
 
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.
@@ -1963,6 +1964,88 @@ class MainWindow(QMainWindow):
         preferred=[x for x in lines if any(k in x.lower() for k in ("error","failed","exception","traceback","not found","missing"))]
         return (preferred[-1] if preferred else (lines[-1] if lines else f"Process exited with code {code}"))[:1500]
 
+    def _build_music_clip_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        try:
+            from minimax_music_clip import MiniMaxMusicClipWidget
+            self.music_clip_widget = MiniMaxMusicClipWidget(page, queue_adapter=self._enqueue_music_clip_job)
+            lay.addWidget(self.music_clip_widget, 1)
+            self.tabs.addTab(page, "Music Clip Creator")
+        except Exception as exc:
+            self.music_clip_widget = None
+            msg = QLabel(
+                "Music Clip Creator could not be loaded.\n\n" + str(exc), page
+            )
+            msg.setWordWrap(True)
+            msg.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lay.addWidget(msg)
+            lay.addStretch(1)
+            self.tabs.addTab(page, "Music Clip Creator")
+
+    def _enqueue_music_clip_job(self, spec):
+        """Add one Music Clip Creator unit to the standalone MiniMax queue.
+
+        One generated shot is one normal queue job.  Final assembly is also a queue
+        job, so Generate all missing shots can safely enqueue a batch and the user can
+        cancel/requeue individual clips from the existing Queue tab.
+        """
+        if not isinstance(spec, dict):
+            raise ValueError("Invalid Music Clip queue job specification.")
+        args = list(spec.get("args") or [])
+        output = str(spec.get("output") or "").strip()
+        if not args or not output:
+            raise ValueError("Music Clip queue job is missing command arguments or output path.")
+        label = str(spec.get("label") or "Music Clip job")
+        frames = int(spec.get("frames") or 0)
+        steps = int(spec.get("steps") or 0)
+        seed = int(spec.get("seed") if spec.get("seed") is not None else -1)
+        job = {
+            "id": uuid.uuid4().hex,
+            "job_number": self._take_next_job_number(),
+            "state": "pending",
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "elapsed": 0,
+            "mode": 3,
+            "mode_name": "Music Clip Creator",
+            "model_label": "MiniMax H3 Ref2VA" if not spec.get("music_assembly") else "Music Clip assembly",
+            "output": output,
+            "seed": seed,
+            "actual_seed": None,
+            "resolution": str(spec.get("resolution") or "Music Clip"),
+            "frames": frames,
+            "steps": steps,
+            "prompt": str(spec.get("prompt") or label),
+            "args": args,
+            "progress": None,
+            "phase": "Waiting",
+            "error": "",
+            "cancel_reason": "",
+            "settings": {},
+            "log_tail": "",
+            "continue_last_result": False,
+            "continue_from_job_id": None,
+            "continue_from_job_number": None,
+            "manual_continue_video": "",
+            "continue_context_frames": None,
+            "glue_results": False,
+            "continue_audio_memory": False,
+            "music_clip_job": True,
+            "music_clip_label": label,
+        }
+        for key in ("music_shot_index", "music_project_output", "music_assembly"):
+            if key in spec:
+                job[key] = spec[key]
+        self.queue_jobs.append(job)
+        self._save_queue_state()
+        self._refresh_queue_views()
+        self.status.setText(f"Added to queue: {label}")
+        self._start_next_pending()
+        return job.get("job_number")
+
     def _build_settings_tab(self):
         body = QWidget(); v = QVBoxLayout(body); v.setContentsMargins(8, 8, 8, 8); v.setSpacing(10)
 
@@ -2910,6 +2993,11 @@ class MainWindow(QMainWindow):
         self.append_log(finish_line); self.proc=None; self.current_job_id=None; self._termination_action=None; self.cancel.setEnabled(False); self.gen.setEnabled(True)
         self._active_log_file=None
         self.status.setText("Queue ready" if code in (0,3) else f"Job stopped/failed ({code})"); self._save_queue_state(); self._refresh_queue_views()
+        if job and job.get("music_clip_job") and getattr(self, "music_clip_widget", None) is not None:
+            try:
+                self.music_clip_widget.external_queue_updated(job)
+            except Exception as exc:
+                self.append_log(f"Music Clip review refresh warning: {exc}\n")
         if play_finished_job is not None:
             QTimer.singleShot(50, lambda j=play_finished_job: self._play_completed_result(j))
         QTimer.singleShot(150,self._start_next_pending)
