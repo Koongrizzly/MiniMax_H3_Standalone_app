@@ -1417,24 +1417,16 @@ def _terminate_generation_process_tree() -> None:
 
 
 def _recreate_output_path(raw_dir: Path, shot_index: int) -> Tuple[Path, bool]:
-    """Return a writable output path for a shot recreation.
+    """Return an output path that cannot collide with a clip already being reviewed.
 
-    Prefer the stable shot_###.mp4 filename. If Windows has that file locked
-    (for example by an external media player), do not fail the generation: create
-    a versioned replacement and let the project point at that new file instead.
+    First generation keeps the stable shot_###.mp4 name. Any recreation/retry of an
+    existing shot ALWAYS gets a new versioned filename. Do not probe by unlinking the
+    existing clip: on Windows a player/review widget can acquire or reacquire a handle
+    during the several-minute render, creating a race that only fails at final mux.
     """
     preferred = raw_dir / f"shot_{shot_index:03d}.mp4"
     if not preferred.exists():
         return preferred, False
-    try:
-        preferred.unlink()
-        return preferred, False
-    except PermissionError:
-        pass
-    except OSError:
-        # Treat any Windows sharing/access problem as a locked output. The new
-        # version is safer than risking a failed render after several minutes.
-        pass
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     candidate = raw_dir / f"shot_{shot_index:03d}_retry_{stamp}.mp4"
@@ -1475,7 +1467,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         _extract_audio_slice(project.audio_path, audio_chunk, shot.generation_start, shot.frames / FPS)
         out_path, used_retry_name = _recreate_output_path(raw_dir, shot.index)
         if used_retry_name:
-            progress(f"Shot {shot.index}: previous clip is locked by another program; rendering replacement as {out_path.name}.")
+            progress(f"Shot {shot.index}: recreation uses a new output file {out_path.name}; the existing clip is left untouched.")
         shot.output_path = str(out_path)
         selected_names = [n for n in shot.reference_names if n in refs_by_name]
         if not selected_names:
@@ -1488,6 +1480,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             selected_names = [next(iter(refs_by_name))]
         selected = [refs_by_name[n] for n in selected_names[:9]]
         generation_prompt = build_generation_prompt(project, shot, selected)
+        (raw_dir / f"shot_{shot.index:03d}_prompt.txt").write_text(generation_prompt, encoding="utf-8")
         cmd = [
             str(MINIMAX_PY), "-u", str(GENERATE_REF),
             "--prompt", generation_prompt,
@@ -2039,7 +2032,28 @@ class MiniMaxMusicClipWidget(QWidget):
         self._update_frame_label()
 
     # ---- state conversion ----
+    def _commit_selected_shot_prompt(self) -> None:
+        """Commit the visible Director editor text into the selected shot immediately."""
+        if not hasattr(self, "shot_prompt_editor") or not hasattr(self, "shot_table"):
+            return
+        shot = self._selected_director_shot()
+        if shot is None:
+            return
+        text = self.shot_prompt_editor.toPlainText()
+        if shot.prompt != text:
+            shot.prompt = text
+        row = next((r for r, s in enumerate(self.project.shots) if s.index == shot.index), -1)
+        if row >= 0:
+            item = self.shot_table.item(row, 9)
+            if item is not None and item.text() != text:
+                self.shot_table.blockSignals(True)
+                item.setText(text)
+                self.shot_table.blockSignals(False)
+
     def _pull_ui(self) -> None:
+        # The Director prompt editor is authoritative. Commit it before ANY save,
+        # queue, generation, restart autosave, or project-state snapshot.
+        self._commit_selected_shot_prompt()
         self.project.audio_path = self.edit_audio.text().strip()
         self.project.output_dir = self.edit_output.text().strip() or str(OUTPUT_ROOT)
         self.project.title = self.edit_title.text().strip()
@@ -2547,18 +2561,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.shot_prompt_editor.blockSignals(False)
 
     def _selected_shot_prompt_changed(self) -> None:
-        shot = self._selected_director_shot()
-        if shot is None:
-            return
-        text = self.shot_prompt_editor.toPlainText()
-        shot.prompt = text
-        row = next((r for r, s in enumerate(self.project.shots) if s.index == shot.index), -1)
-        if row >= 0:
-            item = self.shot_table.item(row, 9)
-            if item is not None and item.text() != text:
-                self.shot_table.blockSignals(True)
-                item.setText(text)
-                self.shot_table.blockSignals(False)
+        self._commit_selected_shot_prompt()
 
     def _next_job_seed(self) -> int:
         return random.SystemRandom().randint(0, 2_147_483_647)
@@ -2725,6 +2728,9 @@ class MiniMaxMusicClipWidget(QWidget):
         return callable(self.queue_adapter)
 
     def _prepare_shot_queue_job(self, shot: MusicShot) -> Dict[str, Any]:
+        # A retry/recreate must use what is visible in Director right now, not a
+        # regenerated project-Idea prompt and not a stale autosave copy.
+        self._commit_selected_shot_prompt()
         if not MINIMAX_PY.is_file():
             raise RuntimeError(f"MiniMax environment Python not found: {MINIMAX_PY}")
         if not GENERATE_REF.is_file():
@@ -2741,7 +2747,7 @@ class MiniMaxMusicClipWidget(QWidget):
         out_path, used_retry_name = _recreate_output_path(raw_dir, shot.index)
         if used_retry_name:
             self.status.setText(
-                f"Shot {shot.index}: existing clip is open/locked; queued replacement will use {out_path.name}."
+                f"Shot {shot.index}: recreation uses a new output file {out_path.name} so the existing clip can stay open."
             )
         refs_by_name = {r.name: r for r in self.project.references if r.enabled and Path(r.path).is_file()}
         selected_names = [n for n in shot.reference_names if n in refs_by_name]
@@ -2751,6 +2757,12 @@ class MiniMaxMusicClipWidget(QWidget):
             selected_names = [next(iter(refs_by_name))]
         selected = [refs_by_name[n] for n in selected_names[:9]]
         generation_prompt = build_generation_prompt(self.project, shot, selected)
+
+        # Persist the exact text handed to MiniMax for audit/debugging. This makes it
+        # impossible to confuse the Director editor, autosave state, and actual queue prompt.
+        prompt_sidecar = raw_dir / f"shot_{shot.index:03d}_prompt.txt"
+        prompt_sidecar.write_text(generation_prompt, encoding="utf-8")
+
         width, height = RESOLUTION_PRESETS[self.project.resolution][self.project.aspect]
         args = [
             "helpers/generate_ref.py",
@@ -2804,6 +2816,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "seed": int(shot.seed),
             "resolution": f"{width} × {height}",
             "prompt": generation_prompt,
+            "music_prompt_file": str(prompt_sidecar),
             "music_shot_index": int(shot.index),
             "music_project_output": str(out_dir),
             "music_recreated_to_new_name": bool(used_retry_name),
@@ -2990,6 +3003,7 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _write_autosave(self, force: bool = False) -> None:
         try:
+            self._commit_selected_shot_prompt()
             payload = self._autosave_payload()
             compare_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             if not force and compare_text == self._autosave_last_text:
