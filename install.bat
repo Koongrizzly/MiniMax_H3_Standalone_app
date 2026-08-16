@@ -166,7 +166,7 @@ if errorlevel 1 (
 set "ENV=%CD%\environments\.minimax_h3_int4"
 set "PY=%ENV%\python.exe"
 if not exist "%PY%" (
-  echo [1/7] Creating isolated Python 3.12 environment...
+  echo [1/8] Creating isolated Python 3.12 environment...
   if /i "%CONDA_KIND%"=="bat" (
     call "%CONDA_CMD%" create -y -p "%ENV%" python=3.12 pip
   ) else (
@@ -174,50 +174,102 @@ if not exist "%PY%" (
   )
   if errorlevel 1 goto :fail
 ) else (
-  echo [1/7] Environment already exists.
+  echo [1/8] Environment already exists.
 )
 
-echo [2/7] Updating pip...
-"%PY%" -m pip install --upgrade pip setuptools wheel
+echo [2/8] Updating pip...
+"%PY%" -m pip install --no-warn-script-location --upgrade pip setuptools wheel
 if errorlevel 1 goto :fail
 
-echo [3/7] Installing matched PyTorch 2.11.0 CUDA 13.0 stack...
+echo [3/8] Installing matched PyTorch 2.11.0 CUDA 13.0 stack...
 echo       torch 2.11.0 / torchvision 0.26.0 / torchaudio 2.11.0
 REM PyTorch 2.12.1 does not publish a matching torchaudio 2.12.1 cu130 Windows wheel.
 REM Clear any partial packages from an interrupted/failed previous install first.
 "%PY%" -m pip uninstall -y torch torchvision torchaudio >nul 2>&1
-"%PY%" -m pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+"%PY%" -m pip install --no-warn-script-location torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 if errorlevel 1 goto :fail
 
-echo [4/7] Installing MiniMax-H3 runtime dependencies...
-"%PY%" -m pip install -r "%CD%\presets\requirements-runtime.txt"
+echo [4/8] Installing Ref2VA audio support...
+echo       TorchCodec 0.11.1 + private FFmpeg 7.1 shared libraries.
+echo       This does NOT install FFmpeg through Conda and does NOT modify the GUI/runtime code.
+set "TC_FFMPEG=%ENV%\torchcodec_ffmpeg"
+set "TC_FFMPEG_ZIP=%TEMP%\minimax_ffmpeg_shared_7_1.zip"
+set "TC_FFMPEG_TMP=%ENV%\torchcodec_ffmpeg_extract"
+set "TC_FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+
+REM TorchCodec 0.11.x is the matching line for Torch 2.11. Use --no-deps so the
+REM already matched Torch/CUDA installation cannot be replaced.
+"%PY%" -m pip install --no-warn-script-location --no-deps "torchcodec==0.11.1"
 if errorlevel 1 goto :fail
 
-echo [5/7] Installing Triton-Windows for Torch 2.10+...
+REM TorchCodec needs FFmpeg shared DLLs on Windows. Keep a private copy inside
+REM the isolated MiniMax environment instead of adding Conda/GTK packages.
+if not exist "%TC_FFMPEG%\bin\avcodec-61.dll" (
+  echo       Downloading FFmpeg 7.1 shared build...
+  where curl.exe >nul 2>&1
+  if errorlevel 1 (
+    echo ERROR: Windows curl.exe was not found.
+    goto :fail
+  )
+  curl.exe -L --fail --retry 5 --retry-delay 2 --continue-at - -o "%TC_FFMPEG_ZIP%" "%TC_FFMPEG_URL%"
+  if errorlevel 1 goto :fail
+  if exist "%TC_FFMPEG_TMP%" rmdir /s /q "%TC_FFMPEG_TMP%"
+  mkdir "%TC_FFMPEG_TMP%" >nul 2>&1
+  "%PY%" -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "%TC_FFMPEG_ZIP%" "%TC_FFMPEG_TMP%"
+  if errorlevel 1 goto :fail
+  if exist "%TC_FFMPEG%" rmdir /s /q "%TC_FFMPEG%"
+  "%PY%" -c "import pathlib,shutil,sys; src=pathlib.Path(sys.argv[1]); dst=pathlib.Path(sys.argv[2]); roots=[p for p in src.iterdir() if p.is_dir()]; assert roots, 'FFmpeg archive had no folder'; shutil.move(str(roots[0]), str(dst))" "%TC_FFMPEG_TMP%" "%TC_FFMPEG%"
+  if errorlevel 1 goto :fail
+  rmdir /s /q "%TC_FFMPEG_TMP%" >nul 2>&1
+  del /q "%TC_FFMPEG_ZIP%" >nul 2>&1
+) else (
+  echo       Private FFmpeg 7.1 shared libraries already present; skipping download.
+)
+
+REM Make the private FFmpeg DLL folder visible automatically whenever this
+REM isolated Python starts, including when the GUI launches python.exe directly.
+> "%ENV%\Lib\site-packages\minimax_ffmpeg_dll_path.py" echo import os
+>> "%ENV%\Lib\site-packages\minimax_ffmpeg_dll_path.py" echo from pathlib import Path
+>> "%ENV%\Lib\site-packages\minimax_ffmpeg_dll_path.py" echo _p = str(Path(__file__).resolve().parents[2] / "torchcodec_ffmpeg" / "bin")
+>> "%ENV%\Lib\site-packages\minimax_ffmpeg_dll_path.py" echo if os.path.isdir(_p):
+>> "%ENV%\Lib\site-packages\minimax_ffmpeg_dll_path.py" echo     os.environ["PATH"] = _p + os.pathsep + os.environ.get("PATH", "")
+>> "%ENV%\Lib\site-packages\minimax_ffmpeg_dll_path.py" echo     _dll_dir = os.add_dll_directory(_p) if hasattr(os, "add_dll_directory") else None
+> "%ENV%\Lib\site-packages\minimax_ffmpeg_dll_path.pth" echo import minimax_ffmpeg_dll_path
+
+REM Exercise the same torchaudio.load path used by Ref2VA before continuing.
+echo       Running Ref2VA audio decode smoke test...
+"%PY%" -c "import os,tempfile,wave,torchaudio,torchcodec; p=tempfile.mktemp(suffix='.wav'); w=wave.open(p,'wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(32000); w.writeframes(b'\x00\x00'*3200); w.close(); x,sr=torchaudio.load(p); os.remove(p); assert sr==32000 and x.shape[-1]==3200, (sr,x.shape); print('TorchCodec Ref2VA audio OK:', torchcodec.__version__, sr, tuple(x.shape))"
+if errorlevel 1 goto :fail
+
+echo [5/8] Installing MiniMax-H3 runtime dependencies...
+"%PY%" -m pip install --no-warn-script-location -r "%CD%\presets\requirements-runtime.txt"
+if errorlevel 1 goto :fail
+
+echo [6/8] Installing Triton-Windows for Torch 2.10+...
 REM SageAttention imports Triton at runtime. Triton-Windows 3.6 is the compatible
 REM Windows line for PyTorch 2.10+; cap below 3.7 to avoid a future incompatible upgrade.
 "%PY%" -c "import triton; import importlib.metadata as m; v=m.version('triton-windows'); assert v.startswith('3.6.'), v" >nul 2>&1
 if errorlevel 1 (
   echo       Triton-Windows 3.6 missing or incompatible; installing before SageAttention...
-  "%PY%" -m pip install --upgrade "triton-windows>=3.6,<3.7"
+  "%PY%" -m pip install --no-warn-script-location --upgrade "triton-windows>=3.6,<3.7"
   if errorlevel 1 goto :fail
 ) else (
   echo       Compatible Triton-Windows already installed; skipping download.
 )
 
-echo [6/7] Installing SageAttention 2.2.0.post6 for CUDA 13 / Torch 2.10+ ABI...
+echo [7/8] Installing SageAttention 2.2.0.post6 for CUDA 13 / Torch 2.10+ ABI...
 set "SAGE_WHEEL=https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post6/sageattention-2.2.0+cu130torch2.10.0andhigher.post6-cp310-abi3-win_amd64.whl"
 REM Do not let SageAttention modify the already matched Torch/CUDA stack.
 "%PY%" -c "import sageattention; from sageattention import sageattn_qk_int8_pv_fp16_cuda" >nul 2>&1
 if errorlevel 1 (
   echo       SageAttention missing or incomplete; installing exact prebuilt wheel with --no-deps...
-  "%PY%" -m pip install --no-deps "%SAGE_WHEEL%"
+  "%PY%" -m pip install --no-warn-script-location --no-deps "%SAGE_WHEEL%"
   if errorlevel 1 goto :fail
 ) else (
   echo       Compatible SageAttention already installed; skipping download.
 )
 
-echo [7/7] Running import / CUDA / SageAttention smoke test...
+echo [8/8] Running import / CUDA / SageAttention smoke test...
 "%PY%" "%CD%\runtime\validate_install.py"
 if errorlevel 1 goto :fail
 
