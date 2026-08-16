@@ -19,9 +19,12 @@ It supports :
 - Reference image/video/audio → video + audio (Ref2VA)
 
 - BETA 08/16/26: imported the Framevision music clip creator and converted it for use with MiniMax H3
+  
   Built-in mini whisper Cpp support for Lyrics, smart reference system for backgrounds and characters,
   shotlist creator/director/review tab and much more.
+
   Uses the vram manager in combination with the ref2va model to combine music, lipsync and ref images into 1 music video
+
   Add an idea, extra details, camera shots, location(s) in the idea tab and a music track and click start
   to create a full music videoclips with the click of a button.
 
