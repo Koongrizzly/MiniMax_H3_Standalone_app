@@ -12,7 +12,7 @@ Design rules:
 - Lyric songs prefer Whisper phrase boundaries; instrumental songs use evenly distributed,
   beat-aware cuts without treating tiny timing mismatches as fatal.
 - A visual change may be directed *inside* one MiniMax generation when a lyric/section
-  boundary does not fit a useful physical clip boundary.
+  boundary does not fit a useful physical clip boundary..
 - The original full song is muxed back at final assembly; generated clip audio is not used
   as the final soundtrack.
 
