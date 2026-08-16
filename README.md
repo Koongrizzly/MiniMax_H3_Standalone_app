@@ -8,7 +8,7 @@
 - This project provides a standalone PySide6 GUI for MiniMax H3 video generation without requiring the user to install or launch ComfyUI. A minimal comfyui backend to load the models runs in the background
 ---
 
-It supports:
+It supports :
 
 - Text → video + audio (T2VA)
 
