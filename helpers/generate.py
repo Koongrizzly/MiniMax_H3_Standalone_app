@@ -12,14 +12,14 @@ from runtime.paths import ROOT
 from runtime.validate_models import validate
 from runtime import vram_manager as _vram_manager_module
 
-_EXPECTED_VRAM_SIGNATURE = "V11_QWEN_PREFLIGHT_20260816B"
+_EXPECTED_VRAM_SIGNATURE = "V11_2_QWEN_ADMISSION_20260816C"
 
 def _verify_vram_runtime():
     actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
     if actual != _EXPECTED_VRAM_SIGNATURE:
         path = getattr(_vram_manager_module, "__file__", "unknown")
         raise RuntimeError(
-            "VRAM Manager patch mismatch: the launcher is V11.1 but the loaded "
+            "VRAM Manager patch mismatch: the launcher is V11.2 but the loaded "
             f"runtime/vram_manager.py is not. Loaded: {path} | signature={actual!r}. "
             "Re-extract the patch into the MiniMax app root so both helpers/ and runtime/ are replaced."
         )
@@ -66,7 +66,7 @@ def main():
     ns = ap.parse_args()
     if ns.vram_manager:
         runtime_path = _verify_vram_runtime()
-        print(f"[VRAM-MGR] V11.1 runtime verified: {runtime_path}", flush=True)
+        print(f"[VRAM-MGR] V11.2 runtime verified: {runtime_path}", flush=True)
     if ns.video_vae_tile_size < 128: print("ERROR: video VAE tile size must be at least 128 px"); return 2
     if ns.video_vae_tile_overlap < 0 or ns.video_vae_tile_overlap >= ns.video_vae_tile_size: print("ERROR: video VAE tile overlap must be >= 0 and smaller than tile size"); return 2
     if len(ns.lora) != len(ns.lora_strength): print("ERROR: each --lora needs one matching --lora-strength"); return 2
@@ -280,7 +280,7 @@ def main():
                 comfy_args += ["--enable-dynamic-vram"]
             if ns.vram_async_streams <= 0: comfy_args += ["--disable-async-offload"]
             else: comfy_args += ["--async-offload", str(ns.vram_async_streams)]
-            print(f"VRAM Manager V11: sample stages={','.join(managed_sample_stages) if ns.vram_manager_auto else 'forced all'} | engine={ns.vram_residency_engine} | runtime free={ns.vram_runtime_free_gb:g} GB | text load headroom={ns.vram_text_headroom_gb:g} GB | diffusion load headroom={ns.vram_diffusion_headroom_gb:g} GB | chunk={ns.vram_offload_chunk_mb} MB | max weights={'auto' if ns.vram_max_resident_weights_gb <= 0 else f'{ns.vram_max_resident_weights_gb:g} GB'} | block check={ns.vram_block_interval if hasattr(ns, 'vram_block_interval') else ns.vram_block_check_interval} | async streams={ns.vram_async_streams}", flush=True)
+            print(f"VRAM Manager V11.2: sample stages={','.join(managed_sample_stages) if ns.vram_manager_auto else 'forced all'} | engine={ns.vram_residency_engine} | runtime free={ns.vram_runtime_free_gb:g} GB | text load headroom={ns.vram_text_headroom_gb:g} GB | diffusion load headroom={ns.vram_diffusion_headroom_gb:g} GB | chunk={ns.vram_offload_chunk_mb} MB | max weights={'auto' if ns.vram_max_resident_weights_gb <= 0 else f'{ns.vram_max_resident_weights_gb:g} GB'} | block check={ns.vram_block_interval if hasattr(ns, 'vram_block_interval') else ns.vram_block_check_interval} | async streams={ns.vram_async_streams}", flush=True)
         if comfy_args:
             sample_env["H3_COMFY_ARGS"] = " ".join(comfy_args)
         for lp, strength in zip(ns.lora, ns.lora_strength): sample_cmd += ["--lora", str(Path(lp).resolve()), "--lora-strength", str(strength)]
