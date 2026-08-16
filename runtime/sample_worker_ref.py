@@ -117,11 +117,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_2_QWEN_ADMISSION_20260816C"
+        expected = "V11_3_AUTO_REF2VA_QWEN_20260817A"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.2 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.3 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     if len(ns.lora)!=len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora)>3: raise ValueError('Maximum 3 LoRAs are supported')
     manager=None
@@ -193,7 +193,7 @@ def main():
     if manager is not None and manager.is_stage_managed('text'):
         manager.begin_text_conditioning_admission()
         # comfy.sd.load_clip() is lazy: this is the first real Qwen CUDA residency
-        # load.  Do it under the V11.2 activation reserve, then verify actual free
+        # load.  Do it under the V11.3 activation reserve, then verify actual free
         # VRAM before the first transformer forward.
         clip.load_model(tokens)
         manager.prepare_text_conditioning(reason='Ref2VA pre-Qwen conditioning')

@@ -67,15 +67,36 @@ def estimate_native_sampling_vram_gib(width: int, height: int, frames: int, mode
     return required
 
 
-def estimate_text_encoder_vram_gib(text_encoder_path=None) -> float:
-    """Native Qwen requirement.
+def estimate_text_encoder_vram_gib(
+    text_encoder_path=None,
+    *,
+    mode: str = "fl2va",
+    ref_image_count: int = 0,
+    ref_video_count: int = 0,
+    ref_audio_count: int = 0,
+) -> float:
+    """Estimate native Qwen conditioning peak.
 
-    The W4A8 encoder checkpoint is about 17 GiB in this app and Comfy's CLIP
-    constructor normally requests a full CUDA load. Add room for model wrappers,
-    temporary casts and prompt/vision-token activations.
+    FL2VA keeps the legacy checkpoint-size estimate. Ref2VA is different: image,
+    video and audio conditioning can create a large first-forward transient on top
+    of a fully resident Qwen model. Real RTX 3090 logs from the standalone app
+    showed native Ref2VA conditioning reaching about 30.3 GiB even when the old
+    estimator predicted only ~16.6 GiB. Use that observed peak as a conservative
+    native safety floor whenever Ref2VA carries reference conditioning, while still
+    allowing genuinely larger-memory cards to bypass the manager.
     """
     weights = _file_gib(text_encoder_path, 17.0)
-    return weights * 1.03 + 1.50
+    base = weights * 1.03 + 1.50
+    if str(mode).lower() == "ref2va":
+        reference_items = max(0, int(ref_image_count)) + max(0, int(ref_video_count)) + max(0, int(ref_audio_count))
+        if reference_items > 0:
+            # 30.50 GiB is just above the ~30.29 GiB CUDA-reserved peak observed
+            # on several 960x544 Ref2VA image/audio conditioning jobs. Additional
+            # references add a small safety increment without pretending to model
+            # exact tokenization at launcher time.
+            ref2va_floor = 30.50 + 0.50 * max(0, reference_items - 1)
+            return max(base, ref2va_floor)
+    return base
 
 
 def estimate_reference_encode_vram_gib(
@@ -167,6 +188,9 @@ def decide_vram_stages(
     reference_needed: bool = False,
     reference_frames: int = 1,
     reference_audio: bool = False,
+    ref_image_count: int = 0,
+    ref_video_count: int = 0,
+    ref_audio_count: int = 0,
 ):
     """Return independent automatic VRAM decisions for every expensive H3 stage."""
     gpu = query_primary_gpu_vram()
@@ -190,7 +214,13 @@ def decide_vram_stages(
             needed=bool(reference_needed),
         ),
         "text": _stage_decision(
-            estimate_text_encoder_vram_gib(text_encoder_path),
+            estimate_text_encoder_vram_gib(
+                text_encoder_path,
+                mode=mode,
+                ref_image_count=ref_image_count,
+                ref_video_count=ref_video_count,
+                ref_audio_count=ref_audio_count,
+            ),
             usable,
             "Qwen/text encoder",
             needed=True,
