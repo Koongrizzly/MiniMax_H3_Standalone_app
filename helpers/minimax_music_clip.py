@@ -12,7 +12,7 @@ Design rules:
 - Lyric songs prefer Whisper phrase boundaries; instrumental songs use evenly distributed,
   beat-aware cuts without treating tiny timing mismatches as fatal.
 - A visual change may be directed *inside* one MiniMax generation when a lyric/section
-  boundary does not fit a useful physical clip boundary..
+  boundary does not fit a useful physical clip boundary.
 - The original full song is muxed back at final assembly; generated clip audio is not used
   as the final soundtrack.
 
@@ -793,6 +793,8 @@ def build_h3_reference_prompt(
     another visible person/performer.
     """
     refs = list(selected_refs)[:9]
+    lyric_text = _clean_whisper_lyric_text(shot.lyrics)
+    has_lyrics = bool(lyric_text)
 
     # 1) subject_definitions
     sections: List[str] = ["subject_definitions:"]
@@ -829,7 +831,10 @@ def build_h3_reference_prompt(
     story = re.sub(r"\s+", " ", project.main_idea.strip()) if project.main_idea.strip() else "the current music-video story"
     summary_bits = [f"[reference generation + audio reuse] Create a music-video shot for {story}."]
     if characters:
-        summary_bits.append(f"Use {labels(characters)} as the visible character/performer reference{'s' if len(characters) != 1 else ''}.")
+        if has_lyrics:
+            summary_bits.append(f"Use {labels(characters)} as the visible character/performer reference{'s' if len(characters) != 1 else ''}.")
+        else:
+            summary_bits.append(f"Use {labels(characters)} as the visible character reference{'s' if len(characters) != 1 else ''}; this interval is instrumental-only, so the character action is visual rather than vocal.")
     if backgrounds:
         summary_bits.append(f"Use {labels(backgrounds)} only as the scene environment/background reference{'s' if len(backgrounds) != 1 else ''}, not as additional people or performers.")
     if objects:
@@ -841,7 +846,10 @@ def build_h3_reference_prompt(
     if picture_anchors:
         picture_summary = ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors)
         summary_bits.append(f"Use {picture_summary} as concrete composition/shot-planning anchors rather than as character identities.")
-    summary_bits.append("Reuse <Audio 1> as the continuous authoritative song/performance source for this shot.")
+    if has_lyrics:
+        summary_bits.append("Reuse <Audio 1> as the continuous authoritative song/performance source for this shot.")
+    else:
+        summary_bits.append("Reuse <Audio 1> as the continuous authoritative instrumental audio source for this shot; the visible character performs silent story action while the music continues unchanged.")
     sections.append("summary:")
     sections.append(" ".join(summary_bits))
 
@@ -878,9 +886,14 @@ def build_h3_reference_prompt(
             + re.sub(r"\s+", " ", project.characters_subjects.strip())
             + "."
         )
-    sections.append(
-        "<Audio 1>: fully_copy - keep the supplied song segment continuous as the target performance track; preserve its existing vocals, lyrics, instrumental passages, rhythm and timing instead of inventing replacement vocals or music."
-    )
+    if has_lyrics:
+        sections.append(
+            "<Audio 1>: fully_copy - keep the supplied song segment continuous as the target performance track; preserve its existing vocals, lyrics, instrumental passages, rhythm and timing instead of inventing replacement vocals or music."
+        )
+    else:
+        sections.append(
+            "<Audio 1>: fully_copy - this interval is instrumental-only. Keep the supplied instrumental audio, rhythm and timing unchanged as the complete audio content for this shot. The character's contribution is silent visual acting and natural non-speaking facial movement."
+        )
 
     # 4) detailed_description
     sections.append("detailed_description:")
@@ -914,10 +927,13 @@ def build_h3_reference_prompt(
     shot1.append(f"This is the {shot.section or 'current'} section of the music video.")
     if project.camera_choreography.strip():
         shot1.append("Camera movement: " + re.sub(r"\s+", " ", project.camera_choreography.strip()) + ".")
-    shot1.append("<Audio 1> begins immediately and remains continuous and synchronized with the visible performance.")
+    if has_lyrics:
+        shot1.append("<Audio 1> begins immediately and remains continuous and synchronized with the visible vocal performance.")
+    else:
+        shot1.append("<Audio 1> begins immediately as an instrumental-only passage and remains continuous. The visible character acts silently within the story; facial and mouth movement stays natural and non-speaking while the instrumental music plays.")
 
-    if shot.lyrics.strip():
-        lyric = re.sub(r"\s+", " ", shot.lyrics.strip())
+    if has_lyrics:
+        lyric = lyric_text
         visible_subtitles = bool(getattr(project, "visible_lyric_subtitles", False))
         if len(characters) == 1:
             performer = f"<Subject {characters[0][0]}>"
@@ -944,7 +960,7 @@ def build_h3_reference_prompt(
                     f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. These words are heard only and must not appear visually."
                 )
     else:
-        shot1.append("This section contains no supplied lyric phrase; keep the instrumental/vocal-free part of <Audio 1> intact and do not introduce a new vocal performance.")
+        shot1.append("Instrumental interval: <Audio 1> contains the complete intended sound for this section. The character continues silent visual story action with natural non-speaking expressions and mouth posture; the music remains the only performance audio.")
     sections.append(" ".join(shot1))
 
     for cut_no, absolute in enumerate(shot.internal_cuts[:4], start=2):
@@ -952,9 +968,13 @@ def build_h3_reference_prompt(
         mm = int(rel // 60)
         ss = rel - mm * 60
         timestamp = f"{mm:02d}:{ss:06.3f}"
+        if has_lyrics:
+            continuity = "<Audio 1> continues seamlessly across the cut with unchanged musical timing and vocal continuity."
+        else:
+            continuity = "<Audio 1> continues seamlessly across the cut as the same instrumental passage; the character remains in silent visual action with natural non-speaking expression."
         sections.append(
             f"[Shot {cut_no}] At {timestamp}, the camera cuts to a complementary new angle or visual beat within the same established scene. "
-            "Keep the same character identities, performer roles, props and background/location roles. <Audio 1> continues seamlessly across the cut with unchanged musical timing and vocal continuity."
+            "Keep the same character identities, performer roles, props and background/location roles. " + continuity
         )
 
     if bool(getattr(project, "visible_lyric_subtitles", False)):
@@ -964,9 +984,14 @@ def build_h3_reference_prompt(
 
     # 5/6) audio sections. The master/reference song is the only music layer we want.
     sections.append("overall_soundscape:")
-    sections.append(
-        "Natural physical ambience and incidental scene sounds may be subtle and secondary. Do not let them replace, interrupt, or obscure the synchronized <Audio 1> performance."
-    )
+    if has_lyrics:
+        sections.append(
+            "Natural physical ambience and incidental scene sounds may be subtle and secondary. Keep <Audio 1> dominant, continuous and clearly synchronized with the vocal performance."
+        )
+    else:
+        sections.append(
+            "<Audio 1> is the complete instrumental soundtrack for this interval. Natural physical ambience may be subtle and secondary; the visible character remains a silent visual participant rather than a speaker or singer."
+        )
     sections.append("non_diegetic_music:")
     sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
 
@@ -977,13 +1002,19 @@ def build_default_prompt(project: MusicProject, shot: MusicShot) -> str:
 
 
 def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_refs: List[ReferenceAsset]) -> str:
-    """Always launch Ref2VA with the H3-native full-reference prompt structure.
+    """Return the exact Director prompt for generation when one exists.
 
-    Legacy LTX-style saved prompts are intentionally not forwarded to MiniMax anymore;
-    the current project brief, reference-purpose details, shot timing and lyrics are the
-    source of truth and are converted here at generation time.
+    The Director prompt editor is authoritative.  Rebuilding the prompt here from the
+    project Idea/Story box used to silently discard manual Director edits on retry and
+    recreate, which could re-introduce story text the user had explicitly removed.
+    Only legacy/restored shots with no saved Director prompt are rebuilt automatically.
     """
-    return build_h3_reference_prompt(project, shot, selected_refs)
+    saved_prompt = (shot.prompt or "").strip()
+    if saved_prompt:
+        return saved_prompt
+    prompt = build_h3_reference_prompt(project, shot, selected_refs)
+    shot.prompt = prompt
+    return prompt
 
 
 def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
@@ -1176,6 +1207,41 @@ _WHISPER_CONTINUATION_WORDS = {
 }
 
 
+_WHISPER_NON_LYRIC_EVENTS = {
+    "music", "instrumental", "instrumental music", "intro", "outro", "silence",
+    "silent", "noise", "background music", "applause", "clapping", "cheering",
+    "laughter", "laughing", "singing", "vocalizing", "humming", "hum",
+}
+
+
+def _clean_whisper_lyric_text(text: str) -> str:
+    """Return actual lyric words only; Whisper event markers such as [Music] are not lyrics."""
+    value = re.sub(r"\s+", " ", text or "").strip()
+    if not value:
+        return ""
+
+    # Remove leading/trailing bracketed event tags only when the tag is a known
+    # non-lexical audio event. Preserve ordinary brackets that are part of real text.
+    event_pattern = re.compile(r"^\s*[\[(]([^\]\)]+)[\])]")
+    while True:
+        match = event_pattern.match(value)
+        if not match:
+            break
+        event = re.sub(r"[^a-z ]+", " ", match.group(1).lower())
+        event = re.sub(r"\s+", " ", event).strip()
+        if event not in _WHISPER_NON_LYRIC_EVENTS:
+            break
+        value = value[match.end():].strip(" -–—:;,.\t")
+
+    # A segment consisting solely of a non-lyrical marker is intentionally empty.
+    bare = re.sub(r"^[\[(]|[\])]$", "", value.strip()).strip().lower()
+    bare = re.sub(r"[^a-z ]+", " ", bare)
+    bare = re.sub(r"\s+", " ", bare).strip()
+    if bare in _WHISPER_NON_LYRIC_EVENTS:
+        return ""
+    return value
+
+
 def _whisper_phrase_cleanup(raw: Sequence[LyricSegment]) -> List[LyricSegment]:
     """Merge obviously broken Whisper.cpp Small segments into safer lyric phrases.
 
@@ -1184,13 +1250,18 @@ def _whisper_phrase_cleanup(raw: Sequence[LyricSegment]) -> List[LyricSegment]:
     or a real timestamp gap remains a boundary.  Very long merged phrases are capped so
     the director still receives useful edit anchors.
     """
-    if not raw:
+    cleaned_raw: List[LyricSegment] = []
+    for seg in raw:
+        text = _clean_whisper_lyric_text(seg.text)
+        if text:
+            cleaned_raw.append(LyricSegment(float(seg.start), float(seg.end), text))
+    if not cleaned_raw:
         return []
 
     result: List[LyricSegment] = []
-    cur_start = float(raw[0].start)
-    cur_end = float(raw[0].end)
-    cur_text = re.sub(r"\s+", " ", raw[0].text or "").strip()
+    cur_start = float(cleaned_raw[0].start)
+    cur_end = float(cleaned_raw[0].end)
+    cur_text = cleaned_raw[0].text
 
     def last_word(text: str) -> str:
         words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+", text.lower())
@@ -1199,8 +1270,8 @@ def _whisper_phrase_cleanup(raw: Sequence[LyricSegment]) -> List[LyricSegment]:
     def strong_end(text: str) -> bool:
         return bool(re.search(r"[.!?][\"')\]]*$", text.strip()))
 
-    for nxt in raw[1:]:
-        nxt_text = re.sub(r"\s+", " ", nxt.text or "").strip()
+    for nxt in cleaned_raw[1:]:
+        nxt_text = nxt.text
         if not nxt_text:
             continue
         gap = max(0.0, float(nxt.start) - cur_end)

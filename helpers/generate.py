@@ -263,7 +263,7 @@ def main():
                 comfy_args += ["--enable-dynamic-vram"]
             if ns.vram_async_streams <= 0: comfy_args += ["--disable-async-offload"]
             else: comfy_args += ["--async-offload", str(ns.vram_async_streams)]
-            print(f"VRAM Manager V10: sample stages={','.join(managed_sample_stages) if ns.vram_manager_auto else 'forced all'} | engine={ns.vram_residency_engine} | runtime free={ns.vram_runtime_free_gb:g} GB | text load headroom={ns.vram_text_headroom_gb:g} GB | diffusion load headroom={ns.vram_diffusion_headroom_gb:g} GB | chunk={ns.vram_offload_chunk_mb} MB | max weights={'auto' if ns.vram_max_resident_weights_gb <= 0 else f'{ns.vram_max_resident_weights_gb:g} GB'} | block check={ns.vram_block_interval if hasattr(ns, 'vram_block_interval') else ns.vram_block_check_interval} | async streams={ns.vram_async_streams}", flush=True)
+            print(f"VRAM Manager V11: sample stages={','.join(managed_sample_stages) if ns.vram_manager_auto else 'forced all'} | engine={ns.vram_residency_engine} | runtime free={ns.vram_runtime_free_gb:g} GB | text load headroom={ns.vram_text_headroom_gb:g} GB | diffusion load headroom={ns.vram_diffusion_headroom_gb:g} GB | chunk={ns.vram_offload_chunk_mb} MB | max weights={'auto' if ns.vram_max_resident_weights_gb <= 0 else f'{ns.vram_max_resident_weights_gb:g} GB'} | block check={ns.vram_block_interval if hasattr(ns, 'vram_block_interval') else ns.vram_block_check_interval} | async streams={ns.vram_async_streams}", flush=True)
         if comfy_args:
             sample_env["H3_COMFY_ARGS"] = " ".join(comfy_args)
         for lp, strength in zip(ns.lora, ns.lora_strength): sample_cmd += ["--lora", str(Path(lp).resolve()), "--lora-strength", str(strength)]
