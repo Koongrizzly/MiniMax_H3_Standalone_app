@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from runtime.memory_diag import log_mem, log_mem_throttled, install_sampling_block_trace, install_comfy_load_trace
+from runtime import vram_manager as _vram_manager_module
 from runtime.vram_manager import VRAMManager, VRAMManagerConfig
 import torchaudio
 from PIL import Image
@@ -115,6 +116,12 @@ def main():
     ap.add_argument('--vram-cache-trim-slack-gb', type=float, default=2.0)
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
+    if ns.vram_manager:
+        expected = "V11_QWEN_PREFLIGHT_20260816B"
+        actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
+        if actual != expected:
+            raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
+        print(f"[VRAM-MGR] V11.1 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     if len(ns.lora)!=len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora)>3: raise ValueError('Maximum 3 LoRAs are supported')
     manager=None
@@ -182,6 +189,8 @@ def main():
         qwen_patch=_install_qwen_layer_trace(manager)
     print('Loading W4A8 text encoder for Ref2VA...',flush=True); clip=comfy.sd.load_clip([ns.text_encoder],clip_type=comfy.sd.CLIPType.MINIMAX)
     if ns.extended_logging: log_mem('after text encoder load')
+    if manager is not None and manager.is_stage_managed('text'):
+        manager.prepare_text_conditioning(reason='Ref2VA pre-Qwen conditioning')
     print('Encoding prompt and Ref2VA conditioning...', flush=True)
     if ns.extended_logging: log_mem('before text encoder conditioning')
     tokens=clip.tokenize(ns.prompt,minimax_ref_items=ref_items); positive=clip.encode_from_tokens_scheduled(tokens)

@@ -7,6 +7,9 @@ import torch
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
 
+VRAM_MANAGER_SIGNATURE = "V11_QWEN_PREFLIGHT_20260816B"
+VRAM_MANAGER_VERSION = "V11.1"
+
 
 @dataclass
 class VRAMManagerConfig:
@@ -22,6 +25,7 @@ class VRAMManagerConfig:
     residency_warmup_blocks: int = 2
     residency_refill_interval: int = 1
     allocator_memory_fraction: float = 0.94
+    text_activation_free_fraction: float = 0.67
     cache_trim_slack_gb: float = 2.0
     disable_comfy_pinned_offload: bool = True
     managed_stages: tuple[str, ...] | None = None
@@ -229,10 +233,14 @@ class VRAMManager:
         self._pinned_guard_active = False
 
     def _sync_stage_guards(self, managed: bool):
-        # The allocator ceiling is a diffusion spill guard. Native Qwen/VAE stages
-        # should keep the normal allocator behaviour. Host pinning follows whether
-        # the current stage is actually managed.
-        if managed and self.stage == "diffusion":
+        # V11: Qwen/Ref2VA conditioning can create its largest transient before a
+        # block-boundary hook has any chance to react.  The old V10 behaviour only
+        # installed the hard CUDA ceiling for diffusion, which allowed managed text
+        # runs to oversubscribe a 24 GiB card before the guard appeared in the log.
+        # Install the ceiling *before loading* every managed compute-heavy stage.
+        # Reference VAE work keeps the normal allocator because its tiled/serial
+        # encoding path is materially smaller and benefits from allocator freedom.
+        if managed and self.stage in ("text", "diffusion"):
             self._install_allocator_guard()
         else:
             self._restore_allocator_guard()
@@ -240,6 +248,48 @@ class VRAMManager:
             self._install_pinned_offload_guard()
         else:
             self._restore_pinned_offload_guard()
+
+    def text_activation_target_bytes(self) -> int:
+        """Free-VRAM target used immediately before Qwen conditioning.
+
+        Ref2VA jobs with several visual/audio references can add a ~14 GiB-class
+        transient on top of resident Qwen weights.  Waiting for a Qwen pre-hook is
+        too late for the first large allocation, so managed text stages proactively
+        reduce resident weights before encode_from_tokens_scheduled().
+        """
+        floor = max(self.runtime_floor_bytes(), self.load_headroom_bytes())
+        free, total = self._cuda_free()
+        if total is None:
+            return floor
+        frac = float(getattr(self.cfg, "text_activation_free_fraction", 0.67) or 0.67)
+        frac = min(0.85, max(0.40, frac))
+        return max(floor, int(float(total) * frac))
+
+    def prepare_text_conditioning(self, reason: str = "pre-Qwen conditioning") -> int:
+        """Make the text stage safe before its first large activation allocation."""
+        if not self.is_stage_managed("text") or self.stage != "text":
+            return 0
+        # The text allocator ceiling must already be active here.  Re-sync so this
+        # remains true if a caller arrived from a native/reference stage.
+        self._sync_stage_guards(True)
+        target = self.text_activation_target_bytes()
+        free_before, total = self._cuda_free()
+        self._log(
+            f"V11 Qwen preflight | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"target free={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
+            force=True,
+        )
+        freed = self.enforce_loaded(reason=reason, target_free=target)
+        # Offloading can leave large reusable cache blocks behind.  At a stage
+        # boundary we prefer genuine free dedicated VRAM over preserving that cache.
+        self.trim_cuda_cache(reason=reason, force=True)
+        free_after, _ = self._cuda_free()
+        self._log(
+            f"V11 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
+            f"CUDA free={self._gb(free_after) if free_after is not None else 'n/a'} | target={self._gb(target)}",
+            force=True,
+        )
+        return freed
 
     def install(self):
         if self._orig_load_models_gpu is not None:
@@ -347,7 +397,7 @@ class VRAMManager:
 
         self.mm.load_models_gpu = managed_load_models_gpu
         self._log(
-            "enabled V10 stage-aware MiniMax residency control | "
+            f"enabled {VRAM_MANAGER_VERSION} stage-aware MiniMax residency control | "
             f"offload chunk={int(self.cfg.offload_chunk_mb)} MiB | "
             f"max resident weights={'auto' if self.cfg.max_resident_weights_gb <= 0 else f'{self.cfg.max_resident_weights_gb:.2f} GiB'} | "
             f"check every {max(1, int(self.cfg.block_check_interval))} block(s) | "
