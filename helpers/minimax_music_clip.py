@@ -362,6 +362,8 @@ class MusicProject:
     vram_residency_refill_interval: int = 1
     turbo_lora_path: str = ""
     turbo_lora_strength: float = 1.0
+    randomize_reference_characters: bool = False
+    reference_random_seed: int = -1
     references: List[ReferenceAsset] = field(default_factory=list)
     lyrics: List[LyricSegment] = field(default_factory=list)
     analysis: AnalysisResult = field(default_factory=AnalysisResult)
@@ -708,7 +710,7 @@ def _selected_refs_for_shot(project: MusicProject, shot: MusicShot) -> List[Refe
     return [by_name[name] for name in shot.reference_names if name in by_name][:9]
 
 
-def _h3_ref_subject_definitions(project: MusicProject, refs: Sequence[ReferenceAsset]) -> List[str]:
+def _h3_ref_subject_definitions(project: MusicProject, refs: Sequence[ReferenceAsset], *, has_lyrics: bool = True) -> List[str]:
     lines: List[str] = []
     subject_no = 0
     for picture_no, ref in enumerate(refs, 1):
@@ -739,9 +741,14 @@ def _h3_ref_subject_definitions(project: MusicProject, refs: Sequence[ReferenceA
             + re.sub(r"\s+", " ", project.characters_subjects.strip())
             + ". Apply these named roles, outfit/prop rules, environment rules and continuity details to the matching references above."
         )
-    lines.append(
-        "<Audio 1> is the supplied song segment for this shot. It is the authoritative music/performance source for vocals, lyrics, rhythm, beat, timing and continuity."
-    )
+    if has_lyrics:
+        lines.append(
+            "<Audio 1> is the supplied song segment for this shot. It is the authoritative music/performance source for vocals, lyrics, rhythm, beat, timing and continuity."
+        )
+    else:
+        lines.append(
+            "<Audio 1> is the supplied instrumental song segment for this shot. It is the authoritative audio source for rhythm, beat, timing, continuity and musical energy. It contains no requested vocal performance."
+        )
     return lines
 
 
@@ -780,6 +787,56 @@ def _h3_reference_labels(refs: Sequence[ReferenceAsset]) -> Dict[str, List[Tuple
     return groups
 
 
+def _creative_pool_items(value: str, *, allow_commas: bool = False) -> List[str]:
+    """Parse a Creative brief field as an option pool without breaking real sequences.
+
+    New lines, semicolons and pipes are explicit option separators.  Location/camera
+    fields also accept simple comma-separated lists, but connected choreography such as
+    "from the basement through the hallway to the roof" or "whip pan then rack focus"
+    stays one instruction.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    sequence_markers = (
+        " then ", " followed by ", " before ", " after ", " while ",
+        " from ", " through ", " into ", " to the ", " and then ", "->", "→",
+    )
+    low = f" {re.sub(r'\\s+', ' ', raw).lower()} "
+    connected_sequence = any(marker in low for marker in sequence_markers)
+
+    parts = re.split(r"[\r\n;|]+", raw)
+    parts = [re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", p).strip() for p in parts]
+    parts = [p for p in parts if p]
+
+    if allow_commas and len(parts) == 1 and not connected_sequence and "," in parts[0]:
+        comma_parts = [p.strip() for p in parts[0].split(",") if p.strip()]
+        # Commas are treated as a list only when they look like compact alternatives,
+        # not a long prose sentence containing incidental commas.
+        if len(comma_parts) >= 2 and max(len(p) for p in comma_parts) <= 140:
+            parts = comma_parts
+
+    out: List[str] = []
+    seen = set()
+    for part in parts:
+        clean = re.sub(r"\s+", " ", part).strip(" .")
+        key = clean.casefold()
+        if clean and key not in seen:
+            seen.add(key)
+            out.append(clean)
+    return out
+
+
+def _creative_pool_choice(value: str, shot_index: int, *, allow_commas: bool = False) -> Tuple[str, int]:
+    """Return this shot's option and the total pool size, rotating before reuse."""
+    items = _creative_pool_items(value, allow_commas=allow_commas)
+    if not items:
+        return "", 0
+    idx = max(0, int(shot_index or 1) - 1) % len(items)
+    return items[idx], len(items)
+
+
 def build_h3_reference_prompt(
     project: MusicProject,
     shot: MusicShot,
@@ -798,7 +855,7 @@ def build_h3_reference_prompt(
 
     # 1) subject_definitions
     sections: List[str] = ["subject_definitions:"]
-    sections.extend(_h3_ref_subject_definitions(project, refs))
+    sections.extend(_h3_ref_subject_definitions(project, refs, has_lyrics=has_lyrics))
 
     # Keep role groups separate throughout the prompt. A background may legitimately be
     # a reusable <Subject N> in H3, but it must never be grouped with character performers.
@@ -816,7 +873,12 @@ def build_h3_reference_prompt(
     # Keep the visual-text rule close to the reference definitions so written lyrics are
     # not mistaken for a request to create karaoke/subtitle graphics later in the prompt.
     sections.append("visual_text_policy:")
-    if bool(getattr(project, "visible_lyric_subtitles", False)):
+    if not has_lyrics:
+        sections.append(
+            "This is an instrumental-only shot. There is no speech, no singing, no narration, no lip-sync, no spoken words, and no visible subtitles or lyric text. "
+            "Only physical scene text explicitly requested by the user may appear. Do not invent dialogue, captions, karaoke text, lyric overlays, title cards, lower-thirds or floating text."
+        )
+    elif bool(getattr(project, "visible_lyric_subtitles", False)):
         sections.append(
             "Visible lyric subtitles are enabled. The current lyric phrase from <Audio 1> may appear as synchronized readable subtitle/lyric text. "
             "Do not invent unrelated captions, title cards, logos, lower-thirds or other text. Text explicitly requested as a physical part of the scene may also remain visible."
@@ -827,9 +889,12 @@ def build_h3_reference_prompt(
             "Only text explicitly requested as a physical part of a scene, object, poster, sign, monitor or interface may be visible. Do not turn spoken or sung words into on-screen text."
         )
 
-    # 2) summary
-    story = re.sub(r"\s+", " ", project.main_idea.strip()) if project.main_idea.strip() else "the current music-video story"
+    # 2) summary. Creative-brief lists are option pools, not a checklist for one clip.
+    story_focus, story_pool_count = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
+    story = re.sub(r"\s+", " ", story_focus.strip()) if story_focus.strip() else "the current music-video story"
     summary_bits = [f"[reference generation + audio reuse] Create a music-video shot for {story}."]
+    if story_pool_count > 1:
+        summary_bits.append("This is one selected story beat from the larger project idea; keep the other listed story beats for other clips instead of combining them here.")
     if characters:
         if has_lyrics:
             summary_bits.append(f"Use {labels(characters)} as the visible character/performer reference{'s' if len(characters) != 1 else ''}.")
@@ -892,18 +957,21 @@ def build_h3_reference_prompt(
         )
     else:
         sections.append(
-            "<Audio 1>: fully_copy - this interval is instrumental-only. Keep the supplied instrumental audio, rhythm and timing unchanged as the complete audio content for this shot. The character's contribution is silent visual acting and natural non-speaking facial movement."
+            "<Audio 1>: fully_copy - keep the supplied instrumental audio unchanged as the complete sound for this shot. Do not add any extra voice, speech, singing, humming, mumbling, narration or replacement music. Preserve its rhythm, beat, timing, continuity and musical energy."
         )
 
     # 4) detailed_description
     sections.append("detailed_description:")
     style = re.sub(r"\s+", " ", project.style_theme.strip()) if project.style_theme.strip() else "cinematic music-video"
-    location = re.sub(r"\s+", " ", project.locations_world.strip())
+    location, location_pool_count = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
+    location = re.sub(r"\s+", " ", location.strip())
     if location:
         # Avoid awkward output such as "set in in the basement" when the user already
         # typed a leading "in".
         location_text = re.sub(r"^(?:set\s+in\s+|in\s+)", "", location, flags=re.IGNORECASE).strip()
         sections.append(f"The target video uses a {style} style and takes place in {location_text}.")
+        if location_pool_count > 1:
+            sections.append("Use only this selected project location as the primary setting for this clip. The other locations listed in the Creative brief are alternatives reserved for other clips; do not visit or combine them in this shot unless the selected location itself explicitly describes a continuous transition.")
     else:
         sections.append(f"The target video uses a {style} style.")
 
@@ -922,15 +990,22 @@ def build_h3_reference_prompt(
     if picture_anchors:
         first_pictures = ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors)
         shot1.append(f"Use {first_pictures} for the specified composition/framing purpose.")
-    if project.main_idea.strip():
-        shot1.append(re.sub(r"\s+", " ", project.main_idea.strip()) + ".")
+    if story_focus.strip():
+        shot1.append(re.sub(r"\s+", " ", story_focus.strip()) + ".")
     shot1.append(f"This is the {shot.section or 'current'} section of the music video.")
-    if project.camera_choreography.strip():
-        shot1.append("Camera movement: " + re.sub(r"\s+", " ", project.camera_choreography.strip()) + ".")
+    camera_choice, camera_pool_count = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
+    if camera_choice.strip():
+        shot1.append("Primary camera concept: " + re.sub(r"\s+", " ", camera_choice.strip()) + ".")
+        if camera_pool_count > 1:
+            shot1.append("Use this one selected camera concept as the dominant camera language for the clip. Do not stack the other camera moves from the Creative brief into this shot; they are reserved for later clips.")
     if has_lyrics:
         shot1.append("<Audio 1> begins immediately and remains continuous and synchronized with the visible vocal performance.")
     else:
-        shot1.append("<Audio 1> begins immediately as an instrumental-only passage and remains continuous. The visible character acts silently within the story; facial and mouth movement stays natural and non-speaking while the instrumental music plays.")
+        shot1.append(
+            "<Audio 1> begins immediately as an instrumental-only passage and remains continuous. "
+            "Every visible character remains completely silent. Use expressive body movement, arm movement, eye movement and silent facial acting to communicate the story and react to the beat. "
+            "Mouth movement stays minimal, natural and non-speaking, with no lip-sync, no sung articulation and no speech-like mouth shapes."
+        )
 
     if has_lyrics:
         lyric = lyric_text
@@ -960,7 +1035,11 @@ def build_h3_reference_prompt(
                     f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. These words are heard only and must not appear visually."
                 )
     else:
-        shot1.append("Instrumental interval: <Audio 1> contains the complete intended sound for this section. The character continues silent visual story action with natural non-speaking expressions and mouth posture; the music remains the only performance audio.")
+        shot1.append(
+            "Instrumental interval: <Audio 1> contains the complete intended sound for this section. "
+            "Translate every story idea into visible physical action rather than spoken or sung content. Characters may dance, gesture, react, work, move through the environment and interact with props, but they do not talk, sing, narrate, hum, mumble or mouth words. "
+            "Do not interpret phrases such as asks, tells, explains, argues, jokes, calls, sings or says as permission to create audible speech; express the intended meaning silently through action and reaction instead."
+        )
     sections.append(" ".join(shot1))
 
     for cut_no, absolute in enumerate(shot.internal_cuts[:4], start=2):
@@ -971,7 +1050,7 @@ def build_h3_reference_prompt(
         if has_lyrics:
             continuity = "<Audio 1> continues seamlessly across the cut with unchanged musical timing and vocal continuity."
         else:
-            continuity = "<Audio 1> continues seamlessly across the cut as the same instrumental passage; the character remains in silent visual action with natural non-speaking expression."
+            continuity = "<Audio 1> continues seamlessly across the cut as the same instrumental passage; every character remains completely silent with minimal natural non-speaking mouth movement and communicates only through visible action and reaction."
         sections.append(
             f"[Shot {cut_no}] At {timestamp}, the camera cuts to a complementary new angle or visual beat within the same established scene. "
             "Keep the same character identities, performer roles, props and background/location roles. " + continuity
@@ -980,7 +1059,10 @@ def build_h3_reference_prompt(
     if bool(getattr(project, "visible_lyric_subtitles", False)):
         sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. Do not invent unrelated captions or title cards beyond the explicitly enabled lyric subtitles and explicitly requested physical scene text.")
     else:
-        sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. No visible lyric subtitles, captions, karaoke text, lyric overlays or title cards; only explicitly requested physical scene text may appear.")
+        if has_lyrics:
+            sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. No visible lyric subtitles, captions, karaoke text, lyric overlays or title cards; only explicitly requested physical scene text may appear.")
+        else:
+            sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. Do not create any extra person, assistant, mascot, floating icon or shoulder creature. No speech, singing, narration, lip-sync, humming, mumbling, visible lyric subtitles, captions, karaoke text, lyric overlays or title cards; only explicitly requested physical scene text may appear.")
 
     # 5/6) audio sections. The master/reference song is the only music layer we want.
     sections.append("overall_soundscape:")
@@ -990,10 +1072,13 @@ def build_h3_reference_prompt(
         )
     else:
         sections.append(
-            "<Audio 1> is the complete instrumental soundtrack for this interval. Natural physical ambience may be subtle and secondary; the visible character remains a silent visual participant rather than a speaker or singer."
+            "<Audio 1> is the complete instrumental soundtrack for this interval. Natural physical ambience may be subtle and secondary, but must not replace, interrupt or compete with the supplied instrumental audio. Every visible character remains a silent visual participant rather than a speaker or singer."
         )
     sections.append("non_diegetic_music:")
-    sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
+    if has_lyrics:
+        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
+    else:
+        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score, voice, vocalization or replacement music.")
 
     return "\n".join(x.strip() for x in sections if x and x.strip())
 
@@ -1017,17 +1102,57 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
     return prompt
 
 
+
+def _randomized_character_reference_names(project: MusicProject, shot: MusicShot, enabled: Sequence[ReferenceAsset]) -> List[str]:
+    """Return a stable per-shot random character subset when the feature is enabled.
+
+    Only enabled Character references participate. One to five characters are selected
+    per shot (or fewer when fewer are available). The project-level seed is refreshed
+    when the plan/prompts are rebuilt, then saved with the project so retries keep the
+    same shot-to-reference mapping.
+    """
+    if not bool(getattr(project, "randomize_reference_characters", False)):
+        return []
+    chars = [r for r in enabled if _normalise_reference_kind(r.kind) == "Character" and r.name]
+    if not chars:
+        return []
+    max_count = min(5, len(chars))
+    try:
+        base_seed = int(getattr(project, "reference_random_seed", -1))
+    except Exception:
+        base_seed = -1
+    if base_seed < 0:
+        base_seed = random.SystemRandom().randint(0, 2_147_483_647)
+        try:
+            project.reference_random_seed = int(base_seed)
+        except Exception:
+            pass
+    rng = random.Random(f"{base_seed}:{int(getattr(shot, 'index', 0) or 0)}:{len(chars)}")
+    count = rng.randint(1, max_count)
+    names = [r.name for r in chars]
+    if count >= len(names):
+        rng.shuffle(names)
+        return names
+    return list(rng.sample(names, count))
+
+
 def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
-    """Conservative first-pass router: refs named in prompt/brief win; character refs otherwise stay available.
+    """Conservative first-pass router with optional per-shot random character refs.
 
     Users can edit the assignment in the shot table. This avoids sending all nine references
-    blindly while still giving the director useful defaults.
+    blindly while still giving the director useful defaults. When random character refs are
+    enabled, one to five Character references are chosen per shot while non-character
+    context (background/style plus explicitly named props/anchors) stays stable.
     """
     enabled = [r for r in project.references if r.enabled and Path(r.path).is_file()]
+    randomize_chars = bool(getattr(project, "randomize_reference_characters", False))
     blob = " ".join((shot.prompt, shot.lyrics, project.characters_subjects, project.main_idea)).lower()
     chosen: List[str] = []
     for ref in enabled:
         if ref.name and ref.name.lower() in blob:
+            kind = _normalise_reference_kind(ref.kind)
+            if randomize_chars and kind == "Character":
+                continue
             chosen.append(ref.name)
     # Background/location and style refs are normally project-wide context, so include
     # them even when the user did not repeat their names in every shot prompt.
@@ -1035,7 +1160,11 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
         kind = _normalise_reference_kind(ref.kind)
         if kind in ("Background / Location", "Style / Mood") and ref.name not in chosen:
             chosen.append(ref.name)
-    if not any(_normalise_reference_kind(r.kind) == "Character" and r.name in chosen for r in enabled):
+    if randomize_chars:
+        for name in _randomized_character_reference_names(project, shot, enabled):
+            if name not in chosen:
+                chosen.append(name)
+    elif not any(_normalise_reference_kind(r.kind) == "Character" and r.name in chosen for r in enabled):
         chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character"]
         chosen.extend(x for x in chars[:2] if x not in chosen)
     # Objects/props and picture/composition anchors remain opt-in by name/purpose so an
@@ -1779,6 +1908,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_world = QLineEdit(brief)
         self.edit_camera = QLineEdit(brief)
         self.edit_subjects.setToolTip("Optional continuity details for named reference images. Example: Erica is the blue-haired woman in her reference, keeps that outfit, and is always the drummer when the drum kit is present. Leave blank when MiniMax may invent role, outfit or props.")
+        self.edit_idea.setToolTip("Write one continuous story, or put alternative story beats on separate lines / separated by semicolons. Alternative beats are distributed across clips instead of being crammed into every clip.")
+        self.edit_world.setToolTip("Enter one location, or a list separated by commas, semicolons or new lines. One primary location is assigned per clip and the list rotates before reuse.")
+        self.edit_camera.setToolTip("Enter one camera concept, or a list separated by commas, semicolons or new lines. One primary camera concept is assigned per clip and the list rotates before reuse. Connected instructions such as 'whip pan then rack focus' stay together.")
         bf.addRow("Main idea / story:", self.edit_idea)
         bf.addRow("Style / theme:", self.edit_style)
         bf.addRow("Ref image purpose details:", self.edit_subjects)
@@ -1811,6 +1943,13 @@ class MiniMaxMusicClipWidget(QWidget):
             body,
         )
         info.setWordWrap(True); lay.addWidget(info)
+        self.check_randomize_ref_characters = QCheckBox("Randomize reference characters per clip", body)
+        self.check_randomize_ref_characters.setToolTip(
+            "When enabled, each shot automatically picks a random subset of enabled Character references. "
+            "The shot uses between 1 and 5 character refs at a time (or fewer when fewer are available). "
+            "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh the random combinations."
+        )
+        lay.addWidget(self.check_randomize_ref_characters)
         self.refs_table = QTableWidget(0, 6, body)
         self.refs_table.setHorizontalHeaderLabels(["Use", "Preview", "Name", "Reference role", "Path", "Image description / purpose"])
         self.refs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -2082,6 +2221,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.vram_auto_bypass = self.check_vram_auto_bypass.isChecked()
         self.project.sage_attention = self.check_sage.isChecked()
         self.project.spectrum = self.check_spectrum.isChecked()
+        self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.references = self._refs_from_table()
 
     def _sync_ui_from_project(self) -> None:
@@ -2101,6 +2241,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_turbo_lora.setText(p.turbo_lora_path or "")
         self.spin_turbo_lora.setValue(float(p.turbo_lora_strength or 1.0))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
+        self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
 
     def _project_dict(self) -> Dict[str, Any]:
@@ -2142,6 +2283,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "vram_async_streams", "vram_video_vae_reserve_gb", "vram_audio_vae_reserve_gb",
             "vram_residency_fill", "vram_residency_target_free_gb", "vram_residency_warmup_blocks",
             "vram_residency_refill_interval", "sage_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
+            "randomize_reference_characters",
         ):
             setattr(self.project, name, getattr(old, name))
         self.project_path = ""
@@ -2330,6 +2472,7 @@ class MiniMaxMusicClipWidget(QWidget):
             self.project.analysis.duration = probe_duration(self.project.audio_path)
         try:
             self.project.shots = build_shot_plan(self.project)
+            self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
             for shot in self.project.shots:
                 shot.reference_names = auto_assign_references(self.project, shot)
                 shot.prompt = build_default_prompt(self.project, shot)
@@ -2500,6 +2643,7 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _rebuild_prompts(self) -> None:
         self._pull_ui()
+        self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
         for shot in self.project.shots:
             shot.reference_names = auto_assign_references(self.project, shot); shot.prompt = build_default_prompt(self.project, shot)
         self._populate_shots(); self.status.setText("MiniMax-H3 Ref2VA prompts and reference suggestions rebuilt.")
@@ -3069,6 +3213,7 @@ class MiniMaxMusicClipWidget(QWidget):
                         setattr(self.project, key, data[key])
                 self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
+                self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
         except Exception:
             pass
 
@@ -3095,6 +3240,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "vram_residency_refill_interval": self.project.vram_residency_refill_interval,
                 "turbo_lora_path": self.project.turbo_lora_path, "turbo_lora_strength": self.project.turbo_lora_strength,
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
+                "randomize_reference_characters": self.project.randomize_reference_characters,
             }
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
