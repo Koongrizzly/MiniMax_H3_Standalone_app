@@ -341,6 +341,8 @@ class MusicProject:
     ref_image_size: str = "match"
     sage_attention: bool = False
     spectrum: bool = False
+    use_hybrid_model: bool = False
+    hybrid_model_path: str = ""
     vram_manager_enabled: bool = True
     vram_auto_bypass: bool = True
     # Keep the MiniMax GUI fresh-install VRAM defaults here so Music Clip Creator
@@ -519,6 +521,160 @@ def _nearest_beat(target: float, beats: Sequence[Beat], tolerance: float = 0.75)
     return min(candidates, key=lambda x: abs(x - target))
 
 
+def _choose_next_instrumental_boundary(
+    cursor: float,
+    hard_limit: float,
+    sections: Sequence[Section],
+    beats: Sequence[Beat],
+    project: MusicProject,
+    max_frames: int,
+) -> float:
+    """Choose an instrumental edit from the detected musical grid.
+
+    Instrumental planning must not be duration packing.  The detector's beat grid
+    is the timing skeleton: low-energy passages span more beats, high-energy
+    passages span fewer, and strong/major accents plus analysed section boundaries
+    are preferred as the actual cut.  Only *after* this returns does the normal
+    MiniMax frame-grid code choose enough generation frames to cover the edit.
+    """
+    valid_lengths = _valid_edit_lengths(cursor, project, max_frames)
+    if not valid_lengths:
+        return hard_limit
+
+    min_edit = max(1.5, valid_lengths[0][0])
+    max_edit = max(min_edit, min(hard_limit - cursor, valid_lengths[-1][0]))
+    if max_edit <= min_edit + 0.05:
+        return min(hard_limit, cursor + max_edit)
+
+    ordered = sorted(
+        [b for b in beats if math.isfinite(float(getattr(b, "time", 0.0) or 0.0))],
+        key=lambda b: float(getattr(b, "time", 0.0) or 0.0),
+    )
+    usable_beats = [b for b in ordered if cursor + 0.02 < float(b.time) <= hard_limit + 1e-6]
+
+    # Weak/no beat detection: use a real analysed section boundary if available,
+    # otherwise fall back to a medium clip rather than the previous maximum pack.
+    if len(ordered) < 2 or not usable_beats:
+        structural = sorted({
+            float(t)
+            for sec in sections
+            for t in (sec.start, sec.end)
+            if cursor + min_edit <= float(t) <= hard_limit + 1e-6
+        })
+        if structural:
+            return structural[0]
+        return min(hard_limit, cursor + min(max_edit, max(min_edit, 6.5)))
+
+    # Estimate the useful musical pulse from detected beat spacing.  Ignore very
+    # tiny duplicate peaks and huge gaps so a breakdown does not corrupt the BPM.
+    intervals = []
+    for a, b in zip(ordered, ordered[1:]):
+        dt = float(b.time) - float(a.time)
+        if 0.22 <= dt <= 1.50:
+            intervals.append(dt)
+    if intervals:
+        intervals.sort()
+        beat_interval = intervals[len(intervals) // 2]
+    else:
+        beat_interval = 0.50
+
+    # Local energy comes from the strength of the *actual forthcoming beats*, not
+    # from a fixed shot-duration ratio.  This makes a rise/drop shorten the next
+    # shot while quieter stretches naturally breathe longer.
+    strengths_all = [max(0.0, float(getattr(b, "strength", 0.0) or 0.0)) for b in ordered]
+    peak_strength = max(strengths_all) if strengths_all else 1.0
+    peak_strength = peak_strength or 1.0
+    local = [
+        max(0.0, float(getattr(b, "strength", 0.0) or 0.0)) / peak_strength
+        for b in usable_beats
+        if float(b.time) <= min(hard_limit, cursor + 8.0)
+    ]
+    local_energy = (sum(local) / len(local)) if local else 0.5
+
+    section = _section_at(cursor + 0.05, sections)
+    # Beat counts are deliberately different by musical role. At ~120 BPM these
+    # correspond roughly to 5-10 second edits, comfortably inside H3's limits.
+    base_beats = {
+        "intro": 18,
+        "break": 18,
+        "verse": 15,
+        "chorus": 12,
+        "drop": 10,
+        "outro": 17,
+    }.get(section, 15)
+    if local_energy >= 0.76:
+        base_beats -= 2
+    elif local_energy >= 0.62:
+        base_beats -= 1
+    elif local_energy <= 0.36:
+        base_beats += 3
+    elif local_energy <= 0.48:
+        base_beats += 1
+    target_beats = max(8, min(22, int(base_beats)))
+
+    # Important section entries are first-class cuts.  Prefer one when it lands in
+    # the useful musical window instead of marching through a fixed beat count.
+    min_end = cursor + min_edit
+    structural = []
+    for sec in sections:
+        for t in (sec.start, sec.end):
+            t = float(t)
+            if min_end <= t <= hard_limit + 1e-6:
+                structural.append(t)
+    structural = sorted(set(structural))
+
+    # Enumerate actual beat candidates and count beats from this shot's start.
+    candidates = []
+    count = 0
+    prev_strength = None
+    for beat in usable_beats:
+        t = float(beat.time)
+        if t < min_end - 1e-6:
+            continue
+        count += 1
+        duration = t - cursor
+        if duration > max_edit + 0.05:
+            break
+        strength = max(0.0, float(getattr(beat, "strength", 0.0) or 0.0)) / peak_strength
+        kind = str(getattr(beat, "kind", "") or "").lower()
+        novelty = abs(strength - prev_strength) if prev_strength is not None else 0.0
+        prev_strength = strength
+
+        # Prefer the musically appropriate beat count, but allow a nearby strong
+        # accent to win. This is what creates genuine variable shot lengths.
+        beat_error = abs(count - target_beats)
+        score = beat_error * 0.19
+        score -= strength * 0.85
+        score -= novelty * 0.45
+        if kind == "major":
+            score -= 1.15
+        # Do not drift to the hard maximum just because it exists.
+        if t >= hard_limit - 0.18:
+            score += 1.10
+        candidates.append((score, t, count, strength, kind))
+
+    if structural:
+        # Section boundaries get a large priority bonus, but only when the shot is
+        # not absurdly short. This preserves drops/breaks even if they interrupt a
+        # normal 12/16-beat grouping.
+        for t in structural:
+            duration = t - cursor
+            approx_beats = max(1, int(round(duration / max(0.001, beat_interval))))
+            if duration < min_edit - 1e-6 or duration > max_edit + 0.05:
+                continue
+            beat_error = abs(approx_beats - target_beats)
+            candidates.append((beat_error * 0.13 - 1.65, t, approx_beats, 1.0, "section"))
+
+    if candidates:
+        return min(candidates, key=lambda item: (item[0], item[1]))[1]
+
+    # Last resort: stay on a detected beat near a section/energy-derived beat count.
+    wanted = cursor + target_beats * beat_interval
+    in_range = [b for b in usable_beats if min_end <= float(b.time) <= hard_limit + 1e-6]
+    if in_range:
+        return min(in_range, key=lambda b: abs(float(b.time) - wanted)).time
+    return min(hard_limit, cursor + min(max_edit, max(min_edit, 6.5)))
+
 def _candidate_lyric_boundaries(lyrics: Sequence[LyricSegment], duration: float) -> List[float]:
     """Return lyric *line ends* as the primary physical edit anchors.
 
@@ -650,11 +806,14 @@ def build_shot_plan(project: MusicProject) -> List[MusicShot]:
                 project.analysis.beats, project, max_frames
             )
         else:
-            # Instrumental/default mode: keep duration packing as the fallback and
-            # only nudge the proposed cut to a nearby beat.
-            end = _nearest_beat(target, project.analysis.beats, tolerance=0.85)
+            # Instrumental/default mode: music chooses the physical cut first.
+            # MiniMax frame fitting happens afterwards when the shot is constructed.
+            end = _choose_next_instrumental_boundary(
+                cursor, hard_limit, project.analysis.sections, project.analysis.beats,
+                project, max_frames
+            )
             if end <= cursor + 1.25 or end > hard_limit + 0.05:
-                end = hard_limit
+                end = min(hard_limit, target)
         if duration - end < 1.0:
             end = duration
         if end <= cursor + 0.20:
@@ -1621,6 +1780,11 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             "--ref-audio", str(audio_chunk),
             "--output", str(out_path),
         ]
+        if project.use_hybrid_model:
+            hybrid = Path(str(project.hybrid_model_path or "").strip())
+            if not hybrid.is_file():
+                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
+            cmd += ["--ref2va-checkpoint", str(hybrid.resolve())]
         if project.vram_manager_enabled:
             cmd += ["--vram-manager-auto" if project.vram_auto_bypass else "--vram-manager"]
             cmd += [
@@ -1938,7 +2102,7 @@ class MiniMaxMusicClipWidget(QWidget):
         outer, body, lay = self._scrollable_tab_body(self.page_refs)
         info = QLabel(
             "Project references are sent directly to MiniMax Ref2VA. Choose what each image is for: Character, Background / Location, Object / Prop, Style / Mood, or Picture / Composition anchor. "
-            "MiniMax then receives the correct <Subject N> or <Picture N> relationship automatically. Use Image purpose details only for consistency rules the model cannot infer by itself. "
+            "MiniMax then receives the correct <Subject N> or <Picture N> relationship automatically. For Character refs, add a short identity/appearance description so multi-reference shots can keep the characters distinct. "
             "Each shot can use a different subset; up to 9 images can be passed to one Ref2VA job.",
             body,
         )
@@ -1951,13 +2115,22 @@ class MiniMaxMusicClipWidget(QWidget):
         )
         lay.addWidget(self.check_randomize_ref_characters)
         self.refs_table = QTableWidget(0, 6, body)
-        self.refs_table.setHorizontalHeaderLabels(["Use", "Preview", "Name", "Reference role", "Path", "Image description / purpose"])
-        self.refs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.refs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.refs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.refs_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.refs_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.refs_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        # Put the useful editable fields first. Long filenames/paths are supporting
+        # metadata and must never consume the reference tab at the expense of role
+        # and identity/purpose descriptions.
+        self.refs_table.setHorizontalHeaderLabels(["Use", "Preview", "Reference role", "Character / image description", "Name", "Path"])
+        header = self.refs_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.resizeSection(1, 122)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.resizeSection(2, 190)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.resizeSection(4, 180)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.resizeSection(5, 150)
+        self.refs_table.setWordWrap(True)
         self.refs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.refs_table.setMinimumHeight(320)
         lay.addWidget(self.refs_table, 1)
@@ -2153,6 +2326,17 @@ class MiniMaxMusicClipWidget(QWidget):
         lora_row.addWidget(self.edit_turbo_lora, 1); lora_row.addWidget(self.btn_turbo_lora); lora_row.addWidget(QLabel("Strength:", gen)); lora_row.addWidget(self.spin_turbo_lora)
         form.addRow("Turbo / speed LoRA:", lora_row)
         self.btn_turbo_lora.clicked.connect(self._browse_turbo_lora)
+        self.check_hybrid_model = QCheckBox("Use hybrid model", gen)
+        self.check_hybrid_model.setToolTip("Use one hybrid MiniMax H3 diffusion checkpoint for these Ref2VA music clips instead of the normal Ref2VA checkpoint. This choice is remembered after restart.")
+        hybrid_row = QHBoxLayout()
+        self.edit_hybrid_model = QLineEdit(gen); self.edit_hybrid_model.setPlaceholderText("Hybrid MiniMax H3 checkpoint (.safetensors)")
+        self.btn_hybrid_model = QPushButton("Browse...", gen)
+        hybrid_row.addWidget(self.edit_hybrid_model, 1); hybrid_row.addWidget(self.btn_hybrid_model)
+        form.addRow(self.check_hybrid_model)
+        form.addRow("Hybrid checkpoint:", hybrid_row)
+        self.btn_hybrid_model.clicked.connect(self._browse_hybrid_model)
+        self.check_hybrid_model.toggled.connect(self._sync_hybrid_model_controls)
+        self._sync_hybrid_model_controls(False)
         self.check_vram_manager = QCheckBox("Enable VRAM Manager protection", gen); self.check_vram_manager.setChecked(True)
         self.check_vram_manager.setToolTip("Master switch. Off = never use VRAM Manager. On = use the setting below to choose automatic bypass or always-on protection.")
         self.check_vram_auto_bypass = QCheckBox("Automatic bypass when job fits", gen); self.check_vram_auto_bypass.setChecked(True)
@@ -2217,6 +2401,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.ref_image_size = self.combo_ref_size.currentText()
         self.project.turbo_lora_path = self.edit_turbo_lora.text().strip()
         self.project.turbo_lora_strength = self.spin_turbo_lora.value()
+        self.project.use_hybrid_model = self.check_hybrid_model.isChecked()
+        self.project.hybrid_model_path = self.edit_hybrid_model.text().strip()
         self.project.vram_manager_enabled = self.check_vram_manager.isChecked()
         self.project.vram_auto_bypass = self.check_vram_auto_bypass.isChecked()
         self.project.sage_attention = self.check_sage.isChecked()
@@ -2240,6 +2426,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.combo_ref_size.setCurrentText(p.ref_image_size if p.ref_image_size in ("match", "max") else "match")
         self.edit_turbo_lora.setText(p.turbo_lora_path or "")
         self.spin_turbo_lora.setValue(float(p.turbo_lora_strength or 1.0))
+        self.check_hybrid_model.setChecked(bool(getattr(p, "use_hybrid_model", False)))
+        self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
@@ -2277,6 +2465,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
             "phrase_snap_tolerance", "steps", "cfg", "shift", "audio_shift",
             "ref_image_size", "turbo_lora_path", "turbo_lora_strength",
+            "use_hybrid_model", "hybrid_model_path",
             "vram_manager_enabled", "vram_auto_bypass", "vram_residency_engine",
             "vram_runtime_free_gb", "vram_text_headroom_gb", "vram_diffusion_headroom_gb",
             "vram_offload_chunk_mb", "vram_max_resident_weights_gb", "vram_block_check_interval",
@@ -2356,7 +2545,6 @@ class MiniMaxMusicClipWidget(QWidget):
             else:
                 preview.setText("No preview")
             self.refs_table.setCellWidget(row, 1, preview)
-            self.refs_table.setItem(row, 2, QTableWidgetItem(ref.name))
             role_combo = QComboBox(self.refs_table)
             role_combo.addItems(list(REFERENCE_TYPES))
             role_combo.setCurrentText(_normalise_reference_kind(ref.kind))
@@ -2364,17 +2552,22 @@ class MiniMaxMusicClipWidget(QWidget):
                 "Character = reusable person/identity. Background / Location = recurring environment. Object / Prop = reusable item. "
                 "Style / Mood = visual treatment. Picture / Composition anchor = use the image itself as framing/keyframe/shot-planning guidance."
             )
-            self.refs_table.setCellWidget(row, 3, role_combo)
-            self.refs_table.setItem(row, 4, QTableWidgetItem(ref.path)); self.refs_table.setItem(row, 5, QTableWidgetItem(ref.description))
+            self.refs_table.setCellWidget(row, 2, role_combo)
+            desc_item = QTableWidgetItem(ref.description)
+            desc_item.setToolTip(ref.description or "For characters: describe the individual appearance/identity traits that should stay distinct from other refs.")
+            self.refs_table.setItem(row, 3, desc_item)
+            name_item = QTableWidgetItem(ref.name); name_item.setToolTip(ref.name)
+            path_item = QTableWidgetItem(ref.path); path_item.setToolTip(ref.path)
+            self.refs_table.setItem(row, 4, name_item); self.refs_table.setItem(row, 5, path_item)
         self.refs_table.blockSignals(False)
 
     def _refs_from_table(self) -> List[ReferenceAsset]:
         refs: List[ReferenceAsset] = []
         for row in range(self.refs_table.rowCount()):
             def txt(col): return self.refs_table.item(row, col).text().strip() if self.refs_table.item(row, col) else ""
-            role_widget = self.refs_table.cellWidget(row, 3)
-            kind = _normalise_reference_kind(role_widget.currentText() if isinstance(role_widget, QComboBox) else txt(3))
-            refs.append(ReferenceAsset(name=txt(2) or Path(txt(4)).stem, kind=kind, path=txt(4), description=txt(5), enabled=bool(self.refs_table.item(row,0) and self.refs_table.item(row,0).checkState() == Qt.Checked)))
+            role_widget = self.refs_table.cellWidget(row, 2)
+            kind = _normalise_reference_kind(role_widget.currentText() if isinstance(role_widget, QComboBox) else txt(2))
+            refs.append(ReferenceAsset(name=txt(4) or Path(txt(5)).stem, kind=kind, path=txt(5), description=txt(3), enabled=bool(self.refs_table.item(row,0) and self.refs_table.item(row,0).checkState() == Qt.Checked)))
         return refs[:9]
 
     # ---- one-click video clip workflow ----
@@ -2919,6 +3112,11 @@ class MiniMaxMusicClipWidget(QWidget):
             "--ref-audio", str(audio_chunk),
             "--output", str(out_path),
         ]
+        if self.project.use_hybrid_model:
+            hybrid = Path(str(self.project.hybrid_model_path or "").strip())
+            if not hybrid.is_file():
+                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
+            args += ["--ref2va-checkpoint", str(hybrid.resolve())]
         if self.project.vram_manager_enabled:
             args += ["--vram-manager-auto" if self.project.vram_auto_bypass else "--vram-manager"]
             args += [
@@ -3100,6 +3298,18 @@ class MiniMaxMusicClipWidget(QWidget):
     def _open_output_folder(self) -> None:
         path = Path(self.edit_output.text().strip() or OUTPUT_ROOT); path.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
+    def _sync_hybrid_model_controls(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.edit_hybrid_model.setEnabled(enabled)
+        self.btn_hybrid_model.setEnabled(enabled)
+
+    def _browse_hybrid_model(self) -> None:
+        start = self.edit_hybrid_model.text().strip() or str(ROOT / "models" / "minimax_h3")
+        path, _ = QFileDialog.getOpenFileName(self, "Select hybrid MiniMax H3 checkpoint", start, "SafeTensors (*.safetensors);;All files (*.*)")
+        if path:
+            self.edit_hybrid_model.setText(path)
+            self._pull_ui(); self._save_settings()
+
     def _browse_turbo_lora(self) -> None:
         start = self.edit_turbo_lora.text().strip()
         if start and Path(start).is_file():
@@ -3211,6 +3421,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 ):
                     if key in data:
                         setattr(self.project, key, data[key])
+                self.project.use_hybrid_model = bool(data.get("use_hybrid_model", self.project.use_hybrid_model))
+                self.project.hybrid_model_path = str(data.get("hybrid_model_path") or self.project.hybrid_model_path)
                 self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
@@ -3239,6 +3451,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "vram_residency_warmup_blocks": self.project.vram_residency_warmup_blocks,
                 "vram_residency_refill_interval": self.project.vram_residency_refill_interval,
                 "turbo_lora_path": self.project.turbo_lora_path, "turbo_lora_strength": self.project.turbo_lora_strength,
+                "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
             }

@@ -2143,6 +2143,12 @@ class MainWindow(QMainWindow):
         models = QGroupBox("Model overrides"); mf = QFormLayout(models)
         mnote = QLabel("Leave a field empty for automatic model discovery. The app scans the matching MiniMax model folder and selects a compatible checkpoint; an override can be a .safetensors file or a folder to scan.")
         mnote.setWordWrap(True); mf.addRow(mnote)
+        self.use_hybrid_model = QCheckBox("Use hybrid model")
+        self.use_hybrid_model.setChecked(False)
+        self.use_hybrid_model.setToolTip("When enabled, use the selected hybrid MiniMax H3 checkpoint for T2VA/FL2VA and Ref2VA generation instead of the separate FL2VA and Ref2VA diffusion checkpoints. This setting is remembered after restart.")
+        self.hybrid_model = ModelPathRow("Select hybrid MiniMax H3 .safetensors checkpoint")
+        mf.addRow(self.use_hybrid_model)
+        mf.addRow("Hybrid checkpoint", self.hybrid_model)
         self.fl2va_model = ModelPathRow("Blank = auto-scan diffusion_models for FL2VA")
         self.ref2va_model = ModelPathRow("Blank = auto-scan diffusion_models for Ref2VA")
         self.text_encoder_model = ModelPathRow("Blank = auto-scan text_encoders")
@@ -2153,6 +2159,8 @@ class MainWindow(QMainWindow):
         mf.addRow("Text encoder", self.text_encoder_model)
         mf.addRow("Video VAE", self.video_vae_model)
         mf.addRow("Audio VAE", self.audio_vae_model)
+        self.use_hybrid_model.toggled.connect(self._sync_hybrid_model_ui)
+        self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
         v.addWidget(models)
 
         vg = QGroupBox("VRAM Lab / Manager"); vf = QFormLayout(vg)
@@ -2565,6 +2573,12 @@ class MainWindow(QMainWindow):
                 keep.append(line)
         if keep: self.append_log("\n".join(keep) + "\n")
 
+    def _sync_hybrid_model_ui(self, enabled):
+        enabled = bool(enabled)
+        self.hybrid_model.setEnabled(enabled)
+        self.fl2va_model.setEnabled(not enabled)
+        self.ref2va_model.setEnabled(not enabled)
+
     def settings_dict(self):
         return {
             "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
@@ -2590,6 +2604,7 @@ class MainWindow(QMainWindow):
             "vram_block_check_interval": self.vram_block_interval.value(), "vram_async_streams": self.vram_async_streams.value(),
             "vram_video_vae_reserve_gb": self.vram_video_vae_reserve.value(), "vram_audio_vae_reserve_gb": self.vram_audio_vae_reserve.value(),
             "vram_video_vae_tile_size": self.vram_video_vae_tile_size.value(), "vram_video_vae_tile_overlap": self.vram_video_vae_tile_overlap.value(),
+            "use_hybrid_model": self.use_hybrid_model.isChecked(), "hybrid_model": self.hybrid_model.path(),
             "fl2va_model": self.fl2va_model.path(), "ref2va_model": self.ref2va_model.path(), "text_encoder_model": self.text_encoder_model.path(),
             "video_vae_model": self.video_vae_model.path(), "audio_vae_model": self.audio_vae_model.path(),
             "loras": [{"path": row.path(), "strength": strength.value()} for row, strength in self.lora_rows],
@@ -2653,6 +2668,7 @@ class MainWindow(QMainWindow):
             self.vram_audio_vae_reserve.setValue(float(d.get("vram_audio_vae_reserve_gb", 1.0)))
             self.vram_video_vae_tile_size.setValue(int(d.get("vram_video_vae_tile_size", 256)))
             self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 128)))
+            self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False))); self.hybrid_model.edit.setText(d.get("hybrid_model", ""))
             self.fl2va_model.edit.setText(d.get("fl2va_model", "")); self.ref2va_model.edit.setText(d.get("ref2va_model", "")); self.text_encoder_model.edit.setText(d.get("text_encoder_model", "")); self.video_vae_model.edit.setText(d.get("video_vae_model", "")); self.audio_vae_model.edit.setText(d.get("audio_vae_model", ""))
             saved_loras = d.get("loras", []) or []
             for i, (row, strength) in enumerate(self.lora_rows):
@@ -2660,6 +2676,7 @@ class MainWindow(QMainWindow):
                 row.edit.setText(str(item.get("path", ""))); strength.setValue(float(item.get("strength", 1.0)))
         except Exception as e:
             self.append_log(f"Preset warning: {e}\n")
+        self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
         self._sync_resolution(); self._sync_mode()
 
     def save_last(self):
@@ -2689,13 +2706,20 @@ class MainWindow(QMainWindow):
                 args += ["--lora", path, "--lora-strength", str(value)]
         return args
 
-    def model_override_args(self):
-        pairs = [
-            ("--fl2va-checkpoint", self.fl2va_model.path()), ("--ref2va-checkpoint", self.ref2va_model.path()),
-            ("--text-encoder", self.text_encoder_model.path()), ("--video-vae", self.video_vae_model.path()), ("--audio-vae", self.audio_vae_model.path()),
-        ]
+    def model_override_args(self, mode=None):
         args = []
-        for flag, value in pairs:
+        hybrid = self.hybrid_model.path().strip() if self.use_hybrid_model.isChecked() else ""
+        if hybrid:
+            if mode == 2:
+                args += ["--ref2va-checkpoint", hybrid]
+            elif mode in (0, 1):
+                args += ["--fl2va-checkpoint", hybrid]
+            else:
+                args += ["--fl2va-checkpoint", hybrid, "--ref2va-checkpoint", hybrid]
+        else:
+            for flag, value in (("--fl2va-checkpoint", self.fl2va_model.path()), ("--ref2va-checkpoint", self.ref2va_model.path())):
+                if value: args += [flag, value]
+        for flag, value in (("--text-encoder", self.text_encoder_model.path()), ("--video-vae", self.video_vae_model.path()), ("--audio-vae", self.audio_vae_model.path())):
             if value: args += [flag, value]
         return args
 
@@ -2912,9 +2936,14 @@ class MainWindow(QMainWindow):
 
     def validate_install(self):
         if not PYTHON.is_file(): self.status.setText("Environment missing"); return
-        self.status.setText("Validating…")
-        args = ["-m", "runtime.validate_models"] + self.model_override_args()
         mode = self.mode.currentIndex()
+        if self.use_hybrid_model.isChecked():
+            hybrid = self.hybrid_model.path().strip()
+            if not hybrid or not Path(hybrid).is_file():
+                QMessageBox.warning(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
+                return
+        self.status.setText("Validating…")
+        args = ["-m", "runtime.validate_models"] + self.model_override_args(mode)
         args += ["--mode", "ref2va" if mode == 2 else "fl2va"]
         p = QProcess(self); p.setWorkingDirectory(str(ROOT)); p.setProgram(str(PYTHON)); p.setArguments(args); p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         buf = []
@@ -3018,7 +3047,7 @@ class MainWindow(QMainWindow):
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
             for pth in self.ref_audios.paths(): args += ["--ref-audio",pth]
-        args += self.model_override_args()
+        args += self.model_override_args(mode)
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():
             args += ["--vram-manager-auto" if self.vram_manager_auto_bypass.isChecked() else "--vram-manager"]
@@ -3044,8 +3073,14 @@ class MainWindow(QMainWindow):
         while out.exists() or str(out.resolve()).lower() in used:
             out=base.with_name(f"{base.stem}_{n:03d}{base.suffix}"); n+=1
         args += ["--output",str(out)]
-        model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
-        model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
+        if self.use_hybrid_model.isChecked():
+            model_path = self.hybrid_model.path()
+            if not model_path or not Path(model_path).is_file():
+                QMessageBox.critical(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found."); return
+            model_label = f"Hybrid: {Path(model_path).name}"
+        else:
+            model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
+            model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
         job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
