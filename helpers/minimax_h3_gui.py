@@ -3,13 +3,21 @@ import json, os, sys, subprocess, time, socket, urllib.request, re, uuid, html, 
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QTimer, QEvent, QUrl, QSizeF, Signal
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, QEvent, QUrl, QSizeF, Signal
 from PySide6.QtGui import QDesktopServices, QTextCursor, QPainter, QColor, QBrush, QPixmap, QIcon
 
-try:
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-    from PySide6.QtWebEngineCore import QWebEnginePage
-except Exception:
+# FrameVision imports this module only after its QApplication is already running.
+# Qt WebEngine/Multimedia can initialize native subsystems during import, so
+# embedded mode deliberately skips them and uses the existing fallbacks.
+_FRAMEVISION_EMBEDDED_IMPORT = os.environ.get("FRAMEVISION_MINIMAX_EMBEDDED_IMPORT", "") == "1"
+if not _FRAMEVISION_EMBEDDED_IMPORT:
+    try:
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtWebEngineCore import QWebEnginePage
+    except Exception:
+        QWebEngineView = None
+        QWebEnginePage = None
+else:
     QWebEngineView = None
     QWebEnginePage = None
 from PySide6.QtWidgets import (
@@ -36,10 +44,13 @@ APP_UPDATE_EXCLUDED_TOP = {"environments", "models", "output", "logs", "jobs", "
 APP_UPDATE_EXCLUDED_PREFIXES = {"presets/setsave", "h3_prompt_builder/.runtime"}
 
 
-try:
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-    from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
-except Exception:
+if not _FRAMEVISION_EMBEDDED_IMPORT:
+    try:
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+    except Exception:
+        QMediaPlayer = QAudioOutput = QGraphicsVideoItem = None
+else:
     QMediaPlayer = QAudioOutput = QGraphicsVideoItem = None
 
 try:
@@ -117,7 +128,16 @@ QUEUE_FILE = PRESET_DIR / "minimax_h3_queue.json"
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from runtime.ffmpeg_tools import BIN_DIR as FFMPEG_BIN_DIR, tool_path as ffmpeg_tool_path, tools_ready as ffmpeg_tools_ready
+try:
+    from runtime.ffmpeg_tools import BIN_DIR as FFMPEG_BIN_DIR, tool_path as ffmpeg_tool_path, tools_ready as ffmpeg_tools_ready
+except Exception:
+    # Fresh FrameVision bootstrap: the MiniMax repository/runtime may not exist yet.
+    # Keep the embedded GUI importable so the one-click installer can be shown.
+    FFMPEG_BIN_DIR = ROOT / "presets" / "bin"
+    def ffmpeg_tool_path(name):
+        return FFMPEG_BIN_DIR / str(name)
+    def ffmpeg_tools_ready():
+        return all((FFMPEG_BIN_DIR / name).is_file() for name in ("ffmpeg.exe", "ffprobe.exe", "ffplay.exe"))
 
 
 def _hud_color(value, yellow_at=None, orange_at=None, red_at=None):
@@ -150,6 +170,7 @@ class SystemHud(QLabel):
     """Compact always-visible system HUD inspired by the user's FrameVision monitor."""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._minimax_owner = parent
         self.setObjectName("systemHud")
         self.setTextFormat(Qt.TextFormat.RichText)
         self.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
@@ -253,7 +274,7 @@ class SystemHud(QLabel):
             # SystemHud is placed inside an intermediate central widget, so parent()
             # is not necessarily the MiniMax main window. window() reliably returns
             # the top-level application window that owns the live queue state.
-            window = self.window()
+            window = self._minimax_owner or self.window()
             job = None
             current_id = getattr(window, "current_job_id", None)
             if current_id and hasattr(window, "_job_by_id"):
@@ -649,13 +670,19 @@ class RefList(QWidget):
 class MainWindow(QMainWindow):
     update_check_finished = Signal(object)
     update_check_failed = Signal(object)
+    bootstrap_repo_finished = Signal(object)
+    bootstrap_failed = Signal(str)
 
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("MiniMax H3 INT4 Standalone")
-        # 1180x900 is only the fallback geometry used after the user explicitly
-        # restores the window.  Normal application startup is maximized.
-        self.resize(1180, 900)
+    def __init__(self, parent=None, embedded: bool = False):
+        super().__init__(parent)
+        self._embedded = bool(embedded)
+        if self._embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
+        else:
+            self.setWindowTitle("MiniMax H3 INT4 Standalone")
+            # 1180x900 is only the fallback geometry used after the user explicitly
+            # restores the window. Normal application startup is maximized.
+            self.resize(1180, 900)
         self._user_window_size_override = False
         self._window_state_guard_pending = False
         self._layout_refresh_pending = False
@@ -688,8 +715,13 @@ class MainWindow(QMainWindow):
         self._ffmpeg_setup_failed = False
         self._update_check_running = False
         self._update_payload = None
+        self._bootstrap_running = False
+        self._bootstrap_proc = None
+        self._bootstrap_stage = ""
         self.update_check_finished.connect(self._handle_update_check_finished)
         self.update_check_failed.connect(self._handle_update_check_failed)
+        self.bootstrap_repo_finished.connect(self._bootstrap_repo_ready)
+        self.bootstrap_failed.connect(self._bootstrap_install_failed)
         self.wheel_filter = NoWheelFilter(self)
         self._build()
         self._apply_style()
@@ -698,6 +730,7 @@ class MainWindow(QMainWindow):
         self._sync_resolution()
         self._sync_mode()
         QTimer.singleShot(300, self.validate_install)
+        QTimer.singleShot(350, self._refresh_bootstrap_button)
         QTimer.singleShot(700, self._recover_interrupted_job)
         QTimer.singleShot(1000, self._ensure_ffmpeg_async)
         QTimer.singleShot(10000, self._startup_update_check)
@@ -766,9 +799,14 @@ class MainWindow(QMainWindow):
         self.status = QLabel("Checking install…"); self.status.setObjectName("status")
         hdr.addWidget(title); hdr.addStretch(); hdr.addWidget(self.status); outer.addLayout(hdr)
 
-        # Always-visible system HUD. It sits outside the tabs so changing tabs never hides it.
-        self.system_hud = SystemHud(self)
-        outer.addWidget(self.system_hud, 0)
+        # FrameVision already has its own system monitor. Avoid starting MiniMax HUD
+        # polling/NVML when embedded; retain a harmless target for Settings code.
+        if self._embedded:
+            self.system_hud = QLabel("")
+            self.system_hud.setVisible(False)
+        else:
+            self.system_hud = SystemHud(self)
+            outer.addWidget(self.system_hud, 0)
 
         self.tabs = QTabWidget()
         self.tabs.setUsesScrollButtons(False)  # tab strip itself never scrolls
@@ -777,7 +815,12 @@ class MainWindow(QMainWindow):
         self._build_generation_tab()
         self._build_prompt_builder_tab()
         self._build_queue_tab()
-        self._build_music_clip_tab()
+        # FrameVision has its own Music Clip Creator location. Keep the MiniMax
+        # Music Clip Creator available only in the standalone application.
+        if not self._embedded:
+            self._build_music_clip_tab()
+        else:
+            self.music_clip_tab_index = -1
         self._build_settings_tab()
 
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.
@@ -786,8 +829,15 @@ class MainWindow(QMainWindow):
         self.gen = QPushButton("Generate"); self.gen.setObjectName("primary"); self.gen.clicked.connect(self._main_generate_action)
         self.cancel = QPushButton("Cancel"); self.cancel.clicked.connect(self.cancel_job); self.cancel.setEnabled(False)
         val = QPushButton("Validate install"); val.clicked.connect(self.validate_install)
+        self.install_minimax = QPushButton("Install MiniMax H3 model & repo")
+        self.install_minimax.clicked.connect(self._start_minimax_bootstrap)
+        self.install_minimax_progress = QProgressBar()
+        self.install_minimax_progress.setRange(0, 0)
+        self.install_minimax_progress.setTextVisible(False)
+        self.install_minimax_progress.setFixedWidth(150)
+        self.install_minimax_progress.setVisible(False)
         self.openout = QPushButton("Open output folder"); self.openout.clicked.connect(self.open_output_folder)
-        controls.addWidget(self.gen); controls.addWidget(self.cancel); controls.addStretch(); controls.addWidget(val); controls.addWidget(self.openout)
+        controls.addWidget(self.gen); controls.addWidget(self.cancel); controls.addStretch(); controls.addWidget(self.install_minimax_progress); controls.addWidget(self.install_minimax); controls.addWidget(val); controls.addWidget(self.openout)
         outer.addWidget(bar, 0)
         self.setCentralWidget(root)
         self._add_tooltips()
@@ -806,6 +856,12 @@ class MainWindow(QMainWindow):
         self.aspect = QComboBox(); self.aspect.addItems(["16:9", "9:16", "1:1"]); self.aspect.currentTextChanged.connect(self._sync_resolution)
         self.res_class = QComboBox(); self.res_class.addItems(list(RESOLUTION_PRESETS)); self.res_class.setCurrentText(DEFAULT_RESOLUTION); self.res_class.currentTextChanged.connect(self._sync_resolution)
         self.resolved = QLabel()
+        self.lanczos_scale_2x = QCheckBox("Use Lanczos scaling")
+        self.lanczos_scale_2x.setChecked(False)
+        self.lanczos_scale_2x.setToolTip(
+            "When enabled, the saved video is resized to 2× its generated width and height using FFmpeg's Lanczos scaler. "
+            "Example: 1280×720 is saved as 2560×1440. This increases output resolution and file size; it does not generate additional model detail."
+        )
         self.frames = QComboBox()
         for x in FRAME_PRESETS:
             self.frames.addItem(f"{x} frames — {x / 24.0:.2f} s", x)
@@ -816,7 +872,7 @@ class MainWindow(QMainWindow):
         self.steps = QSpinBox(); self.steps.setRange(1, 100); self.steps.setValue(15)
         self.seed = QSpinBox(); self.seed.setRange(-1, 98_999_999); self.seed.setValue(-1); self.seed.setSpecialValueText("-1 (random)")
         form.addRow("Mode", self.mode)
-        rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
+        rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addWidget(self.lanczos_scale_2x); rr.addStretch(); form.addRow("Resolution", rr)
         form.addRow("Frames", self.frames); form.addRow("", self.experimental_long_duration); form.addRow("Steps", self.steps); form.addRow("Seed", self.seed)
         v.addWidget(basic)
 
@@ -936,7 +992,18 @@ class MainWindow(QMainWindow):
         self.builder_timer.setInterval(1500)
         self.builder_timer.timeout.connect(self._poll_prompt_builder_status)
         self.builder_timer.start()
-        QTimer.singleShot(500, self._start_prompt_builder)
+        self._prompt_builder_tab_index = self.tabs.indexOf(page)
+        if self._embedded:
+            self.tabs.currentChanged.connect(self._on_embedded_tab_changed)
+        else:
+            QTimer.singleShot(500, self._start_prompt_builder)
+
+    def _on_embedded_tab_changed(self, index: int):
+        if not self._embedded or index != getattr(self, "_prompt_builder_tab_index", -1):
+            return
+        if self.builder_port or (self.builder_process is not None and self.builder_process.poll() is None):
+            return
+        QTimer.singleShot(0, self._start_prompt_builder)
 
     def _port_is_free(self, port: int) -> bool:
         try:
@@ -1782,41 +1849,6 @@ class MainWindow(QMainWindow):
             # A process cannot still belong to this freshly-started GUI. Preserve it as interrupted until user decides.
             for j in self.queue_jobs:
                 if j.get("state")=="running": j["state"]="interrupted"; j["cancel_reason"]="Application closed while this job was running."
-
-            # Keep restart history compact: all active/pending work is retained, while
-            # only the newest 20 terminal results are remembered. A terminal result
-            # referenced by an active/pending job is also retained so dependency chains
-            # cannot be broken merely by restarting the GUI.
-            terminal_states = {"finished", "failed", "cancelled"}
-            active_jobs = [j for j in self.queue_jobs if j.get("state") not in terminal_states]
-            required_terminal_ids = set()
-            active_ids = {j.get("id") for j in active_jobs if j.get("id")}
-            # Walk dependency links transitively because a pending chain can point to a
-            # completed job which itself points to an older completed job.
-            by_id = {j.get("id"): j for j in self.queue_jobs if j.get("id")}
-            frontier = list(active_ids)
-            seen = set(frontier)
-            while frontier:
-                jid = frontier.pop()
-                job = by_id.get(jid)
-                if not job:
-                    continue
-                dep_id = job.get("continue_from_job_id")
-                if dep_id and dep_id not in seen:
-                    seen.add(dep_id)
-                    dep = by_id.get(dep_id)
-                    if dep:
-                        if dep.get("state") in terminal_states:
-                            required_terminal_ids.add(dep_id)
-                        frontier.append(dep_id)
-
-            terminal_jobs = [j for j in self.queue_jobs if j.get("state") in terminal_states]
-            terminal_jobs.sort(key=lambda j: float(j.get("finished_at") or j.get("created_at") or 0), reverse=True)
-            keep_terminal_ids = {j.get("id") for j in terminal_jobs[:20] if j.get("id")} | required_terminal_ids
-            self.queue_jobs = [
-                j for j in self.queue_jobs
-                if j.get("state") not in terminal_states or j.get("id") in keep_terminal_ids
-            ]
             self._ensure_queue_job_numbers()
         except Exception as exc:
             self.queue_jobs=[]
@@ -1941,6 +1973,9 @@ class MainWindow(QMainWindow):
 
     def _start_next_pending(self):
         if self.proc and self.proc.state()!=QProcess.ProcessState.NotRunning: return
+        if self._framevision_queue_mode():
+            self.current_job_id=None; self.gen.setEnabled(True); self.cancel.setEnabled(False)
+            return
         if not ffmpeg_tools_ready():
             self._ensure_ffmpeg_async()
             return
@@ -1984,7 +2019,7 @@ class MainWindow(QMainWindow):
         job["state"]="running"; job["started_at"]=time.time(); job["finished_at"]=None; job["progress"]=None; job["phase"]="Starting"; job["step_now"]=None; job["step_total"]=job.get("steps"); job["log_tail"]=""; self.current_job_id=job["id"]; self._termination_action=None; self._proc_buffer=""
         # The queue timer has started, so update the always-visible HUD immediately
         # instead of waiting for its next periodic refresh.
-        if hasattr(self, "system_hud"):
+        if hasattr(self, "system_hud") and isinstance(self.system_hud, SystemHud):
             self.system_hud.refresh()
         self.proc=QProcess(self); self.proc.setWorkingDirectory(str(ROOT)); self.proc.setProgram(str(PYTHON)); self.proc.setArguments(run_args); self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._process_output); self.proc.finished.connect(self._finished)
@@ -2005,6 +2040,104 @@ class MainWindow(QMainWindow):
         lines=[x.strip() for x in txt.replace("\r","\n").splitlines() if x.strip()]
         preferred=[x for x in lines if any(k in x.lower() for k in ("error","failed","exception","traceback","not found","missing"))]
         return (preferred[-1] if preferred else (lines[-1] if lines else f"Process exited with code {code}"))[:1500]
+
+    def _framevision_queue_mode(self):
+        return bool(self._embedded and hasattr(self, "use_framevision_queue") and self.use_framevision_queue.isChecked())
+
+    def _sync_queue_preview_setting_visibility(self):
+        show = bool(self.play_result_finished.isChecked()) and not self._framevision_queue_mode()
+        self.play_result_queue_player.setVisible(show)
+        if self._framevision_queue_mode():
+            self.play_result_queue_player.setChecked(False)
+
+    def _set_framevision_queue_mode(self, enabled):
+        enabled = bool(enabled and self._embedded)
+        # Keep the newer Music Clip Creator tab. Only the MiniMax internal Queue
+        # tab is hidden while FrameVision owns generation scheduling.
+        try:
+            self.tabs.setTabVisible(2, not enabled)
+        except Exception:
+            pass
+        if enabled:
+            self.play_result_queue_player.setChecked(False)
+            self.status.setText("FrameVision queue enabled — MiniMax pending jobs paused")
+        else:
+            self.status.setText("MiniMax internal queue enabled")
+            QTimer.singleShot(0, self._start_next_pending)
+        self._sync_queue_preview_setting_visibility()
+        try:
+            self.save_last()
+        except Exception:
+            pass
+
+    def _framevision_queue_job_records(self):
+        if not self._embedded:
+            return []
+        records = []
+        jobs_root = ROOT / "jobs"
+        state_map = {"pending":"pending", "running":"running", "done":"finished", "failed":"failed"}
+        for folder, state in state_map.items():
+            d = jobs_root / folder
+            if not d.is_dir():
+                continue
+            for jp in d.glob("*.json"):
+                if jp.name.endswith(".progress.json") or jp.name.startswith("_"):
+                    continue
+                try:
+                    data = json.loads(jp.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if str(data.get("type") or "").lower() not in ("minimax_h3_generate", "minimax_h3"):
+                    continue
+                data = dict(data)
+                data["state"] = state
+                data["_queue_file"] = str(jp)
+                try:
+                    data["_queue_mtime"] = jp.stat().st_mtime
+                except Exception:
+                    data["_queue_mtime"] = 0.0
+                records.append(data)
+        return records
+
+    def _latest_framevision_minimax_job(self):
+        records = [j for j in self._framevision_queue_job_records() if str(j.get("status") or "").lower() not in ("cancelled", "canceled")]
+        if not records:
+            return None
+        def key(j):
+            created = j.get("created_at")
+            try:
+                if isinstance(created, (int, float)):
+                    return float(created)
+            except Exception:
+                pass
+            return float(j.get("_queue_mtime") or 0.0)
+        return max(records, key=key)
+
+    def _framevision_reserved_outputs(self):
+        out = set()
+        for j in self._framevision_queue_job_records():
+            a = j.get("args") or {}
+            p = j.get("produced") or j.get("output") or a.get("outfile") or a.get("out_file") or a.get("output")
+            if p:
+                try:
+                    out.add(str(Path(str(p)).resolve()).lower())
+                except Exception:
+                    pass
+        return out
+
+    def _enqueue_framevision_minimax_job(self, job):
+        try:
+            from helpers.queue_adapter import enqueue_minimax_h3_job
+        except Exception:
+            try:
+                import queue_adapter as _qa
+                enqueue_minimax_h3_job = _qa.enqueue_minimax_h3_job
+            except Exception as exc:
+                raise RuntimeError(f"FrameVision queue adapter is unavailable: {exc}")
+        qid = enqueue_minimax_h3_job(job)
+        if not qid:
+            raise RuntimeError("FrameVision queue did not accept the MiniMax job.")
+        return qid
 
     def _build_music_clip_tab(self):
         page = QWidget()
@@ -2038,7 +2171,20 @@ class MainWindow(QMainWindow):
                 if is_music else "Add the current MiniMax generation job to the queue."
             )
 
+    def _flash_generate_click(self):
+        """Give immediate visual confirmation that the fixed Generate button was clicked."""
+        if not hasattr(self, "gen"):
+            return
+        is_music = (
+            getattr(self, "music_clip_widget", None) is not None
+            and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
+        )
+        self.gen.setText("Create video clip ✓" if is_music else "Generate ✓")
+        # Restore the normal context-sensitive label shortly after the click.
+        QTimer.singleShot(700, self._sync_main_generate_button)
+
     def _main_generate_action(self):
+        self._flash_generate_click()
         if (
             getattr(self, "music_clip_widget", None) is not None
             and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
@@ -2105,6 +2251,10 @@ class MainWindow(QMainWindow):
         for key in ("music_shot_index", "music_project_output", "music_assembly"):
             if key in spec:
                 job[key] = spec[key]
+        if self._framevision_queue_mode():
+            qid = self._enqueue_framevision_minimax_job(job)
+            self.status.setText(f"Added to FrameVision queue: {label}")
+            return qid
         self.queue_jobs.append(job)
         self._save_queue_state()
         self._refresh_queue_views()
@@ -2122,12 +2272,29 @@ class MainWindow(QMainWindow):
             "DDR RAM, CPU load, network DL/UL only above 100 KB/s, and local date/time. Default: On."
         )
         self.system_hud_toggle.toggled.connect(self._set_system_hud_visible)
+        if self._embedded:
+            self.system_hud_toggle.setChecked(False)
+            self.system_hud_toggle.setVisible(False)
         v.addWidget(self.system_hud_toggle)
+
+        self.use_framevision_queue = QCheckBox("Use FrameVision queue")
+        self.use_framevision_queue.setChecked(False)
+        self.use_framevision_queue.setToolTip(
+            "Send newly created MiniMax jobs to FrameVision's shared queue. The MiniMax internal queue is hidden and its pending jobs are paused while this is enabled."
+        )
+        self.use_framevision_queue.setVisible(self._embedded)
+        self.use_framevision_queue.toggled.connect(self._set_framevision_queue_mode)
+        v.addWidget(self.use_framevision_queue)
 
         self.sage_attention_enabled = QCheckBox("Enable SageAttention")
         self.sage_attention_enabled.setChecked(False)
-        self.sage_attention_enabled.setToolTip("This affects transformer attention during sampling only; isolated video/audio VAE workers keep their normal attention path. Default: Off.")
+        self.sage_attention_enabled.setToolTip("Transformer attention acceleration during sampling. Can be used together with Comfy Kitchen. Default: Off.")
         v.addWidget(self.sage_attention_enabled)
+
+        self.comfy_kitchen_enabled = QCheckBox("Enable Comfy Kitchen W4A8 acceleration")
+        self.comfy_kitchen_enabled.setChecked(True)
+        self.comfy_kitchen_enabled.setToolTip("Uses Comfy Kitchen CUDA kernels for supported quantized W4A8 / ConvRot operations. This is separate from SageAttention and both may be enabled together. Default: On.")
+        v.addWidget(self.comfy_kitchen_enabled)
 
         self.spectrum_enabled = QCheckBox("Enable Spectrum feature forecasting")
         self.spectrum_enabled.setChecked(False)
@@ -2141,7 +2308,7 @@ class MainWindow(QMainWindow):
         self.play_result_queue_player = QCheckBox("Use player in Queue (Off = Windows default player)")
         self.play_result_queue_player.setChecked(False)
         self.play_result_queue_player.setVisible(False)
-        self.play_result_finished.toggled.connect(self.play_result_queue_player.setVisible)
+        self.play_result_finished.toggled.connect(self._sync_queue_preview_setting_visibility)
         v.addWidget(self.play_result_queue_player)
 
         self.auto_update_enabled = QCheckBox("Auto update app")
@@ -2180,10 +2347,10 @@ class MainWindow(QMainWindow):
         mnote.setWordWrap(True); mf.addRow(mnote)
         self.use_hybrid_model = QCheckBox("Use hybrid model")
         self.use_hybrid_model.setChecked(False)
-        self.use_hybrid_model.setToolTip("When enabled, use the selected hybrid MiniMax H3 checkpoint for T2VA/FL2VA and Ref2VA generation instead of the separate FL2VA and Ref2VA diffusion checkpoints. This setting is remembered after restart.")
-        self.hybrid_model = ModelPathRow("Select hybrid MiniMax H3 .safetensors checkpoint")
+        self.use_hybrid_model.setToolTip(
+            "When enabled, the app ignores the separate FL2VA and Ref2VA checkpoint overrides and scans the MiniMax H3 model folders recursively for a .safetensors file with 'hybrid' in its filename. The same hybrid checkpoint is then used for T2VA/FL2VA and Ref2VA jobs."
+        )
         mf.addRow(self.use_hybrid_model)
-        mf.addRow("Hybrid checkpoint", self.hybrid_model)
         self.fl2va_model = ModelPathRow("Blank = auto-scan diffusion_models for FL2VA")
         self.ref2va_model = ModelPathRow("Blank = auto-scan diffusion_models for Ref2VA")
         self.text_encoder_model = ModelPathRow("Blank = auto-scan text_encoders")
@@ -2194,8 +2361,8 @@ class MainWindow(QMainWindow):
         mf.addRow("Text encoder", self.text_encoder_model)
         mf.addRow("Video VAE", self.video_vae_model)
         mf.addRow("Audio VAE", self.audio_vae_model)
-        self.use_hybrid_model.toggled.connect(self._sync_hybrid_model_ui)
-        self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
+        self.use_hybrid_model.toggled.connect(self._sync_hybrid_model_controls)
+        self._sync_hybrid_model_controls(self.use_hybrid_model.isChecked())
         v.addWidget(models)
 
         vg = QGroupBox("VRAM Lab / Manager"); vf = QFormLayout(vg)
@@ -2325,7 +2492,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._scroll_page(body), "Settings")
 
     def _set_system_hud_visible(self, enabled):
-        if hasattr(self, "system_hud"):
+        if self._embedded:
+            if hasattr(self, "system_hud"):
+                self.system_hud.setVisible(False)
+        elif hasattr(self, "system_hud") and isinstance(self.system_hud, SystemHud):
             enabled = bool(enabled)
             self.system_hud.setVisible(enabled)
             if enabled:
@@ -2608,15 +2778,9 @@ class MainWindow(QMainWindow):
                 keep.append(line)
         if keep: self.append_log("\n".join(keep) + "\n")
 
-    def _sync_hybrid_model_ui(self, enabled):
-        enabled = bool(enabled)
-        self.hybrid_model.setEnabled(enabled)
-        self.fl2va_model.setEnabled(not enabled)
-        self.ref2va_model.setEnabled(not enabled)
-
     def settings_dict(self):
         return {
-            "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
+            "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "lanczos_scale_2x": self.lanczos_scale_2x.isChecked(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
             "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
@@ -2624,13 +2788,16 @@ class MainWindow(QMainWindow):
             "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
-            "system_hud": self.system_hud_toggle.isChecked(),
+            "system_hud": False if self._embedded else self.system_hud_toggle.isChecked(),
+            "use_framevision_queue": self._framevision_queue_mode(),
             "auto_update_enabled": self.auto_update_enabled.isChecked(),
             "font_size_pt": int(self.font_size_slider.value()) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
             "play_result_finished": self.play_result_finished.isChecked(),
             "play_result_queue_player": self.play_result_queue_player.isChecked(),
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
             "sage_attention_enabled": self.sage_attention_enabled.isChecked(),
+            "comfy_kitchen_enabled": self.comfy_kitchen_enabled.isChecked(),
+            "use_hybrid_model": self.use_hybrid_model.isChecked(),
             "vram_manager_enabled": self.vram_manager_enabled.isChecked(), "vram_manager_auto_bypass": self.vram_manager_auto_bypass.isChecked(), "vram_residency_engine": self.vram_residency_engine.currentData(), "vram_runtime_free_gb": self.vram_runtime_free.value(),
             "vram_text_headroom_gb": self.vram_text_headroom.value(), "vram_diffusion_headroom_gb": self.vram_diffusion_headroom.value(),
             "vram_offload_chunk_mb": self.vram_offload_chunk.value(), "vram_max_resident_weights_gb": self.vram_max_weights.value(),
@@ -2639,7 +2806,6 @@ class MainWindow(QMainWindow):
             "vram_block_check_interval": self.vram_block_interval.value(), "vram_async_streams": self.vram_async_streams.value(),
             "vram_video_vae_reserve_gb": self.vram_video_vae_reserve.value(), "vram_audio_vae_reserve_gb": self.vram_audio_vae_reserve.value(),
             "vram_video_vae_tile_size": self.vram_video_vae_tile_size.value(), "vram_video_vae_tile_overlap": self.vram_video_vae_tile_overlap.value(),
-            "use_hybrid_model": self.use_hybrid_model.isChecked(), "hybrid_model": self.hybrid_model.path(),
             "fl2va_model": self.fl2va_model.path(), "ref2va_model": self.ref2va_model.path(), "text_encoder_model": self.text_encoder_model.path(),
             "video_vae_model": self.video_vae_model.path(), "audio_vae_model": self.audio_vae_model.path(),
             "loras": [{"path": row.path(), "strength": strength.value()} for row, strength in self.lora_rows],
@@ -2652,6 +2818,7 @@ class MainWindow(QMainWindow):
             saved_res = {"Low / test": "576 × 320", "480p": "832 × 480", "768p": "1344 × 768", "1080p": "1920 × 1088"}.get(saved_res, saved_res)
             if saved_res in RESOLUTION_PRESETS: self.res_class.setCurrentText(saved_res)
             else: self.res_class.setCurrentText(DEFAULT_RESOLUTION)
+            self.lanczos_scale_2x.setChecked(bool(d.get("lanczos_scale_2x", False)))
             self.experimental_long_duration.setChecked(bool(d.get("experimental_long_duration", False)))
             self._sync_long_duration_mode(self.experimental_long_duration.isChecked())
             self._set_frame_count(d.get("frames", 362))
@@ -2668,7 +2835,9 @@ class MainWindow(QMainWindow):
                 self.output_folder.edit.setText(d.get("output_folder", "")); self.output_name.setText(d.get("output_name", ""))
             self.extended_logging.setChecked(bool(d.get("extended_logging", False)))
             self.tile_debugging.setChecked(bool(d.get("tile_debugging", False)))
-            self.system_hud_toggle.setChecked(bool(d.get("system_hud", True)))
+            self.system_hud_toggle.setChecked(False if self._embedded else bool(d.get("system_hud", True)))
+            if hasattr(self, "use_framevision_queue"):
+                self.use_framevision_queue.setChecked(bool(d.get("use_framevision_queue", False)) if self._embedded else False)
             self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
             saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
             self.font_size_slider.blockSignals(True)
@@ -2678,11 +2847,15 @@ class MainWindow(QMainWindow):
             self._update_font_size_label(saved_font)
             self._apply_style()
             self.play_result_finished.setChecked(bool(d.get("play_result_finished", False)))
-            self.play_result_queue_player.setChecked(bool(d.get("play_result_queue_player", False)))
-            self.play_result_queue_player.setVisible(self.play_result_finished.isChecked())
+            self.play_result_queue_player.setChecked(False if self._framevision_queue_mode() else bool(d.get("play_result_queue_player", False)))
+            self._sync_queue_preview_setting_visibility()
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
-            self._set_system_hud_visible(self.system_hud_toggle.isChecked())
+            self.comfy_kitchen_enabled.setChecked(bool(d.get("comfy_kitchen_enabled", True)))
+            self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False)))
+            self._sync_hybrid_model_controls(self.use_hybrid_model.isChecked())
+            self._set_system_hud_visible(False if self._embedded else self.system_hud_toggle.isChecked())
+            self._set_framevision_queue_mode(self._framevision_queue_mode())
             self.vram_manager_enabled.setChecked(bool(d.get("vram_manager_enabled", True)))
             self.vram_manager_auto_bypass.setChecked(bool(d.get("vram_manager_auto_bypass", True)))
             engine = str(d.get("vram_residency_engine", "static")).lower()
@@ -2703,7 +2876,6 @@ class MainWindow(QMainWindow):
             self.vram_audio_vae_reserve.setValue(float(d.get("vram_audio_vae_reserve_gb", 1.0)))
             self.vram_video_vae_tile_size.setValue(int(d.get("vram_video_vae_tile_size", 256)))
             self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 128)))
-            self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False))); self.hybrid_model.edit.setText(d.get("hybrid_model", ""))
             self.fl2va_model.edit.setText(d.get("fl2va_model", "")); self.ref2va_model.edit.setText(d.get("ref2va_model", "")); self.text_encoder_model.edit.setText(d.get("text_encoder_model", "")); self.video_vae_model.edit.setText(d.get("video_vae_model", "")); self.audio_vae_model.edit.setText(d.get("audio_vae_model", ""))
             saved_loras = d.get("loras", []) or []
             for i, (row, strength) in enumerate(self.lora_rows):
@@ -2711,7 +2883,6 @@ class MainWindow(QMainWindow):
                 row.edit.setText(str(item.get("path", ""))); strength.setValue(float(item.get("strength", 1.0)))
         except Exception as e:
             self.append_log(f"Preset warning: {e}\n")
-        self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
         self._sync_resolution(); self._sync_mode()
 
     def save_last(self):
@@ -2741,22 +2912,292 @@ class MainWindow(QMainWindow):
                 args += ["--lora", path, "--lora-strength", str(value)]
         return args
 
-    def model_override_args(self, mode=None):
+    def _sync_hybrid_model_controls(self, enabled):
+        # Keep the saved FL2VA/Ref2VA locations visible, but make it clear they are ignored
+        # while the single hybrid diffusion checkpoint is active.
+        self.fl2va_model.setEnabled(not bool(enabled))
+        self.ref2va_model.setEnabled(not bool(enabled))
+
+    def _find_hybrid_checkpoint(self):
+        """Return the preferred MiniMax H3 hybrid .safetensors checkpoint, or an empty string."""
+        roots = []
+
+        # Custom diffusion locations already entered by the user are valid search roots.
+        for raw in (self.fl2va_model.path(), self.ref2va_model.path()):
+            if not raw:
+                continue
+            candidate = Path(raw).expanduser()
+            if candidate.is_file():
+                if candidate.suffix.lower() == ".safetensors" and "hybrid" in candidate.name.lower():
+                    return str(candidate.resolve())
+                candidate = candidate.parent
+            if candidate.is_dir() and candidate not in roots:
+                roots.append(candidate)
+
+        default_root = ROOT / "models" / "minimax_h3"
+        diffusion_root = default_root / "diffusion_models"
+        for candidate in (diffusion_root, default_root):
+            if candidate.is_dir() and candidate not in roots:
+                roots.append(candidate)
+
+        matches = []
+        seen = set()
+        for root in roots:
+            try:
+                for path in root.rglob("*.safetensors"):
+                    if "hybrid" not in path.name.lower():
+                        continue
+                    key = str(path.resolve()).lower()
+                    if key not in seen:
+                        seen.add(key)
+                        matches.append(path)
+            except (OSError, PermissionError):
+                continue
+
+        if not matches:
+            return ""
+
+        # Prefer diffusion_models and shallow paths, then use alphabetical order so selection
+        # stays deterministic if the user has more than one hybrid checkpoint installed.
+        def sort_key(path):
+            try:
+                rel = path.resolve().relative_to(diffusion_root.resolve())
+                return (0, len(rel.parts), path.name.lower(), str(path).lower())
+            except Exception:
+                try:
+                    rel = path.resolve().relative_to(default_root.resolve())
+                    return (1, len(rel.parts), path.name.lower(), str(path).lower())
+                except Exception:
+                    return (2, len(path.parts), path.name.lower(), str(path).lower())
+
+        matches.sort(key=sort_key)
+        return str(matches[0].resolve())
+
+    def model_override_args(self):
+        hybrid = self._find_hybrid_checkpoint() if self.use_hybrid_model.isChecked() else ""
+        pairs = [
+            ("--fl2va-checkpoint", hybrid if hybrid else self.fl2va_model.path()),
+            ("--ref2va-checkpoint", hybrid if hybrid else self.ref2va_model.path()),
+            ("--text-encoder", self.text_encoder_model.path()), ("--video-vae", self.video_vae_model.path()), ("--audio-vae", self.audio_vae_model.path()),
+        ]
         args = []
-        hybrid = self.hybrid_model.path().strip() if self.use_hybrid_model.isChecked() else ""
-        if hybrid:
-            if mode == 2:
-                args += ["--ref2va-checkpoint", hybrid]
-            elif mode in (0, 1):
-                args += ["--fl2va-checkpoint", hybrid]
-            else:
-                args += ["--fl2va-checkpoint", hybrid, "--ref2va-checkpoint", hybrid]
-        else:
-            for flag, value in (("--fl2va-checkpoint", self.fl2va_model.path()), ("--ref2va-checkpoint", self.ref2va_model.path())):
-                if value: args += [flag, value]
-        for flag, value in (("--text-encoder", self.text_encoder_model.path()), ("--video-vae", self.video_vae_model.path()), ("--audio-vae", self.audio_vae_model.path())):
+        for flag, value in pairs:
             if value: args += [flag, value]
         return args
+
+    def _minimax_bootstrap_ready(self):
+        # Require the repo runtime/vendor plus the MiniMax model folder.  This
+        # covers both fresh installs and damaged/partially deleted installations.
+        return (
+            (ROOT / "runtime").is_dir()
+            and (ROOT / "vendor").is_dir()
+            and (ROOT / "models" / "minimax_h3").is_dir()
+        )
+
+    def _refresh_bootstrap_button(self):
+        if not hasattr(self, "install_minimax"):
+            return
+        if self._bootstrap_running:
+            self.install_minimax.setVisible(True)
+            self.install_minimax.setEnabled(False)
+            self.install_minimax.setText("Please wait while installing")
+            self.install_minimax_progress.setVisible(True)
+            return
+        ready = self._minimax_bootstrap_ready()
+        self.install_minimax.setVisible(not ready)
+        self.install_minimax.setEnabled(not ready)
+        self.install_minimax.setText("Install MiniMax H3 model & repo")
+        self.install_minimax_progress.setVisible(False)
+
+    def _set_bootstrap_stage(self, text):
+        self._bootstrap_stage = str(text or "")
+        if self._bootstrap_stage:
+            self.status.setText(self._bootstrap_stage)
+
+    def _start_minimax_bootstrap(self):
+        if self._bootstrap_running:
+            return
+        installer = ROOT / "presets" / "extra_env" / "install.bat"
+        if not installer.is_file():
+            QMessageBox.critical(
+                self,
+                "MiniMax H3 installer",
+                f"The FrameVision MiniMax installer was not found:\n\n{installer}",
+            )
+            return
+        self._bootstrap_running = True
+        self._refresh_bootstrap_button()
+        self._set_bootstrap_stage("Downloading MiniMax H3 repository…")
+        threading.Thread(target=self._bootstrap_repo_worker, daemon=True).start()
+
+    @staticmethod
+    def _bootstrap_repo_rel_allowed(rel: str) -> bool:
+        rel = str(rel).replace("\\", "/").lstrip("/")
+        if not rel or rel.endswith("/"):
+            return False
+        low = rel.lower()
+        # Never touch FrameVision's imported MiniMax helper/queue integration.
+        if low == "helpers" or low.startswith("helpers/"):
+            return False
+        # Standalone launch/document/install files do not belong in FrameVision root.
+        if "/" not in rel and low in {"readme.md", "start.bat", "install.bat"}:
+            return False
+        # Keep FrameVision's relocated/non-interactive wrapper installer intact.
+        if low == "presets/extra_env/install.bat":
+            return False
+        if "__pycache__" in {part.lower() for part in rel.split("/")} or low.endswith((".pyc", ".pyo")):
+            return False
+        return True
+
+    def _bootstrap_repo_worker(self):
+        temp_dir = None
+        try:
+            temp_dir = Path(tempfile.mkdtemp(prefix="framevision_minimax_h3_"))
+            zip_path = temp_dir / "repo.zip"
+            req = urllib.request.Request(
+                APP_UPDATE_ZIP,
+                headers={
+                    "User-Agent": "FrameVision-MiniMax-H3-Installer/1.0",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=90) as response, zip_path.open("wb") as out:
+                shutil.copyfileobj(response, out, length=1024 * 1024)
+
+            extract_dir = temp_dir / "extract"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(extract_dir)
+            roots = [x for x in extract_dir.iterdir() if x.is_dir()]
+            if len(roots) != 1:
+                raise RuntimeError("Unexpected GitHub repository ZIP layout.")
+            source_root = roots[0]
+
+            copied = 0
+            for src in source_root.rglob("*"):
+                if not src.is_file():
+                    continue
+                rel = src.relative_to(source_root).as_posix()
+                if not self._bootstrap_repo_rel_allowed(rel):
+                    continue
+                dst = ROOT / Path(rel)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dst.with_name(dst.name + ".minimax_install_tmp")
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dst)
+                copied += 1
+            self.bootstrap_repo_finished.emit({"copied": copied})
+        except Exception as exc:
+            self.bootstrap_failed.emit(f"Repository setup failed: {type(exc).__name__}: {exc}")
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _bootstrap_repo_ready(self, payload):
+        if not self._bootstrap_running:
+            return
+        self._set_bootstrap_stage("Installing MiniMax H3 environment…")
+        installer = ROOT / "presets" / "extra_env" / "install.bat"
+        proc = QProcess(self)
+        self._bootstrap_proc = proc
+        self._bootstrap_stage = "environment"
+        proc.setWorkingDirectory(str(ROOT))
+        proc.setProgram("cmd.exe")
+        proc.setArguments(["/d", "/c", str(installer)])
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("MINIMAX_H3_GUI_INSTALL", "1")
+        proc.setProcessEnvironment(env)
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(self._bootstrap_process_output)
+        proc.finished.connect(self._bootstrap_environment_finished)
+        proc.start()
+        if not proc.waitForStarted(5000):
+            self._bootstrap_install_failed("Could not start presets\\extra_env\\install_minimax_h3.bat")
+
+    def _bootstrap_process_output(self):
+        proc = self._bootstrap_proc
+        if proc is None:
+            return
+        try:
+            raw = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        except Exception:
+            return
+        # Keep the GUI responsive and useful without dumping an installer console
+        # into the footer.  The last meaningful line becomes the status text.
+        lines = [x.strip() for x in raw.replace("\r", "\n").split("\n") if x.strip()]
+        if lines:
+            self.status.setText(lines[-1][:180])
+
+    def _bootstrap_environment_finished(self, exit_code, exit_status):
+        if not self._bootstrap_running or self._bootstrap_stage != "environment":
+            return
+        self._bootstrap_proc = None
+        if int(exit_code) != 0 or exit_status != QProcess.ExitStatus.NormalExit:
+            self._bootstrap_install_failed(f"Environment installer failed with exit code {int(exit_code)}.")
+            return
+        if not PYTHON.is_file():
+            self._bootstrap_install_failed(f"Environment installer finished, but Python was not found at:\n{PYTHON}")
+            return
+        self._start_bootstrap_model_download()
+
+    def _start_bootstrap_model_download(self):
+        self._set_bootstrap_stage("Downloading both MiniMax H3 models and all available LoRAs…")
+        code = r'''from runtime import download_models as d
+files=d.repo_files()
+need=[d.REMOTE_FL2VA,d.REMOTE_REF2VA,d.REMOTE_TE,d.REMOTE_VVAE,d.REMOTE_AVAE]
+missing=[x for x in need if x not in files]
+if missing: raise RuntimeError("Required model file(s) missing from repository: " + ", ".join(missing))
+loras=d.live_lora_files()
+d.download(d.REMOTE_FL2VA,d.DIFF,d.LOCAL_FL2VA)
+d.download(d.REMOTE_REF2VA,d.DIFF,d.LOCAL_REF2VA)
+d.download(d.REMOTE_TE,d.TE,d.LOCAL_TE)
+d.download(d.REMOTE_VVAE,d.VVAE,d.LOCAL_VVAE)
+d.download(d.REMOTE_AVAE,d.AVAE,d.LOCAL_AVAE)
+for item in loras: d.download(item["path"],d.LORAS,d.Path(item["path"]).name)
+print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
+'''
+        proc = QProcess(self)
+        self._bootstrap_proc = proc
+        self._bootstrap_stage = "models"
+        proc.setWorkingDirectory(str(ROOT))
+        proc.setProgram(str(PYTHON))
+        proc.setArguments(["-c", code])
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(self._bootstrap_process_output)
+        proc.finished.connect(self._bootstrap_models_finished)
+        proc.start()
+        if not proc.waitForStarted(5000):
+            self._bootstrap_install_failed("The MiniMax H3 model downloader could not be started.")
+
+    def _bootstrap_models_finished(self, exit_code, exit_status):
+        if not self._bootstrap_running or self._bootstrap_stage != "models":
+            return
+        self._bootstrap_proc = None
+        if int(exit_code) != 0 or exit_status != QProcess.ExitStatus.NormalExit:
+            self._bootstrap_install_failed(f"Model/LoRA download failed with exit code {int(exit_code)}.")
+            return
+        self._bootstrap_running = False
+        self._bootstrap_stage = ""
+        self._set_bootstrap_stage("MiniMax H3 installation complete")
+        self._refresh_bootstrap_button()
+        self.validate_install()
+
+    def _bootstrap_install_failed(self, message):
+        proc = self._bootstrap_proc
+        self._bootstrap_proc = None
+        self._bootstrap_running = False
+        self._bootstrap_stage = ""
+        if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
+            proc.kill()
+        self.status.setText("MiniMax H3 installation failed")
+        # Keep the install button visible even when a failed attempt happened to
+        # create one or more of the marker directories.
+        if hasattr(self, "install_minimax"):
+            self.install_minimax.setVisible(True)
+            self.install_minimax.setEnabled(True)
+            self.install_minimax.setText("Install MiniMax H3 model & repo")
+            self.install_minimax_progress.setVisible(False)
+        QMessageBox.critical(self, "MiniMax H3 installer", str(message))
 
     @staticmethod
     def _update_rel_allowed(rel: str) -> bool:
@@ -2767,6 +3208,10 @@ class MainWindow(QMainWindow):
         if not parts or parts[0].lower() in {x.lower() for x in APP_UPDATE_EXCLUDED_TOP}:
             return False
         low = rel.lower()
+        # FrameVision owns these two GUI integration files. Never replace them
+        # with standalone-repository copies during an application update.
+        if low in {"helpers/minimax_h3_gui.py", "helpers/minimax_music_clip.py"}:
+            return False
         if any(low == p.lower() or low.startswith(p.lower() + "/") for p in APP_UPDATE_EXCLUDED_PREFIXES):
             return False
         if "__pycache__" in {x.lower() for x in parts} or low.endswith((".pyc", ".pyo")):
@@ -2971,14 +3416,9 @@ class MainWindow(QMainWindow):
 
     def validate_install(self):
         if not PYTHON.is_file(): self.status.setText("Environment missing"); return
-        mode = self.mode.currentIndex()
-        if self.use_hybrid_model.isChecked():
-            hybrid = self.hybrid_model.path().strip()
-            if not hybrid or not Path(hybrid).is_file():
-                QMessageBox.warning(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
-                return
         self.status.setText("Validating…")
-        args = ["-m", "runtime.validate_models"] + self.model_override_args(mode)
+        args = ["-m", "runtime.validate_models"] + self.model_override_args()
+        mode = self.mode.currentIndex()
         args += ["--mode", "ref2va" if mode == 2 else "fl2va"]
         p = QProcess(self); p.setWorkingDirectory(str(ROOT)); p.setProgram(str(PYTHON)); p.setArguments(args); p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         buf = []
@@ -3033,7 +3473,18 @@ class MainWindow(QMainWindow):
         prompt=self.prompt.toPlainText().strip()
         if not prompt: QMessageBox.warning(self,"Prompt required","Enter a prompt before adding the job to the queue."); return
         if not PYTHON.is_file(): QMessageBox.critical(self,"Environment missing",f"Missing {PYTHON}"); return
-        mode=self.mode.currentIndex(); w,h=RESOLUTION_PRESETS[self.res_class.currentText()][self.aspect.currentText()]; frames=self._frame_count()
+        mode=self.mode.currentIndex()
+        hybrid_checkpoint = ""
+        if self.use_hybrid_model.isChecked():
+            hybrid_checkpoint = self._find_hybrid_checkpoint()
+            if not hybrid_checkpoint:
+                QMessageBox.critical(
+                    self,
+                    "Hybrid model not found",
+                    "Use hybrid model is enabled, but no .safetensors checkpoint with 'hybrid' in its filename was found in the MiniMax H3 model folders.\n\nPlace the hybrid checkpoint under models\\minimax_h3 (normally diffusion_models), or point one of the FL2VA/Ref2VA checkpoint fields at the folder containing it before enabling hybrid mode."
+                )
+                return
+        w,h=RESOLUTION_PRESETS[self.res_class.currentText()][self.aspect.currentText()]; frames=self._frame_count()
         long_mode = self.experimental_long_duration.isChecked()
         max_frames = EXPERIMENTAL_FRAME_MAX if long_mode else NORMAL_FRAME_MAX
         if frames > max_frames:
@@ -3062,15 +3513,18 @@ class MainWindow(QMainWindow):
             if manual_continue_video and not Path(manual_continue_video).is_file():
                 QMessageBox.warning(self,"Video missing","The selected Continue video file does not exist."); return
             if continue_last:
-                previous=self._latest_non_cancelled_queue_job()
+                previous=self._latest_framevision_minimax_job() if self._framevision_queue_mode() else self._latest_non_cancelled_queue_job()
                 if previous is None:
-                    QMessageBox.warning(self,"No previous queue job","Continue last result needs an earlier non-cancelled queue job to continue from. Add or finish a source job first."); return
+                    QMessageBox.warning(self,"No previous queue job","Continue last result needs an earlier non-cancelled MiniMax queue job to continue from. Add or finish a source job first."); return
                 if previous.get("state")=="failed":
-                    QMessageBox.warning(self,"Previous job failed","The latest non-cancelled queue job failed and continuation stops there. Remove the failed job or run a new successful source job first."); return
-                if previous.get("state")=="finished" and not Path(previous.get("output","")).is_file():
-                    QMessageBox.warning(self,"Previous output missing","The latest non-cancelled queue job is finished but its output file is missing."); return
+                    QMessageBox.warning(self,"Previous job failed","The latest non-cancelled MiniMax queue job failed and continuation stops there. Remove the failed job or run a new successful source job first."); return
+                if previous.get("state")=="finished":
+                    pa = previous.get("args") or {}
+                    prev_output = previous.get("produced") or previous.get("output") or pa.get("outfile") or pa.get("out_file")
+                    if not prev_output or not Path(str(prev_output)).is_file():
+                        QMessageBox.warning(self,"Previous output missing","The latest non-cancelled MiniMax queue job is finished but its output file is missing."); return
                 continue_from_job_id=previous.get("id")
-                continue_from_job_number=previous.get("job_number")
+                continue_from_job_number=previous.get("job_number") or previous.get("id")
             if glue_results and not (manual_continue_video or continue_last):
                 QMessageBox.warning(self,"Glue source required","Glue results requires either a selected Continue video or Continue last result."); return
             if not self.first.path() and not self.last.path() and not manual_continue_video and not continue_last:
@@ -3082,7 +3536,7 @@ class MainWindow(QMainWindow):
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
             for pth in self.ref_audios.paths(): args += ["--ref-audio",pth]
-        args += self.model_override_args(mode)
+        args += self.model_override_args()
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():
             args += ["--vram-manager-auto" if self.vram_manager_auto_bypass.isChecked() else "--vram-manager"]
@@ -3090,6 +3544,7 @@ class MainWindow(QMainWindow):
             args += ["--vram-residency-fill" if self.vram_residency_fill.isChecked() else "--no-vram-residency-fill"]
         if self.spectrum_enabled.isChecked(): args += ["--spectrum"]
         if self.sage_attention_enabled.isChecked(): args += ["--sage-attention"]
+        if not self.comfy_kitchen_enabled.isChecked(): args += ["--disable-comfy-kitchen"]
         # Video-VAE tiling is independent from sampling-side VRAM Manager activation.
         # Keep the proven 256/128 defaults unless the user deliberately changes them for testing.
         tile_size = int(self.vram_video_vae_tile_size.value())
@@ -3104,21 +3559,61 @@ class MainWindow(QMainWindow):
         # Queue jobs must never silently overwrite one another (or an existing clip), even when
         # the user entered a fixed output name. Preserve the requested base and add _002, _003...
         used={str(Path(j.get("output","")).resolve()).lower() for j in self.queue_jobs if j.get("output")}
+        if self._framevision_queue_mode():
+            used.update(self._framevision_reserved_outputs())
         base=out; n=2
         while out.exists() or str(out.resolve()).lower() in used:
             out=base.with_name(f"{base.stem}_{n:03d}{base.suffix}"); n+=1
         args += ["--output",str(out)]
         if self.use_hybrid_model.isChecked():
-            model_path = self.hybrid_model.path()
-            if not model_path or not Path(model_path).is_file():
-                QMessageBox.critical(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found."); return
-            model_label = f"Hybrid: {Path(model_path).name}"
+            model_path = hybrid_checkpoint or self._find_hybrid_checkpoint()
+            model_label = f"Hybrid: {Path(model_path).name}" if model_path else "Hybrid model"
         else:
             model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
             model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
-        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
+        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"lanczos_scale_2x":bool(self.lanczos_scale_2x.isChecked())}
+        if self._framevision_queue_mode():
+            try:
+                qid = self._enqueue_framevision_minimax_job(job)
+            except Exception as exc:
+                QMessageBox.critical(self, "FrameVision queue", f"Could not add the MiniMax job to FrameVision queue:\n\n{exc}")
+                return
+            self.save_last()
+            self.status.setText(f"MiniMax job added to FrameVision queue ({qid})")
+            return
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
+
+    def _apply_lanczos_scale_2x(self, output_path):
+        """Replace a completed MiniMax MP4 with a 2× Lanczos-scaled copy."""
+        src = Path(output_path or "")
+        if not src.is_file():
+            return False, f"Lanczos scaling source is missing: {src}"
+        ffmpeg = ffmpeg_tool_path("ffmpeg.exe")
+        if not ffmpeg or not Path(ffmpeg).is_file():
+            return False, "FFmpeg is not available for Lanczos scaling."
+        tmp = src.with_name(f".{src.stem}.lanczos2x.{uuid.uuid4().hex[:8]}.mp4")
+        cmd = [
+            str(ffmpeg), "-y", "-i", str(src),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-vf", "scale=iw*2:ih*2:flags=lanczos",
+            "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+            "-c:a", "copy", "-movflags", "+faststart", str(tmp),
+        ]
+        try:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", creationflags=flags)
+            if cp.returncode != 0 or not tmp.is_file() or tmp.stat().st_size <= 0:
+                try: tmp.unlink(missing_ok=True)
+                except Exception: pass
+                tail = (cp.stdout or "").strip().splitlines()[-8:]
+                return False, "Lanczos scaling failed" + ((":\n" + "\n".join(tail)) if tail else ".")
+            os.replace(str(tmp), str(src))
+            return True, ""
+        except Exception as exc:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+            return False, f"Lanczos scaling failed: {exc}"
 
     def _play_completed_result(self, job):
         if not job or job.get("state") != "finished":
@@ -3145,17 +3640,31 @@ class MainWindow(QMainWindow):
             elif self._termination_action=="cancel":
                 job["state"]="cancelled"; job["error"]=job.get("cancel_reason") or "Cancelled by user."
             elif code in (0,3) and Path(job.get("output","")).is_file():
-                job["state"]="finished"; job["phase"]="Finished"
-                job["clip_duration"] = self._probe_clip_duration(job.get("output"), job.get("frames"))
-                if self.play_result_finished.isChecked():
+                if bool(job.get("lanczos_scale_2x")):
+                    self.status.setText("Applying 2× Lanczos scaling…")
+                    self.append_log("Applying 2× Lanczos scaling to saved output…\n")
+                    ok, scale_error = self._apply_lanczos_scale_2x(job.get("output"))
+                    if not ok:
+                        job["state"]="failed"; job["error"]=scale_error; job["phase"]="Lanczos scaling failed"
+                    else:
+                        self.append_log("Lanczos scaling complete.\n")
+                        job["state"]="finished"; job["phase"]="Finished"
+                else:
+                    job["state"]="finished"; job["phase"]="Finished"
+                if job.get("state") == "finished":
+                    job["clip_duration"] = self._probe_clip_duration(job.get("output"), job.get("frames"))
+                if job.get("state") == "finished" and self.play_result_finished.isChecked():
                     play_finished_job = job
             else:
                 job["state"]="failed"; job["error"]=self._extract_failure_reason(job,code); job["phase"]="Failed"
-        finish_line=f"=== FINISHED: exit {code} ===\n"
+        effective_code = code
+        if job and job.get("state") == "failed" and code in (0,3):
+            effective_code = 2
+        finish_line=f"=== FINISHED: exit {effective_code} ===\n"
         self._write_job_log_file(finish_line)
         self.append_log(finish_line); self.proc=None; self.current_job_id=None; self._termination_action=None; self.cancel.setEnabled(False); self.gen.setEnabled(True)
         self._active_log_file=None
-        self.status.setText("Queue ready" if code in (0,3) else f"Job stopped/failed ({code})"); self._save_queue_state(); self._refresh_queue_views()
+        self.status.setText("Queue ready" if effective_code in (0,3) else f"Job stopped/failed ({effective_code})"); self._save_queue_state(); self._refresh_queue_views()
         if job and job.get("music_clip_job") and getattr(self, "music_clip_widget", None) is not None:
             try:
                 self.music_clip_widget.external_queue_updated(job)
@@ -3177,7 +3686,7 @@ class MainWindow(QMainWindow):
     def _restore_expected_maximized_state(self):
         """Undo accidental/programmatic restores while respecting the user."""
         self._window_state_guard_pending = False
-        if self._closing or self._user_window_size_override:
+        if self._embedded or self._closing or self._user_window_size_override:
             return
         state = self.windowState()
         if state & Qt.WindowState.WindowMinimized:
@@ -3186,7 +3695,7 @@ class MainWindow(QMainWindow):
             self.showMaximized()
 
     def changeEvent(self, event):
-        if event.type() == QEvent.Type.WindowStateChange:
+        if (not self._embedded) and event.type() == QEvent.Type.WindowStateChange:
             self._schedule_layout_refresh()
             state = self.windowState()
             minimized = bool(state & Qt.WindowState.WindowMinimized)
