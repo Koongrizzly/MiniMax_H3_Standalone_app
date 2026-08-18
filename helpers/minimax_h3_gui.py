@@ -1782,6 +1782,41 @@ class MainWindow(QMainWindow):
             # A process cannot still belong to this freshly-started GUI. Preserve it as interrupted until user decides.
             for j in self.queue_jobs:
                 if j.get("state")=="running": j["state"]="interrupted"; j["cancel_reason"]="Application closed while this job was running."
+
+            # Keep restart history compact: all active/pending work is retained, while
+            # only the newest 20 terminal results are remembered. A terminal result
+            # referenced by an active/pending job is also retained so dependency chains
+            # cannot be broken merely by restarting the GUI.
+            terminal_states = {"finished", "failed", "cancelled"}
+            active_jobs = [j for j in self.queue_jobs if j.get("state") not in terminal_states]
+            required_terminal_ids = set()
+            active_ids = {j.get("id") for j in active_jobs if j.get("id")}
+            # Walk dependency links transitively because a pending chain can point to a
+            # completed job which itself points to an older completed job.
+            by_id = {j.get("id"): j for j in self.queue_jobs if j.get("id")}
+            frontier = list(active_ids)
+            seen = set(frontier)
+            while frontier:
+                jid = frontier.pop()
+                job = by_id.get(jid)
+                if not job:
+                    continue
+                dep_id = job.get("continue_from_job_id")
+                if dep_id and dep_id not in seen:
+                    seen.add(dep_id)
+                    dep = by_id.get(dep_id)
+                    if dep:
+                        if dep.get("state") in terminal_states:
+                            required_terminal_ids.add(dep_id)
+                        frontier.append(dep_id)
+
+            terminal_jobs = [j for j in self.queue_jobs if j.get("state") in terminal_states]
+            terminal_jobs.sort(key=lambda j: float(j.get("finished_at") or j.get("created_at") or 0), reverse=True)
+            keep_terminal_ids = {j.get("id") for j in terminal_jobs[:20] if j.get("id")} | required_terminal_ids
+            self.queue_jobs = [
+                j for j in self.queue_jobs
+                if j.get("state") not in terminal_states or j.get("id") in keep_terminal_ids
+            ]
             self._ensure_queue_job_numbers()
         except Exception as exc:
             self.queue_jobs=[]
