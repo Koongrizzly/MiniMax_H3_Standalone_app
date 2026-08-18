@@ -24,6 +24,7 @@ for d in (DIFF, TE, VVAE, AVAE, LORAS):
 
 HF = "https://huggingface.co"
 REPO = "koongrizzly/MiniMax_H3_int4_W4A8_ConvRot_Pruned"
+HYBRID_REPO = "berryber09/MiniMax-H3-ref2va-fl2va-hybrid-w4a8"
 
 REMOTE_FL2VA = "diffusion_models/minimax_h3_fl2va_pruned-w4a8_convrot_pruned.safetensors"
 REMOTE_REF2VA = "diffusion_models/minimax_h3_ref2va_pruned-w4a8_convrot_pruned.safetensors"
@@ -37,7 +38,7 @@ LOCAL_TE = "qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors"
 LOCAL_VVAE = "MiniMax-H3-video_vae_fp16.safetensors"
 LOCAL_AVAE = "MiniMax-H3-audio_vae_fp32.safetensors"
 
-USER_AGENT = "MiniMax-H3-standalone-downloader/3.0"
+USER_AGENT = "MiniMax-H3-standalone-downloader/3.2"
 S = requests.Session()
 S.headers.update({"User-Agent": USER_AGENT})
 
@@ -60,8 +61,8 @@ def env_int(name: str, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
-def repo_files() -> set[str]:
-    r = S.get(f"{HF}/api/models/{REPO}", timeout=30)
+def repo_files(repo: str = REPO) -> set[str]:
+    r = S.get(f"{HF}/api/models/{repo}", timeout=30)
     r.raise_for_status()
     return {x.get("rfilename") for x in r.json().get("siblings", []) if x.get("rfilename")}
 
@@ -87,8 +88,8 @@ def live_lora_files() -> list[dict]:
     ]
 
 
-def remote_size(remote_path: str) -> int | None:
-    url = f"{HF}/{REPO}/resolve/main/{quote(remote_path, safe='/')}?download=true"
+def remote_size(remote_path: str, repo: str = REPO) -> int | None:
+    url = f"{HF}/{repo}/resolve/main/{quote(remote_path, safe='/')}?download=true"
     try:
         r = S.head(url, allow_redirects=True, timeout=30)
         if r.ok and r.headers.get("Content-Length"):
@@ -275,12 +276,12 @@ def _parallel_download(url: str, out: Path, total: int, workers: int) -> Path:
     return out
 
 
-def download(remote_path: str, dest_dir: Path, local_name: str | None = None) -> Path:
+def download(remote_path: str, dest_dir: Path, local_name: str | None = None, repo: str = REPO) -> Path:
     local_name = local_name or Path(remote_path).name
     out = dest_dir / local_name
-    url = f"{HF}/{REPO}/resolve/main/{quote(remote_path, safe='/')}?download=true"
+    url = f"{HF}/{repo}/resolve/main/{quote(remote_path, safe='/')}?download=true"
 
-    total = remote_size(remote_path)
+    total = remote_size(remote_path, repo=repo)
     if out.exists() and out.stat().st_size > 1024 * 1024:
         if total and out.stat().st_size == total:
             print(f"[SKIP] {local_name} already complete ({gb(total)})")
@@ -289,7 +290,7 @@ def download(remote_path: str, dest_dir: Path, local_name: str | None = None) ->
             print(f"[SKIP] {local_name} already present ({gb(out.stat().st_size)}); runtime validation will inspect it")
             return out
 
-    print(f"[GET ] {REPO}/{remote_path}\n      -> {out}")
+    print(f"[GET ] {repo}/{remote_path}\n      -> {out}")
     workers = env_int("MINIMAX_H3_DOWNLOAD_WORKERS", 8, 2, 16)
     min_parallel_size = 512 * 1024 * 1024
     if total is None:
@@ -320,52 +321,88 @@ def download(remote_path: str, dest_dir: Path, local_name: str | None = None) ->
     return out
 
 
+def live_hybrid_files() -> list[dict]:
+    """Return all root-level hybrid .safetensors checkpoints from the dedicated W4A8 repo."""
+    try:
+        r = S.get(f"{HF}/api/models/{HYBRID_REPO}/tree/main", params={"recursive": "false", "expand": "false"}, timeout=30)
+        r.raise_for_status()
+        items = []
+        for x in r.json():
+            path = x.get("path") or ""
+            if x.get("type") == "file" and path.lower().endswith(".safetensors"):
+                items.append({"path": path, "size": x.get("size")})
+        if items:
+            return sorted(items, key=lambda x: x["path"].lower())
+    except Exception:
+        pass
+
+    try:
+        return [
+            {"path": p, "size": None}
+            for p in sorted(repo_files(HYBRID_REPO))
+            if "/" not in p and p.lower().endswith(".safetensors")
+        ]
+    except Exception as exc:
+        print(f"WARNING: Could not read hybrid model repository: {exc}")
+        return []
+
+
 def diffusion_model_choices(files: set[str]) -> list[dict]:
-    """Build the selectable diffusion-model list from the live repository."""
+    """Build one model-selection list from the normal W4A8 repo plus the dedicated hybrid W4A8 repo."""
     choices = []
     if REMOTE_FL2VA in files:
-        choices.append({"path": REMOTE_FL2VA, "label": "FL2VA", "note": "Text-to-video and first/last-frame image-to-video"})
-    if REMOTE_REF2VA in files:
-        choices.append({"path": REMOTE_REF2VA, "label": "Ref2VA", "note": "Omni-reference generation using reference images/videos/audio"})
-
-    normal = {REMOTE_FL2VA, REMOTE_REF2VA}
-    hybrids = sorted(
-        p for p in files
-        if p.startswith("diffusion_models/")
-        and p.lower().endswith(".safetensors")
-        and "hybrid" in Path(p).name.lower()
-        and p not in normal
-    )
-    for remote_path in hybrids:
         choices.append({
-            "path": remote_path,
-            "label": f"Hybrid - {Path(remote_path).name}",
-            "note": "Hybrid MiniMax H3 diffusion checkpoint; select it in the GUI with Use hybrid model",
+            "repo": REPO,
+            "path": REMOTE_FL2VA,
+            "label": "FL2VA",
+            "note": "Text-to-video and first/last-frame image-to-video",
+            "kind": "fl2va",
+        })
+    if REMOTE_REF2VA in files:
+        choices.append({
+            "repo": REPO,
+            "path": REMOTE_REF2VA,
+            "label": "Ref2VA",
+            "note": "Omni-reference generation using reference images/videos/audio",
+            "kind": "ref2va",
+        })
+
+    for item in live_hybrid_files():
+        name = Path(item["path"]).name
+        size = f" - {gb(item.get('size'))}" if item.get("size") else ""
+        choices.append({
+            "repo": HYBRID_REPO,
+            "path": item["path"],
+            "label": f"Hybrid W4A8 - {name}{size}",
+            "note": "Combined FL2VA/Ref2VA hybrid checkpoint; select it in the GUI with Use hybrid model",
+            "kind": "hybrid",
         })
     return choices
 
 
-def choose_diffusion_models(files: set[str]) -> list[str] | None:
-    """Return selected diffusion paths; None means skip all model/LoRA downloads."""
+def choose_diffusion_models(files: set[str]) -> list[dict]:
+    """Return selected diffusion entries. An empty list means skip diffusion checkpoints only."""
     choices = diffusion_model_choices(files)
     if not choices:
-        raise RuntimeError(f"No supported MiniMax H3 diffusion .safetensors files were found in {REPO}.")
+        raise RuntimeError("No supported MiniMax H3 diffusion .safetensors files were found.")
 
     print("Choose which MiniMax H3 diffusion model(s) to download:\n")
     for i, item in enumerate(choices, 1):
         print(f"  {i}. {item['label']}")
         print(f"     {item['note']}")
     print("\n  A. All listed diffusion models")
-    print("  S. Skip all model and LoRA downloads - I will use my own files")
-    print("\nHybrid entries are discovered live from diffusion_models/, so newly published hybrid checkpoints appear automatically.\n")
+    print("  S. Skip diffusion models - still install/verify text encoder + VAEs and still offer LoRAs")
+    print(f"\nOriginal models: {HF}/{REPO}")
+    print(f"Hybrid W4A8 models: {HF}/{HYBRID_REPO}")
+    print("Hybrid entries are discovered live, so newly published .safetensors checkpoints appear automatically.\n")
 
     while True:
         ans = input("Selection [numbers separated by commas / A / S, default 1]: ").strip() or "1"
         low = ans.lower()
         if low == "s":
-            return None
+            return []
         if low == "a":
-            return [item["path"] for item in choices]
+            return choices
 
         selected = []
         seen = set()
@@ -382,10 +419,11 @@ def choose_diffusion_models(files: set[str]) -> list[str] | None:
             if not 1 <= idx <= len(choices):
                 valid = False
                 break
-            remote_path = choices[idx - 1]["path"]
-            if remote_path not in seen:
-                seen.add(remote_path)
-                selected.append(remote_path)
+            item = choices[idx - 1]
+            key = (item["repo"], item["path"])
+            if key not in seen:
+                seen.add(key)
+                selected.append(item)
         if valid and selected:
             return selected
         print(f"Please enter one or more numbers from 1 to {len(choices)}, A, or S.")
@@ -444,17 +482,13 @@ def choose_loras() -> list[dict]:
 
 def main() -> int:
     print("=" * 68)
-    print("MiniMax-H3 INT4 W4A8 ConvRot model downloader v3.1")
+    print("MiniMax-H3 INT4 W4A8 ConvRot model downloader v3.2")
     print(f"Source: {HF}/{REPO}")
     print("=" * 68)
     print("Downloads selected files only - never a full repository snapshot.\n")
 
     files = repo_files()
     selected_diffusion = choose_diffusion_models(files)
-    if selected_diffusion is None:
-        print("\nSkipping all model and LoRA downloads.")
-        print("Use your own compatible files in the MiniMax H3 model folders, then start the app.")
-        return 0
 
     required_common = [REMOTE_TE, REMOTE_VVAE, REMOTE_AVAE]
     missing = [p for p in required_common if p not in files]
@@ -464,14 +498,17 @@ def main() -> int:
     chosen_loras = choose_loras()
 
     print("\nDownload plan:")
-    for remote_path in selected_diffusion:
-        name = Path(remote_path).name
-        if remote_path == REMOTE_FL2VA:
-            print("  - FL2VA diffusion model")
-        elif remote_path == REMOTE_REF2VA:
-            print("  - Ref2VA diffusion model")
-        else:
-            print(f"  - Hybrid diffusion model: {name}")
+    if selected_diffusion:
+        for item in selected_diffusion:
+            name = Path(item["path"]).name
+            if item["kind"] == "fl2va":
+                print("  - FL2VA diffusion model")
+            elif item["kind"] == "ref2va":
+                print("  - Ref2VA diffusion model")
+            else:
+                print(f"  - Hybrid W4A8 diffusion model: {name}")
+    else:
+        print("  - Diffusion models: skipped by user")
     print("  - W4A8 ConvRot text encoder")
     print("  - Mixed FP16/FP32 video VAE")
     print("  - FP32 audio VAE")
@@ -482,13 +519,15 @@ def main() -> int:
         print("  - LoRAs: none")
     print()
 
-    for remote_path in selected_diffusion:
-        if remote_path == REMOTE_FL2VA:
-            download(remote_path, DIFF, LOCAL_FL2VA)
-        elif remote_path == REMOTE_REF2VA:
-            download(remote_path, DIFF, LOCAL_REF2VA)
+    for item in selected_diffusion:
+        remote_path = item["path"]
+        repo = item["repo"]
+        if item["kind"] == "fl2va":
+            download(remote_path, DIFF, LOCAL_FL2VA, repo=repo)
+        elif item["kind"] == "ref2va":
+            download(remote_path, DIFF, LOCAL_REF2VA, repo=repo)
         else:
-            download(remote_path, DIFF, Path(remote_path).name)
+            download(remote_path, DIFF, Path(remote_path).name, repo=repo)
     download(REMOTE_TE, TE, LOCAL_TE)
     download(REMOTE_VVAE, VVAE, LOCAL_VVAE)
     download(REMOTE_AVAE, AVAE, LOCAL_AVAE)
