@@ -106,6 +106,9 @@ def estimate_reference_encode_vram_gib(
     video_vae_path=None,
     audio_vae_path=None,
     include_audio: bool = False,
+    ref_image_count: int = 0,
+    ref_video_count: int = 0,
+    ref_image_size: str = "match",
 ) -> float:
     """Estimate peak native reference/keyframe encode pressure.
 
@@ -120,6 +123,18 @@ def estimate_reference_encode_vram_gib(
     work = (width * height * reference_frames) / (832.0 * 480.0 * 35.0)
     transient = 2.25 + 2.25 * min(4.0, max(0.10, work) ** 0.55)
     video_required = video_weights * 1.05 + transient
+    # V11.4: the old single-frame estimate (~8 GiB around 960x544) badly
+    # underestimated multi-image Ref2VA. Real 24 GiB runs spilled and some
+    # reached OOM during visual VAE encode before Qwen. Force managed reference
+    # handling for multi-image/high-detail reference jobs on 24 GiB-class cards.
+    image_count = max(0, int(ref_image_count))
+    video_count = max(0, int(ref_video_count))
+    if image_count >= 2:
+        video_required = max(video_required, 25.50 + 0.50 * min(4, image_count - 2))
+    elif image_count >= 1 and str(ref_image_size).lower() == "max":
+        video_required = max(video_required, 24.50)
+    if video_count > 0:
+        video_required = max(video_required, 25.50)
     if include_audio:
         audio_weights = _file_gib(audio_vae_path, 2.0)
         audio_required = audio_weights * 1.08 + 1.50
@@ -191,6 +206,7 @@ def decide_vram_stages(
     ref_image_count: int = 0,
     ref_video_count: int = 0,
     ref_audio_count: int = 0,
+    ref_image_size: str = "match",
 ):
     """Return independent automatic VRAM decisions for every expensive H3 stage."""
     gpu = query_primary_gpu_vram()
@@ -208,6 +224,9 @@ def decide_vram_stages(
                 video_vae_path=video_vae_path,
                 audio_vae_path=audio_vae_path,
                 include_audio=reference_audio,
+                ref_image_count=ref_image_count,
+                ref_video_count=ref_video_count,
+                ref_image_size=ref_image_size,
             ),
             usable,
             "reference/video encode",

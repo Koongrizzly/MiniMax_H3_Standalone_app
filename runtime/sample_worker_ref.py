@@ -75,6 +75,46 @@ def _cpu_latent(x):
     except Exception:
         return x.cpu() if hasattr(x, "cpu") else x
 
+
+def _encode_visual_reference(vae, pixels, manager=None, *, label="reference image"):
+    """Encode visual Ref2VA input without the old full-encode spill first.
+
+    Managed reference stages go directly to MiniMax/Comfy's tiled VAE path under
+    inference_mode. This avoids constructing an autograd graph and avoids the old
+    pattern of trying a huge regular encode, spilling/OOMing, and only then retrying
+    tiled while the failed allocation is still being unwound.
+    """
+    managed = bool(manager is not None and manager.is_stage_managed('reference'))
+    if managed:
+        free_before, total = manager._cuda_free()
+        print(
+            f"[VRAM-MGR] V11.4 reference admission | {label} | "
+            f"CUDA free={manager._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"card={manager._gb(total) if total is not None else 'n/a'} | proactive tiled inference encode",
+            flush=True,
+        )
+        manager.trim_cuda_cache(reason=f'pre-{label}', force=True)
+    with torch.inference_mode():
+        if managed:
+            z = vae.encode_tiled(pixels, tile_x=256, tile_y=256, overlap=64)
+        else:
+            z = vae.encode(pixels)
+        z = _cpu_latent(z)
+    if managed:
+        # Drop only unused allocator cache between independent references. Keep the
+        # 4.85 GiB VAE residency itself intact so the next image does not reload it.
+        try:
+            comfy.model_management.soft_empty_cache()
+        except Exception:
+            pass
+        free_after, _ = manager._cuda_free()
+        print(
+            f"[VRAM-MGR] V11.4 reference encode complete | {label} | "
+            f"CUDA free={manager._gb(free_after) if free_after is not None else 'n/a'}",
+            flush=True,
+        )
+    return z
+
 def _install_qwen_layer_trace(manager=None):
     import comfy.text_encoders.llama as h3_llama
     original=h3_llama.TransformerBlock.forward
@@ -117,11 +157,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_3_AUTO_REF2VA_QWEN_20260817A"
+        expected = "V11_4_REF_VAE_ADMISSION_20260817A"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.3 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.4 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     if len(ns.lora)!=len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora)>3: raise ValueError('Maximum 3 LoRAs are supported')
     manager=None
@@ -155,7 +195,7 @@ def main():
         img=load_image(path); h,w=img.shape[1],img.shape[2]
         scale=min(1.0, math.sqrt((ns.width*ns.height)/(w*h))) if ns.ref_image_size=='match' else min(1.0,REF_IMAGE_SHORT_EDGE/min(w,h))
         tw=max(CANVAS_MULTIPLE,round(w*scale/CANVAS_MULTIPLE)*CANVAS_MULTIPLE); th=max(CANVAS_MULTIPLE,round(h*scale/CANVAS_MULTIPLE)*CANVAS_MULTIPLE)
-        r=resize(img,tw,th); z=_cpu_latent(vv.encode(r)); ref_items.append({'type':'image','data':r.cpu()}); ref_blocks.append({'kind':'image','latent_h':th//16,'latent_w':tw//16,'latent':z})
+        r=resize(img,tw,th); z=_encode_visual_reference(vv, r, manager, label=f'reference image {len(ref_blocks)+1} ({tw}x{th})'); ref_items.append({'type':'image','data':r.cpu()}); ref_blocks.append({'kind':'image','latent_h':th//16,'latent_w':tw//16,'latent':z})
     video_data=[]
     for path in ns.ref_video[:3]:
         vf=load_video_24(path,frame_count); vh,vw=vf.shape[1],vf.shape[2]; cw,ch=adapt_canvas(vw,vh)
@@ -164,7 +204,7 @@ def main():
         n=min(frames.shape[0],frame_count)
         if n<5: raise ValueError('MiniMax H3 reference videos need at least 5 frames')
         while n%17!=5 and n>5:n-=1
-        frames=frames[:n]; z=_cpu_latent(vv.encode(frames))
+        frames=frames[:n]; z=_encode_visual_reference(vv, frames, manager, label=f'reference video {len(video_data)+1} ({cw}x{ch}, {n}f)')
         sample_idx=list(range(0,frames.shape[0],FPS//2)); qwen=frames[sample_idx].cpu()
         video_data.append((path,z,ch,cw,qwen,[i/2.0 for i in range(len(sample_idx))]))
     del vv; _flush_models()
@@ -193,7 +233,7 @@ def main():
     if manager is not None and manager.is_stage_managed('text'):
         manager.begin_text_conditioning_admission()
         # comfy.sd.load_clip() is lazy: this is the first real Qwen CUDA residency
-        # load.  Do it under the V11.3 activation reserve, then verify actual free
+        # load.  Do it under the V11.4 activation reserve, then verify actual free
         # VRAM before the first transformer forward.
         clip.load_model(tokens)
         manager.prepare_text_conditioning(reason='Ref2VA pre-Qwen conditioning')

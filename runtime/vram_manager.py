@@ -7,8 +7,8 @@ import torch
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
 
-VRAM_MANAGER_SIGNATURE = "V11_3_AUTO_REF2VA_QWEN_20260817A"
-VRAM_MANAGER_VERSION = "V11.3"
+VRAM_MANAGER_SIGNATURE = "V11_4_REF_VAE_ADMISSION_20260817A"
+VRAM_MANAGER_VERSION = "V11.4"
 
 
 @dataclass
@@ -239,9 +239,11 @@ class VRAMManager:
         # installed the hard CUDA ceiling for diffusion, which allowed managed text
         # runs to oversubscribe a 24 GiB card before the guard appeared in the log.
         # Install the ceiling *before loading* every managed compute-heavy stage.
-        # Reference VAE work keeps the normal allocator because its tiled/serial
-        # encoding path is materially smaller and benefits from allocator freedom.
-        if managed and self.stage in ("text", "diffusion"):
+        # V11.4 also protects the reference VAE stage. Multi-image Ref2VA jobs,
+        # especially at high reference resolution, demonstrated 24+ GiB transient
+        # allocations before Qwen was ever reached. Leaving reference encoding
+        # outside the allocator ceiling allowed WDDM to spill hard into shared RAM.
+        if managed and self.stage in ("reference", "text", "diffusion"):
             self._install_allocator_guard()
         else:
             self._restore_allocator_guard()
@@ -272,7 +274,7 @@ class VRAMManager:
         comfy.sd.load_clip() only creates the CLIP/Qwen object; the GPU residency
         load happens lazily from CLIP.load_model(tokens) inside encode.  V11.1 ran
         its preflight before that lazy load, so it always saw an almost-empty card.
-        V11.3 arms Comfy's EXTRA_RESERVED_VRAM with the activation target first so
+        V11.4 arms Comfy's EXTRA_RESERVED_VRAM with the activation target first so
         the lazy loader chooses partial Qwen residency from the outset.
         """
         if not self.is_stage_managed("text") or self.stage != "text":
@@ -284,7 +286,7 @@ class VRAMManager:
         self._set_comfy_reserve(target)
         free_before, total = self._cuda_free()
         self._log(
-            f"V11.3 Qwen admission armed | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"V11.4 Qwen admission armed | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
             f"reserved activation runway={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
             force=True,
         )
@@ -300,7 +302,7 @@ class VRAMManager:
         self._set_comfy_reserve(target)
         free_before, total = self._cuda_free()
         self._log(
-            f"V11.3 Qwen preflight after load | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"V11.4 Qwen preflight after load | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
             f"target free={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
             force=True,
         )
@@ -308,7 +310,7 @@ class VRAMManager:
         self.trim_cuda_cache(reason=reason, force=True)
         free_after, _ = self._cuda_free()
         self._log(
-            f"V11.3 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
+            f"V11.4 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
             f"CUDA free={self._gb(free_after) if free_after is not None else 'n/a'} | target={self._gb(target)}",
             force=True,
         )
@@ -318,7 +320,7 @@ class VRAMManager:
         """Release the temporary Qwen activation reserve after conditioning."""
         if self._text_conditioning_target_bytes:
             self._log(
-                f"V11.3 Qwen admission released | activation runway was={self._gb(self._text_conditioning_target_bytes)}",
+                f"V11.4 Qwen admission released | activation runway was={self._gb(self._text_conditioning_target_bytes)}",
                 force=True,
             )
         self._text_conditioning_target_bytes = 0
@@ -338,7 +340,7 @@ class VRAMManager:
                 return manager._orig_load_models_gpu(models, *args, **kwargs)
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
-            # V11.3: while Qwen conditioning admission is armed, keep the large
+            # V11.4: while Qwen conditioning admission is armed, keep the large
             # activation runway visible to *every* Comfy load call.  encode() calls
             # CLIP.load_model(tokens) again, so dropping back to the 0.5 GiB runtime
             # reserve here would simply pull the offloaded Qwen weights back in.

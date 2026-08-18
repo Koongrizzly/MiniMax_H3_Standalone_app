@@ -63,11 +63,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_3_AUTO_REF2VA_QWEN_20260817A"
+        expected = "V11_4_REF_VAE_ADMISSION_20260817A"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.3 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.4 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     torch.set_grad_enabled(False)
     if len(ns.lora) != len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora) > 3: raise ValueError('Maximum 3 LoRAs are supported')
@@ -145,7 +145,7 @@ def main():
     clip=comfy.sd.load_clip([ns.text_encoder], clip_type=comfy.sd.CLIPType.MINIMAX)
     if ns.extended_logging: log_mem('after text encoder object load')
     # build_conditioning() tokenizes internally, so make a matching token set here
-    # solely to force the lazy Qwen residency load under V11.3 admission control.
+    # solely to force the lazy Qwen residency load under V11.4 admission control.
     if manager is not None and manager.is_stage_managed('text'):
         admission_images=prepared_keyframes[0] if prepared_keyframes is not None else []
         admission_tokens=clip.tokenize(ns.prompt, images=admission_images)
