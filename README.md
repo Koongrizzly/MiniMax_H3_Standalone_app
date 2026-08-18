@@ -10,13 +10,6 @@
 
 It supports :
 
-- Text → video + audio (T2VA)
-
-- First/last image/video → video + audio (FL2VA)
-
-- Video To Video with sound memory + 'use last finished job' feature for automation (FL2VA)
-
-- Reference image/video/audio → video + audio (Ref2VA)
 
 - BETA 08/16/26: imported the Framevision music clip creator and converted it for use with MiniMax H3
   
@@ -28,6 +21,20 @@ It supports :
  
   Add an idea, extra details, camera shots, location(s) in the idea tab and a music track and click start
   to create a full music videoclips with the click of a button.
+  
+  
+- 08/17/26 : added support for the hybrid models (INT4/W4A8)
+  Folder location now has a toggle 'use hybrid model' and the installer now has option to download the hybrid model
+  Re-run the installer if you already have the app installed. You can also download the model yourself and simply load it in   the app
+
+
+- Text → video + audio (T2VA)
+
+- First/last image/video → video + audio (FL2VA)
+
+- Video To Video with sound memory + 'use last finished job' feature for automation (FL2VA)
+
+- Reference image/video/audio → video + audio (Ref2VA)
 
 - Up to 30 seconds at 24 FPS by default + experimental : up to 100 seconds !
 
