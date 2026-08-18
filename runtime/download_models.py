@@ -320,18 +320,75 @@ def download(remote_path: str, dest_dir: Path, local_name: str | None = None) ->
     return out
 
 
-def ask_model_mode() -> str:
-    print("Choose which MiniMax H3 diffusion model to download:\n")
-    print("  1. FL2VA only  - Text-to-video and first/last-frame image-to-video")
-    print("  2. Ref2VA only - Omni-reference generation using reference images/videos/audio")
-    print("  3. Both        - Install both diffusion models")
-    print("  4. Skip model downloads - I will use my own files")
-    print()
+def diffusion_model_choices(files: set[str]) -> list[dict]:
+    """Build the selectable diffusion-model list from the live repository."""
+    choices = []
+    if REMOTE_FL2VA in files:
+        choices.append({"path": REMOTE_FL2VA, "label": "FL2VA", "note": "Text-to-video and first/last-frame image-to-video"})
+    if REMOTE_REF2VA in files:
+        choices.append({"path": REMOTE_REF2VA, "label": "Ref2VA", "note": "Omni-reference generation using reference images/videos/audio"})
+
+    normal = {REMOTE_FL2VA, REMOTE_REF2VA}
+    hybrids = sorted(
+        p for p in files
+        if p.startswith("diffusion_models/")
+        and p.lower().endswith(".safetensors")
+        and "hybrid" in Path(p).name.lower()
+        and p not in normal
+    )
+    for remote_path in hybrids:
+        choices.append({
+            "path": remote_path,
+            "label": f"Hybrid - {Path(remote_path).name}",
+            "note": "Hybrid MiniMax H3 diffusion checkpoint; select it in the GUI with Use hybrid model",
+        })
+    return choices
+
+
+def choose_diffusion_models(files: set[str]) -> list[str] | None:
+    """Return selected diffusion paths; None means skip all model/LoRA downloads."""
+    choices = diffusion_model_choices(files)
+    if not choices:
+        raise RuntimeError(f"No supported MiniMax H3 diffusion .safetensors files were found in {REPO}.")
+
+    print("Choose which MiniMax H3 diffusion model(s) to download:\n")
+    for i, item in enumerate(choices, 1):
+        print(f"  {i}. {item['label']}")
+        print(f"     {item['note']}")
+    print("\n  A. All listed diffusion models")
+    print("  S. Skip all model and LoRA downloads - I will use my own files")
+    print("\nHybrid entries are discovered live from diffusion_models/, so newly published hybrid checkpoints appear automatically.\n")
+
     while True:
-        ans = input("Selection [1/2/3/4, default 1]: ").strip() or "1"
-        if ans in {"1", "2", "3", "4"}:
-            return ans
-        print("Please enter 1, 2, 3 or 4.")
+        ans = input("Selection [numbers separated by commas / A / S, default 1]: ").strip() or "1"
+        low = ans.lower()
+        if low == "s":
+            return None
+        if low == "a":
+            return [item["path"] for item in choices]
+
+        selected = []
+        seen = set()
+        valid = True
+        for piece in ans.replace(";", ",").split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                idx = int(piece)
+            except ValueError:
+                valid = False
+                break
+            if not 1 <= idx <= len(choices):
+                valid = False
+                break
+            remote_path = choices[idx - 1]["path"]
+            if remote_path not in seen:
+                seen.add(remote_path)
+                selected.append(remote_path)
+        if valid and selected:
+            return selected
+        print(f"Please enter one or more numbers from 1 to {len(choices)}, A, or S.")
 
 
 def lora_note(name: str) -> str:
@@ -387,35 +444,34 @@ def choose_loras() -> list[dict]:
 
 def main() -> int:
     print("=" * 68)
-    print("MiniMax-H3 INT4 W4A8 ConvRot model downloader v3.0")
+    print("MiniMax-H3 INT4 W4A8 ConvRot model downloader v3.1")
     print(f"Source: {HF}/{REPO}")
     print("=" * 68)
     print("Downloads selected files only - never a full repository snapshot.\n")
 
-    mode = ask_model_mode()
-    if mode == "4":
+    files = repo_files()
+    selected_diffusion = choose_diffusion_models(files)
+    if selected_diffusion is None:
         print("\nSkipping all model and LoRA downloads.")
         print("Use your own compatible files in the MiniMax H3 model folders, then start the app.")
         return 0
 
-    files = repo_files()
     required_common = [REMOTE_TE, REMOTE_VVAE, REMOTE_AVAE]
     missing = [p for p in required_common if p not in files]
     if missing:
         raise RuntimeError("Required common file(s) missing from repository: " + ", ".join(missing))
 
-    if mode in {"1", "3"} and REMOTE_FL2VA not in files:
-        raise RuntimeError(f"Required FL2VA file is missing from {REPO}: {REMOTE_FL2VA}")
-    if mode in {"2", "3"} and REMOTE_REF2VA not in files:
-        raise RuntimeError(f"Required Ref2VA file is missing from {REPO}: {REMOTE_REF2VA}")
-
     chosen_loras = choose_loras()
 
     print("\nDownload plan:")
-    if mode in {"1", "3"}:
-        print("  - FL2VA diffusion model")
-    if mode in {"2", "3"}:
-        print("  - Ref2VA diffusion model")
+    for remote_path in selected_diffusion:
+        name = Path(remote_path).name
+        if remote_path == REMOTE_FL2VA:
+            print("  - FL2VA diffusion model")
+        elif remote_path == REMOTE_REF2VA:
+            print("  - Ref2VA diffusion model")
+        else:
+            print(f"  - Hybrid diffusion model: {name}")
     print("  - W4A8 ConvRot text encoder")
     print("  - Mixed FP16/FP32 video VAE")
     print("  - FP32 audio VAE")
@@ -426,10 +482,13 @@ def main() -> int:
         print("  - LoRAs: none")
     print()
 
-    if mode in {"1", "3"}:
-        download(REMOTE_FL2VA, DIFF, LOCAL_FL2VA)
-    if mode in {"2", "3"}:
-        download(REMOTE_REF2VA, DIFF, LOCAL_REF2VA)
+    for remote_path in selected_diffusion:
+        if remote_path == REMOTE_FL2VA:
+            download(remote_path, DIFF, LOCAL_FL2VA)
+        elif remote_path == REMOTE_REF2VA:
+            download(remote_path, DIFF, LOCAL_REF2VA)
+        else:
+            download(remote_path, DIFF, Path(remote_path).name)
     download(REMOTE_TE, TE, LOCAL_TE)
     download(REMOTE_VVAE, VVAE, LOCAL_VVAE)
     download(REMOTE_AVAE, AVAE, LOCAL_AVAE)
