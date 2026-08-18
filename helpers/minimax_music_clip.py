@@ -126,6 +126,7 @@ def _music_project_identity(title: str, audio_path: str) -> str:
 def _cleanup_music_clip_temp_artifacts() -> None:
     """Remove stale scratch data without touching rendered raw clips or final videos."""
     now = time.time()
+    # Analysis scratch dirs are normally deleted in a finally block, but crashes can leave them behind.
     try:
         temp_root = Path(tempfile.gettempdir())
         for child in temp_root.glob("fv_minimax_music_an_*"):
@@ -137,6 +138,7 @@ def _cleanup_music_clip_temp_artifacts() -> None:
     except Exception:
         pass
 
+    # Global Whisper scratch and thumbnail cache.
     for folder, max_age in ((OUTPUT_ROOT / "_temp", 3600), (OUTPUT_ROOT / "_preview_cache", 7 * 86400)):
         try:
             if not folder.is_dir():
@@ -144,20 +146,18 @@ def _cleanup_music_clip_temp_artifacts() -> None:
             for child in folder.iterdir():
                 try:
                     if now - child.stat().st_mtime > max_age:
-                        if child.is_dir():
-                            shutil.rmtree(child, ignore_errors=True)
-                        else:
-                            child.unlink(missing_ok=True)
+                        if child.is_dir(): shutil.rmtree(child, ignore_errors=True)
+                        else: child.unlink(missing_ok=True)
                 except Exception:
                     pass
             try:
-                if not any(folder.iterdir()):
-                    folder.rmdir()
+                if not any(folder.iterdir()): folder.rmdir()
             except Exception:
                 pass
         except Exception:
             pass
 
+    # Old assembly scratch directories can be large; only remove stale ones.
     try:
         if OUTPUT_ROOT.is_dir():
             for folder in OUTPUT_ROOT.rglob("_assembly"):
@@ -1025,8 +1025,7 @@ def _creative_pool_items(value: str, *, allow_commas: bool = False) -> List[str]
         " then ", " followed by ", " before ", " after ", " while ",
         " from ", " through ", " into ", " to the ", " and then ", "->", "→",
     )
-    normalized_raw = re.sub(r"\s+", " ", raw)
-    low = f" {normalized_raw.lower()} "
+    low = f" {re.sub(r'\\s+', ' ', raw).lower()} "
     connected_sequence = any(marker in low for marker in sequence_markers)
 
     parts = re.split(r"[\r\n;|]+", raw)
@@ -2084,7 +2083,6 @@ class MiniMaxMusicClipWidget(QWidget):
         self._build_director_tab()
         self._build_generate_tab()
         self._build_settings_tab()
-        self._build_global_action_bar(outer)
 
         footer = QHBoxLayout()
         self.progress = QProgressBar(self)
@@ -2095,47 +2093,6 @@ class MiniMaxMusicClipWidget(QWidget):
         footer.addWidget(self.progress, 1)
         footer.addWidget(self.status, 2)
         outer.addLayout(footer)
-
-    def _build_global_action_bar(self, outer: QVBoxLayout) -> None:
-        """Keep the primary music-clip actions visible on every tab."""
-        bar = QHBoxLayout()
-        bar.setSpacing(6)
-
-        self.btn_create_video_clip = QPushButton("Create video clip", self)
-        self.btn_create_video_clip.setToolTip(
-            "One-click workflow: analyze the selected song, use Whisper lyric timing when enabled, "
-            "build/direct the complete shot list, add all missing MiniMax clips to the FrameVision queue, "
-            "then queue final trim and assembly."
-        )
-        self.btn_generate_selected = QPushButton("Generate selected shot", self)
-        self.btn_generate_all = QPushButton("Generate all missing shots", self)
-        self.btn_stop_generation = QPushButton("Stop generation", self)
-        self.btn_stop_generation.setEnabled(False)
-        self.btn_stop_generation.setToolTip(
-            "Stops the current direct MiniMax clip. When FrameVision queue mode is active, "
-            "cancel or requeue running jobs from FrameVision's main Queue tab."
-        )
-        self.btn_assemble = QPushButton("Assemble final music video", self)
-        self.btn_open_output = QPushButton("Open output folder", self)
-
-        for button in (
-            self.btn_create_video_clip,
-            self.btn_generate_selected,
-            self.btn_generate_all,
-            self.btn_stop_generation,
-            self.btn_assemble,
-            self.btn_open_output,
-        ):
-            bar.addWidget(button)
-        bar.addStretch(1)
-        outer.addLayout(bar)
-
-        self.btn_create_video_clip.clicked.connect(self.create_video_clip)
-        self.btn_generate_selected.clicked.connect(self._generate_selected)
-        self.btn_generate_all.clicked.connect(self._generate_all)
-        self.btn_stop_generation.clicked.connect(self._stop_generation)
-        self.btn_assemble.clicked.connect(self._assemble)
-        self.btn_open_output.clicked.connect(self._open_output_folder)
 
     def _scrollable_tab_body(self, page: QWidget) -> tuple[QVBoxLayout, QWidget, QVBoxLayout]:
         """Create a vertically scrollable tab body plus a fixed bottom area.
@@ -2352,6 +2309,17 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _build_generate_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_generate)
+        row = QHBoxLayout()
+        self.btn_generate_selected = QPushButton("Generate selected shot", self.page_generate)
+        self.btn_generate_all = QPushButton("Generate all missing shots", self.page_generate)
+        self.btn_stop_generation = QPushButton("Stop generation", self.page_generate)
+        self.btn_stop_generation.setEnabled(False)
+        self.btn_stop_generation.setToolTip("Stops the current direct MiniMax clip. When embedded in the standalone app, use the main Queue tab to cancel/requeue jobs.")
+        if callable(getattr(self, "queue_adapter", None)):
+            self.btn_stop_generation.setVisible(False)
+        self.btn_assemble = QPushButton("Assemble final music video", self.page_generate)
+        self.btn_open_output = QPushButton("Open output folder", self.page_generate)
+        row.addWidget(self.btn_generate_selected); row.addWidget(self.btn_generate_all); row.addWidget(self.btn_stop_generation); row.addWidget(self.btn_assemble); row.addWidget(self.btn_open_output); row.addStretch(1)
         self.label_job_seed = QLabel("Job seed: auto (first generation locks one random seed for the whole job). Edit a shot's Seed value below to override it for retries.", body)
         self.label_job_seed.setWordWrap(True)
         lay.addWidget(self.label_job_seed)
@@ -2385,6 +2353,13 @@ class MiniMaxMusicClipWidget(QWidget):
         preview_actions.addWidget(self.btn_play_clip); preview_actions.addWidget(self.btn_open_clip_folder); preview_actions.addStretch(1)
         preview_lay.addLayout(preview_actions)
         lay.addWidget(preview_box)
+        outer.addLayout(row)
+
+        self.btn_generate_selected.clicked.connect(self._generate_selected)
+        self.btn_generate_all.clicked.connect(self._generate_all)
+        self.btn_stop_generation.clicked.connect(self._stop_generation)
+        self.btn_assemble.clicked.connect(self._assemble)
+        self.btn_open_output.clicked.connect(self._open_output_folder)
         self.btn_play_clip.clicked.connect(self._play_selected_clip)
         self.btn_open_clip_folder.clicked.connect(self._open_selected_clip_folder)
         self.review_table.itemSelectionChanged.connect(self._show_selected_clip_preview)
@@ -2585,6 +2560,7 @@ class MiniMaxMusicClipWidget(QWidget):
                     data = json.loads(marker.read_text(encoding="utf-8"))
                     if str(data.get("identity") or "") == identity:
                         break
+                # An empty folder is safe to claim; a legacy/non-empty folder is not.
                 elif not any(candidate.iterdir()):
                     break
             except Exception:
@@ -2830,7 +2806,6 @@ class MiniMaxMusicClipWidget(QWidget):
     def _one_click_build_plan_and_queue(self) -> None:
         self.tabs.setCurrentIndex(3)
         self._pull_ui()
-        self._ensure_project_output_folder(reset_generated_state=True)
         if self.project.analysis.duration <= 0:
             self.project.analysis.duration = probe_duration(self.project.audio_path)
         try:
