@@ -1025,18 +1025,39 @@ def _creative_pool_items(value: str, *, allow_commas: bool = False) -> List[str]
         " then ", " followed by ", " before ", " after ", " while ",
         " from ", " through ", " into ", " to the ", " and then ", "->", "→",
     )
-    low = f" {re.sub(r'\\s+', ' ', raw).lower()} "
+    normalized_raw = re.sub(r"\s+", " ", raw)
+    low = f" {normalized_raw.lower()} "
     connected_sequence = any(marker in low for marker in sequence_markers)
 
     parts = re.split(r"[\r\n;|]+", raw)
     parts = [re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", p).strip() for p in parts]
     parts = [p for p in parts if p]
 
-    if allow_commas and len(parts) == 1 and not connected_sequence and "," in parts[0]:
+    if allow_commas and len(parts) == 1 and "," in parts[0]:
         comma_parts = [p.strip() for p in parts[0].split(",") if p.strip()]
-        # Commas are treated as a list only when they look like compact alternatives,
-        # not a long prose sentence containing incidental commas.
-        if len(comma_parts) >= 2 and max(len(p) for p in comma_parts) <= 140:
+
+        # Explicit named-option lists use the user-facing format
+        # "Name - description, Name - description, ...".  In that format commas are
+        # guaranteed option separators, so words such as "from" or "to the" inside a
+        # description must NOT cause the entire list to collapse into one option.
+        # This is especially important for location/camera pools such as
+        # "Zion - humans live free from machines, Rooftop - ..." and
+        # "Overhead Shot - shows action from directly above, ...".
+        named_options = [
+            item for item in comma_parts
+            if re.match(r"^.{1,80}?\s+[-–—:]\s+\S+", item)
+        ]
+        looks_like_named_pool = len(comma_parts) >= 2 and len(named_options) == len(comma_parts)
+
+        # Preserve the older compact-list fallback for simple alternatives while still
+        # protecting genuine connected prose/choreography from incidental commas.
+        looks_like_compact_pool = (
+            len(comma_parts) >= 2
+            and not connected_sequence
+            and max(len(item) for item in comma_parts) <= 140
+        )
+
+        if looks_like_named_pool or looks_like_compact_pool:
             parts = comma_parts
 
     out: List[str] = []
