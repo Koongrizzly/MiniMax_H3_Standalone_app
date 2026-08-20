@@ -1329,6 +1329,43 @@ def build_default_prompt(project: MusicProject, shot: MusicShot) -> str:
     return build_h3_reference_prompt(project, shot, _selected_refs_for_shot(project, shot))
 
 
+def _migrate_saved_creative_pool_prompt(project: MusicProject, shot: MusicShot, saved_prompt: str) -> str:
+    """Repair stale Director prompts that embedded whole location/camera option pools.
+
+    Director edits remain authoritative.  We therefore do not rebuild a saved prompt.
+    Instead, only the exact Creative-brief pool text is replaced when that complete
+    pool is still present in the saved prompt.  A manually edited/simplified location
+    or camera instruction is left untouched.
+    """
+    prompt = str(saved_prompt or "")
+    if not prompt:
+        return prompt
+
+    location_items = _creative_pool_items(project.locations_world, allow_commas=True)
+    if len(location_items) > 1:
+        selected_location, _ = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
+        raw_location = re.sub(r"\s+", " ", str(project.locations_world or "").strip())
+        # The old broken parser stripped terminal spaces/periods before the builder
+        # re-added sentence punctuation, so accept both the raw form and that form.
+        location_candidates = [raw_location, raw_location.strip(" .")]
+        for candidate in sorted({x for x in location_candidates if x}, key=len, reverse=True):
+            if candidate in prompt:
+                prompt = prompt.replace(candidate, selected_location, 1)
+                break
+
+    camera_items = _creative_pool_items(project.camera_choreography, allow_commas=True)
+    if len(camera_items) > 1:
+        selected_camera, _ = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
+        raw_camera = re.sub(r"\s+", " ", str(project.camera_choreography or "").strip())
+        camera_candidates = [raw_camera, raw_camera.strip(" .")]
+        for candidate in sorted({x for x in camera_candidates if x}, key=len, reverse=True):
+            if candidate in prompt:
+                prompt = prompt.replace(candidate, selected_camera, 1)
+                break
+
+    return prompt
+
+
 def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_refs: List[ReferenceAsset]) -> str:
     """Return the exact Director prompt for generation when one exists.
 
@@ -1339,7 +1376,12 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
     """
     saved_prompt = (shot.prompt or "").strip()
     if saved_prompt:
-        return saved_prompt
+        migrated_prompt = _migrate_saved_creative_pool_prompt(project, shot, saved_prompt)
+        if migrated_prompt != saved_prompt:
+            # Persist the repaired prompt so the Director view, retries, queue sidecar
+            # and subsequent saves all agree on the exact prompt used for generation.
+            shot.prompt = migrated_prompt
+        return migrated_prompt
     prompt = build_h3_reference_prompt(project, shot, selected_refs)
     shot.prompt = prompt
     return prompt
