@@ -75,6 +75,7 @@ class VRAMManager:
         self._pinned_guard_active = False
         self._text_conditioning_target_bytes = 0
         self._extreme_diffusion_pressure = False
+        self._extreme_floor_logged = False
 
     @staticmethod
     def _gb(n: int) -> str:
@@ -125,6 +126,7 @@ class VRAMManager:
         self.stage = self._normalize_stage(stage)
         if self.stage != "diffusion":
             self._extreme_diffusion_pressure = False
+            self._extreme_floor_logged = False
             self._sampling_target_free_bytes = 0
         managed = self.is_stage_managed(self.stage)
         if managed:
@@ -598,11 +600,13 @@ class VRAMManager:
             # module granularity; rounding UP here is what allowed V11.4 to hit 0 GiB.
             removable = self._round_chunk_down(max(0, loaded - resident_floor))
             if removable <= 0:
-                self._log(
-                    f"V11.5 extreme diffusion floor: keeping {self._gb(loaded)} resident at {reason}; "
-                    f"protected floor={self._gb(resident_floor)} even though target free is not yet met",
-                    force=True,
-                )
+                if not self._extreme_floor_logged:
+                    self._log(
+                        f"V11.5 extreme diffusion floor active | resident={self._gb(loaded)} | "
+                        f"protected floor={self._gb(resident_floor)}; further per-block floor messages suppressed",
+                        force=True,
+                    )
+                    self._extreme_floor_logged = True
                 return 0
             need = min(need, removable)
 
