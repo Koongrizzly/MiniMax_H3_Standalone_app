@@ -7,8 +7,8 @@ import torch
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
 
-VRAM_MANAGER_SIGNATURE = "V11_4_REF_VAE_ADMISSION_20260817A"
-VRAM_MANAGER_VERSION = "V11.4"
+VRAM_MANAGER_SIGNATURE = "V11_5_EXTREME_DIFFUSION_SAFE_20260826A"
+VRAM_MANAGER_VERSION = "V11.5"
 
 
 @dataclass
@@ -74,6 +74,7 @@ class VRAMManager:
         self._allocator_guard_active = False
         self._pinned_guard_active = False
         self._text_conditioning_target_bytes = 0
+        self._extreme_diffusion_pressure = False
 
     @staticmethod
     def _gb(n: int) -> str:
@@ -122,6 +123,9 @@ class VRAMManager:
 
     def set_stage(self, stage: str):
         self.stage = self._normalize_stage(stage)
+        if self.stage != "diffusion":
+            self._extreme_diffusion_pressure = False
+            self._sampling_target_free_bytes = 0
         managed = self.is_stage_managed(self.stage)
         if managed:
             self._set_comfy_reserve(self.load_headroom_bytes())
@@ -239,7 +243,7 @@ class VRAMManager:
         # installed the hard CUDA ceiling for diffusion, which allowed managed text
         # runs to oversubscribe a 24 GiB card before the guard appeared in the log.
         # Install the ceiling *before loading* every managed compute-heavy stage.
-        # V11.4 also protects the reference VAE stage. Multi-image Ref2VA jobs,
+        # V11.5 also protects the reference VAE stage. Multi-image Ref2VA jobs,
         # especially at high reference resolution, demonstrated 24+ GiB transient
         # allocations before Qwen was ever reached. Leaving reference encoding
         # outside the allocator ceiling allowed WDDM to spill hard into shared RAM.
@@ -274,7 +278,7 @@ class VRAMManager:
         comfy.sd.load_clip() only creates the CLIP/Qwen object; the GPU residency
         load happens lazily from CLIP.load_model(tokens) inside encode.  V11.1 ran
         its preflight before that lazy load, so it always saw an almost-empty card.
-        V11.4 arms Comfy's EXTRA_RESERVED_VRAM with the activation target first so
+        V11.5 arms Comfy's EXTRA_RESERVED_VRAM with the activation target first so
         the lazy loader chooses partial Qwen residency from the outset.
         """
         if not self.is_stage_managed("text") or self.stage != "text":
@@ -286,7 +290,7 @@ class VRAMManager:
         self._set_comfy_reserve(target)
         free_before, total = self._cuda_free()
         self._log(
-            f"V11.4 Qwen admission armed | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"V11.5 Qwen admission armed | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
             f"reserved activation runway={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
             force=True,
         )
@@ -302,7 +306,7 @@ class VRAMManager:
         self._set_comfy_reserve(target)
         free_before, total = self._cuda_free()
         self._log(
-            f"V11.4 Qwen preflight after load | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"V11.5 Qwen preflight after load | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
             f"target free={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
             force=True,
         )
@@ -310,7 +314,7 @@ class VRAMManager:
         self.trim_cuda_cache(reason=reason, force=True)
         free_after, _ = self._cuda_free()
         self._log(
-            f"V11.4 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
+            f"V11.5 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
             f"CUDA free={self._gb(free_after) if free_after is not None else 'n/a'} | target={self._gb(target)}",
             force=True,
         )
@@ -320,7 +324,7 @@ class VRAMManager:
         """Release the temporary Qwen activation reserve after conditioning."""
         if self._text_conditioning_target_bytes:
             self._log(
-                f"V11.4 Qwen admission released | activation runway was={self._gb(self._text_conditioning_target_bytes)}",
+                f"V11.5 Qwen admission released | activation runway was={self._gb(self._text_conditioning_target_bytes)}",
                 force=True,
             )
         self._text_conditioning_target_bytes = 0
@@ -340,7 +344,7 @@ class VRAMManager:
                 return manager._orig_load_models_gpu(models, *args, **kwargs)
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
-            # V11.4: while Qwen conditioning admission is armed, keep the large
+            # V11.5: while Qwen conditioning admission is armed, keep the large
             # activation runway visible to *every* Comfy load call.  encode() calls
             # CLIP.load_model(tokens) again, so dropping back to the 0.5 GiB runtime
             # reserve here would simply pull the offloaded Qwen weights back in.
@@ -373,6 +377,7 @@ class VRAMManager:
                     # weights, which matches the observed ~17 GiB transient DiT
                     # workspace much better than V4's full 11.68 GiB residency.
                     if total is not None and (req > float(total) or min_req > float(total) * 0.60):
+                        manager._extreme_diffusion_pressure = bool(req > float(total) or min_req > float(total))
                         explicit_reserve = manager.load_headroom_bytes()
                         desired_total_free = max(
                             explicit_reserve,
@@ -391,6 +396,12 @@ class VRAMManager:
                         if 'minimum_memory_required' in kwargs or orig_minimum is not None:
                             kwargs['minimum_memory_required'] = forwarded
                         clamped = True
+                        if manager._extreme_diffusion_pressure:
+                            manager._log(
+                                "V11.5 extreme diffusion safety armed | impossible native sampling hint exceeds physical VRAM | "
+                                "synchronous offload barriers enabled and a 2.50 GiB diffusion working-set floor will be protected",
+                                force=True,
+                            )
                 except Exception as exc:
                     manager._log(f"sampling request guard skipped: {exc}", force=True)
 
@@ -530,6 +541,28 @@ class VRAMManager:
                 force=force,
             )
 
+    def _diffusion_resident_floor_bytes(self, patcher) -> int:
+        """Protect a small W4A8 working set during impossible/high-pressure sampling.
+
+        Comfy ModelPatcher unload granularity can be larger than the requested byte
+        count. V11.4 could therefore ask for the last ~1-2 GiB of headroom and have
+        the remaining 2.8 GiB residency evicted in one operation. With quantized
+        MiniMax weights that immediately forced a reload inside the first DiT block
+        and could surface as cudaErrorIllegalAddress rather than a clean OOM.
+        """
+        if self.stage != "diffusion" or not self._extreme_diffusion_pressure:
+            return 0
+        try:
+            size = int(patcher.model_size())
+        except Exception:
+            size = 0
+        # 2.5 GiB matches the observed safe boundary on the 11.68 GiB H3 W4A8 DiT.
+        # Keep the floor bounded for differently sized patchers.
+        floor = int(2.50 * _GIB)
+        if size > 0:
+            floor = min(floor, max(int(0.22 * size), int(0.50 * _GIB)))
+        return max(0, floor)
+
     def enforce_patcher(self, patcher, target_free: int | None = None, reason: str = "runtime") -> int:
         if patcher is None or not torch.cuda.is_available():
             return 0
@@ -557,9 +590,32 @@ class VRAMManager:
         need = self._round_chunk_up(need)
         if need <= 0:
             return 0
+
+        resident_floor = self._diffusion_resident_floor_bytes(patcher)
+        if resident_floor > 0:
+            # Never request an unload that crosses the protected working-set floor.
+            # Round the removable budget DOWN because ModelPatcher may unload at
+            # module granularity; rounding UP here is what allowed V11.4 to hit 0 GiB.
+            removable = self._round_chunk_down(max(0, loaded - resident_floor))
+            if removable <= 0:
+                self._log(
+                    f"V11.5 extreme diffusion floor: keeping {self._gb(loaded)} resident at {reason}; "
+                    f"protected floor={self._gb(resident_floor)} even though target free is not yet met",
+                    force=True,
+                )
+                return 0
+            need = min(need, removable)
+
         need = min(need, loaded)
         try:
+            if self.stage == "diffusion" and self._extreme_diffusion_pressure:
+                # Serialize outstanding CUDA work before ModelPatcher mutates W4A8
+                # residency. This is intentionally slower than async streaming but
+                # avoids racing quantized weight copies with in-flight kernels.
+                torch.cuda.synchronize()
             freed = int(patcher.partially_unload(patcher.offload_device, need) or 0)
+            if self.stage == "diffusion" and self._extreme_diffusion_pressure:
+                torch.cuda.synchronize()
         except Exception as exc:
             self._log(f"offload skipped ({reason}): {exc}", force=True)
             return 0

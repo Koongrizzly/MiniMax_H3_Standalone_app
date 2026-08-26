@@ -88,7 +88,7 @@ def _encode_visual_reference(vae, pixels, manager=None, *, label="reference imag
     if managed:
         free_before, total = manager._cuda_free()
         print(
-            f"[VRAM-MGR] V11.4 reference admission | {label} | "
+            f"[VRAM-MGR] V11.5 reference admission | {label} | "
             f"CUDA free={manager._gb(free_before) if free_before is not None else 'n/a'} | "
             f"card={manager._gb(total) if total is not None else 'n/a'} | proactive tiled inference encode",
             flush=True,
@@ -109,7 +109,7 @@ def _encode_visual_reference(vae, pixels, manager=None, *, label="reference imag
             pass
         free_after, _ = manager._cuda_free()
         print(
-            f"[VRAM-MGR] V11.4 reference encode complete | {label} | "
+            f"[VRAM-MGR] V11.5 reference encode complete | {label} | "
             f"CUDA free={manager._gb(free_after) if free_after is not None else 'n/a'}",
             flush=True,
         )
@@ -157,11 +157,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_4_REF_VAE_ADMISSION_20260817A"
+        expected = "V11_5_EXTREME_DIFFUSION_SAFE_20260826A"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.4 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.5 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     if len(ns.lora)!=len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora)>3: raise ValueError('Maximum 3 LoRAs are supported')
     manager=None
@@ -233,7 +233,7 @@ def main():
     if manager is not None and manager.is_stage_managed('text'):
         manager.begin_text_conditioning_admission()
         # comfy.sd.load_clip() is lazy: this is the first real Qwen CUDA residency
-        # load.  Do it under the V11.4 activation reserve, then verify actual free
+        # load.  Do it under the V11.5 activation reserve, then verify actual free
         # VRAM before the first transformer forward.
         clip.load_model(tokens)
         manager.prepare_text_conditioning(reason='Ref2VA pre-Qwen conditioning')
