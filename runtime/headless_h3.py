@@ -82,6 +82,24 @@ _MINIMAX_H3_AUDIO_LATENTS_STD = (
     1.718045989838149, 1.6307219190837705, 1.8661226051202384, 1.5613768203168363,
 )
 
+
+def _prepare_minimax_h3_video_sd(sd):
+    # The released MiniMax-H3 video VAE checkpoint stores the learned network
+    # weights but omits the latent normalization constants. The Comfy model
+    # class registers these as built-in buffers, so inject them here before
+    # load_state_dict to avoid harmless-but-alarming missing-key warnings.
+    if not ("decoder.transformer_blocks.0.scale1" in sd and "encoder.down.5.block.0.conv1.weight" in sd):
+        return sd, None
+    added = []
+    from comfy.ldm.minimax import vae as minimax_video_vae
+    if 'latents_mean' not in sd:
+        sd['latents_mean'] = torch.tensor(minimax_video_vae.LATENTS_MEAN, dtype=torch.float32)
+        added.append('latents_mean')
+    if 'latents_std' not in sd:
+        sd['latents_std'] = torch.tensor(minimax_video_vae.LATENTS_STD, dtype=torch.float32)
+        added.append('latents_std')
+    return sd, {'injected_constants': added}
+
 def _fold_legacy_weight_norm(v, g):
     # torch.nn.utils.weight_norm defaults to dim=0.  The released MiniMax-H3
     # audio checkpoint uses the legacy weight_g/weight_v representation.
@@ -124,6 +142,7 @@ def _prepare_minimax_h3_audio_sd(sd):
 
 def load_vae(path):
     sd, metadata = _load_sd(path)
+    sd, video_fix = _prepare_minimax_h3_video_sd(sd)
     sd, audio_fix = _prepare_minimax_h3_audio_sd(sd)
     if audio_fix is not None:
         print('MiniMax-H3 audio checkpoint adapter: '
@@ -131,6 +150,8 @@ def load_vae(path):
               f"missing pairs={len(audio_fix['missing_weight_norm_pairs'])}", flush=True)
         if audio_fix['missing_weight_norm_pairs']:
             raise RuntimeError('Audio VAE checkpoint has incomplete weight_g/weight_v pairs: ' + ', '.join(audio_fix['missing_weight_norm_pairs'][:8]))
+    if video_fix is not None and video_fix.get('injected_constants'):
+        print('MiniMax-H3 video checkpoint adapter: injected latent normalization constants (' + ', '.join(video_fix['injected_constants']) + ')', flush=True)
     vae = comfy.sd.VAE(sd=sd, metadata=metadata)
     vae.throw_exception_if_invalid()
     if audio_fix is not None:
@@ -463,7 +484,7 @@ def split_av_latents(samples):
         raise RuntimeError("MiniMax H3 sampler did not return nested video+audio latents")
     return latent.unbind()
 
-def decode_video(video_latent, video_vae, force_tiled=False, tile_size=256, tile_overlap=64):
+def decode_video(video_latent, video_vae, force_tiled=False, tile_size=256, tile_overlap=128):
     # MiniMax H3 owns its spatial tiling internally. For the large native FP16 VAE,
     # skip Comfy's initial full-frame decode attempt and go straight to the tiled path.
     if hasattr(video_vae, "first_stage_model"):
