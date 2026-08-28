@@ -487,37 +487,35 @@ class MiniMaxH3VideoVAE(nn.Module):
         y_idx, y_len, y_overlap = self.split_tiles(height)
         x_idx, x_len, x_overlap = self.split_tiles(width)
 
-        # Blended tiles are written straight into a pre-allocated canvas.
-        canvas = None
-        row_tails = []
-        out_y = 0
-        for i, (i_pos, i_len) in enumerate(zip(y_idx, y_len)):
+        # Decode all spatial tiles first, then perform the same row/column blend-and-
+        # crop assembly pattern used by the reference MiniMax implementation. The
+        # earlier memory-optimized canvas/tail rewrite kept partial edge strips before
+        # neighboring blends were fully resolved, which risks seam-dependent quality
+        # loss. This simpler assembly path favors correctness over peak memory savings.
+        rows = []
+        for i_pos, i_len in zip(y_idx, y_len):
             zi, zl = i_pos // self.vae_ratio, i_len // self.vae_ratio
-            new_tails = []
-            left_tail = None
-            out_x = 0
-            for j, (j_pos, j_len) in enumerate(zip(x_idx, x_len)):
+            row = []
+            for j_pos, j_len in zip(x_idx, x_len):
                 zj, zw = j_pos // self.vae_ratio, j_len // self.vae_ratio
-                tile = self._decode_pixels(z[..., zi:zi + zl, zj:zj + zw])
-                if i < len(y_idx) - 1:
-                    new_tails.append(tile[..., -y_overlap[i]:, :].clone())
-                next_left_tail = tile[..., :, -x_overlap[j]:].clone() if j < len(x_idx) - 1 else None
+                row.append(self._decode_pixels(z[..., zi:zi + zl, zj:zj + zw]))
+            rows.append(row)
+
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
                 if i > 0:
-                    tile = self.blend(row_tails[j], tile, y_overlap[i - 1], dim=-2)
+                    tile = self.blend(rows[i - 1][j], tile, y_overlap[i - 1], dim=-2)
                 if j > 0:
-                    tile = self.blend(left_tail, tile, x_overlap[j - 1], dim=-1)
-                left_tail = next_left_tail
-                if i < len(y_idx) - 1:
+                    tile = self.blend(row[j - 1], tile, x_overlap[j - 1], dim=-1)
+                if i < len(rows) - 1:
                     tile = tile[..., :-y_overlap[i], :]
-                if j < len(x_idx) - 1:
+                if j < len(row) - 1:
                     tile = tile[..., :, :-x_overlap[j]]
-                if canvas is None:
-                    canvas = torch.empty(*tile.shape[:-2], height, width, dtype=tile.dtype, device=tile.device)
-                canvas[..., out_y:out_y + tile.shape[-2], out_x:out_x + tile.shape[-1]].copy_(tile)
-                out_x += tile.shape[-1]
-            row_tails = new_tails
-            out_y += tile.shape[-2]
-        return canvas
+                result_row.append(tile)
+            result_rows.append(torch.cat(result_row, dim=-1))
+        return torch.cat(result_rows, dim=-2)
 
     # temporal chunking
 
