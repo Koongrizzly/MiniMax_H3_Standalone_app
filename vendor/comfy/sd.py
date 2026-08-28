@@ -1566,11 +1566,21 @@ def detect_te_model(sd):
         if weight.shape[0] == 5120:
             return TEModel.QWEN35_27B
         return TEModel.QWEN35_2B
+    # MiniMax H3 conditioning encoder: Qwen3-VL-32B truncated to 50 layers.
+    # Native/upstream BF16 checkpoints keep the Qwen prefixes
+    #   model.visual.* / model.language_model.*
+    # while converted Comfy checkpoints use
+    #   visual.* / model.*
+    # Detect H3 *before* the generic Qwen3-VL 4B/8B DeepStack branch; otherwise
+    # the native 32B checkpoint is incorrectly classified as 8B and Comfy builds
+    # a 4096-wide model for 5120-wide weights.
+    if (("model.visual.deepstack_merger_list.0.norm.weight" in sd and
+         "model.language_model.layers.49.self_attn.q_proj.weight" in sd) or
+        ("visual.deepstack_merger_list.0.norm.weight" in sd and
+         "model.layers.49.self_attn.q_proj.weight" in sd)):
+        return TEModel.QWEN3VL_32B
     if "model.visual.deepstack_merger_list.0.norm.weight" in sd:  # DeepStack is unique to Qwen3-VL
         return TEModel.QWEN3VL_4B if sd["model.visual.merger.linear_fc2.weight"].shape[0] == 2560 else TEModel.QWEN3VL_8B
-    if "visual.deepstack_merger_list.0.norm.weight" in sd and "model.layers.49.self_attn.q_proj.weight" in sd:
-        # MiniMax H3 conditioning encoder: Qwen3-VL-32B, truncated to 50 layers
-        return TEModel.QWEN3VL_32B
     if "model.layers.0.post_attention_layernorm.weight" in sd:
         weight = sd['model.layers.0.post_attention_layernorm.weight']
         if 'model.layers.0.self_attn.q_norm.weight' in sd:
@@ -1801,6 +1811,14 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
                 clip_target.clip = comfy.text_encoders.qwen3vl.te(**llama_detect(clip_data), model_type=qwen3vl_type)
                 clip_target.tokenizer = comfy.text_encoders.qwen3vl.tokenizer(model_type=qwen3vl_type)
         elif te_model == TEModel.QWEN3VL_32B:
+            # Native MiniMax/Qwen BF16 checkpoints retain upstream Qwen3-VL
+            # namespaces. Convert them to the internal Comfy MiniMax H3 layout.
+            # Converted W4A8 checkpoints already use the internal layout and are
+            # therefore left unchanged by this prefix replacement.
+            clip_data[0] = comfy.utils.state_dict_prefix_replace(
+                clip_data[0],
+                {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."}
+            )
             clip_target.clip = comfy.text_encoders.minimax.te(**llama_detect(clip_data))
             clip_target.tokenizer = comfy.text_encoders.minimax.MiniMaxH3Tokenizer
         elif te_model == TEModel.QWEN3_06B:
