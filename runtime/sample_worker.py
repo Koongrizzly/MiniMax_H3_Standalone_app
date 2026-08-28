@@ -141,7 +141,7 @@ def main():
         _log_checkpoint('text encoder checkpoint', ns.text_encoder); log_mem('before text encoder load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
     if ns.extended_logging or (manager is not None and manager.is_stage_managed('text')):
         qwen_patch=_install_qwen_layer_trace(manager)
-    print('Loading MiniMax H3 text encoder...', flush=True)
+    print('Loading W4A8 text encoder...', flush=True)
     clip=comfy.sd.load_clip([ns.text_encoder], clip_type=comfy.sd.CLIPType.MINIMAX)
     if ns.extended_logging: log_mem('after text encoder object load')
     # build_conditioning() tokenizes internally, so make a matching token set here
