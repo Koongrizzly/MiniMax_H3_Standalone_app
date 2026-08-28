@@ -62,16 +62,6 @@ What is MiniMax H3?
 
 MiniMax H3 is an omni-modal generative video system from MiniMax. H3 can understand combinations of text, images, video and audio and generate video together with native stereo audio.
 
-The official H3 release contains two main H3-Base task families:
-
-FL2VA — text-to-video and first/last-frame image conditioning.
-
-Ref2VA — multimodal reference generation using images, video and audio.
-
-The official model runs at 24 FPS and generates synchronized 32 kHz stereo audio.
-
-This standalone application focuses on running the H3-Base models locally with community INT4/W4A8 ConvRot checkpoints to greatly reduce the memory requirement compared with the original BF16 weights.
-
 Official MiniMax H3: Hugging Face: https://huggingface.co/MiniMaxAI/MiniMax-H3 / MiniMax: https://www.minimax.io / MiniMax GitHub: https://github.com/MiniMax-AI
 
 ---
