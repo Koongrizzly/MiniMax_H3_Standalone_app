@@ -1,6 +1,7 @@
 # MiniMax H3 video VAE: 3D causal CNN encoder + ViT3D decoder.
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -350,6 +351,12 @@ class MiniMaxH3VideoVAE(nn.Module):
         self.tokens_chunk_size = math.ceil(clip_length / self.vae_ratio_t)
         self.token_overlap = (-token_drop) % self.tokens_chunk_size
         self.frame_overlap = max(self.token_overlap * self.vae_ratio_t - self.frame_pre_padding, 0)
+        # Temporal chunk joins: blending the overlapping 5-frame boundary can cause
+        # visible ghosting / trailing during camera pans when the two decoded chunks
+        # disagree slightly. Default to trusting the current chunk and discarding the
+        # previous overlap at joins. Set H3_MINIMAX_TEMPORAL_JOIN=blend to restore the
+        # original cross-fade, or =previous to keep the previous overlap instead.
+        self.temporal_join_mode = os.environ.get('H3_MINIMAX_TEMPORAL_JOIN', 'current').strip().lower()
 
         # spatial tiling parameters
         self.tiling = tiling
@@ -519,6 +526,21 @@ class MiniMaxH3VideoVAE(nn.Module):
 
     # temporal chunking
 
+    def _join_temporal_chunks(self, prev_overlap, current_chunk):
+        if prev_overlap is None:
+            return current_chunk
+        mode = getattr(self, 'temporal_join_mode', 'current')
+        if mode == 'blend':
+            if self.frame_overlap > 0:
+                return self.blend(prev_overlap, current_chunk, self.frame_overlap, dim=-3)
+            return current_chunk
+        overlap = min(prev_overlap.shape[2], current_chunk.shape[2], max(int(self.frame_overlap), 0))
+        if mode == 'previous' and overlap > 0:
+            return torch.cat([prev_overlap[:, :, -overlap:, :, :], current_chunk[:, :, overlap:, :, :]], dim=2)
+        # default: current chunk wins at the temporal join, eliminating cross-fade
+        # ghost trails while preserving the overall frame count.
+        return current_chunk
+
     def encode_temporal(self, x):
         if x.shape[2] % self.clip_length != 0:
             pad_size = (-x.shape[2]) % self.clip_length
@@ -634,9 +656,7 @@ class MiniMaxH3VideoVAE(nn.Module):
 
                 if j == 0:
                     if dec_overlap is not None:
-                        clip_dec_chunk = self.blend(
-                            dec_overlap, clip_dec_chunk, self.frame_overlap, dim=-3
-                        )
+                        clip_dec_chunk = self._join_temporal_chunks(dec_overlap, clip_dec_chunk)
                         dec_overlap = None
                     write_part(clip_dec_chunk)
                 else:
