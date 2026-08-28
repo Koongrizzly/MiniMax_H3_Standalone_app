@@ -153,6 +153,8 @@ def main():
 
     print('Decoding video frames...', flush=True)
     print(f'H3 VAE decoder path: reference-style tiled assembly | tile={ns.tile_size}px overlap={ns.tile_overlap}px', flush=True)
+    if hasattr(vv, 'first_stage_model') and hasattr(vv.first_stage_model, 'temporal_join_mode'):
+        print(f'H3 VAE temporal join mode: {vv.first_stage_model.temporal_join_mode}', flush=True)
     if ns.extended_logging: print(f'VAE decode details: torch.inference_mode(), {ns.tile_size}px MiniMax tiles / {ns.tile_overlap}px overlap', flush=True)
     try:
         with torch.inference_mode():
