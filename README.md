@@ -46,7 +46,7 @@ It supports :
 
 - Automatic VRAM management with override features
 
-- Optional Spectrum Feature Forecasting
+- Optional Spectrum Feature Forecasting (use at least 6 steps to avoid bad results)
 
 - Optional SageAttention acceleration
 
@@ -91,7 +91,6 @@ Installation
 Using Git:
 
 git clone https://github.com/Koongrizzly/MiniMax_H3_Standalone_app.git
-cd MiniMax_H3_Standalone_app
 
 Or download the repository as a ZIP from GitHub and extract it.
 
@@ -132,9 +131,9 @@ PySide6
 The installer later starts the model downloader and asks whether you want:
 FL2VA only
 Ref2VA only
-Both
+Hybrid (2 models combined into one with Ref2va as the majority of tensors)
+
 It also offers available MiniMax H3 LoRAs.
-Large files use a multi-connection HTTP downloader to improve Hugging Face transfer speed without requiring Xet or leaving a large Xet cache behind.
 
 4. Start the application
 After installation, double-click:
@@ -147,7 +146,7 @@ Troubleshooting
 
 conda.exe was not found
 
-Install Miniconda or Anaconda and run install.bat again.
+Install Miniconda (or Anaconda) and run install.bat again.
 
 CUDA / Torch import error
 
