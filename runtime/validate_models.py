@@ -43,6 +43,56 @@ def inspect_quant(path: Path):
     }
     return md, qmd, format_ok, field_hits, len(keys)
 
+
+def inspect_text_encoder(path: Path):
+    keys, md = _keys(path)
+    # Supported MiniMax H3 text encoders:
+    # 1) FrameVision/Comfy W4A8 ConvRot quantized checkpoint.
+    # 2) Native BF16 Qwen3-VL-32B H3 layer-50 checkpoint used by Wan2GP / Comfy.
+    raw = md.get("_quantization_metadata") or md.get("quantization_metadata")
+    qmd = None
+    if raw:
+        try: qmd = json.loads(raw)
+        except Exception: qmd = raw
+    qtext = json.dumps(qmd, ensure_ascii=False) if qmd is not None else ""
+    quant_ok = (
+        "asym_w4a8_int8" in qtext
+        or md.get("format") == "asym_w4a8_int8"
+        or (
+            any(k.endswith("weight_s_rel") for k in keys)
+            and any(k.endswith("weight_codebook") for k in keys)
+        )
+    )
+    # Comfy's MiniMax H3 detector identifies the native layer-50 encoder by these
+    # two structural keys. This matches the original Qwen3-VL-32B H3 checkpoint.
+    # Wan2GP's native H3 BF16 file retains the upstream Qwen3-VL key namespace:
+    #   model.visual.*
+    #   model.language_model.layers.0..49.*
+    # Accept both that native namespace and already-remapped Comfy-style variants.
+    visual_key_ok = (
+        "model.visual.deepstack_merger_list.0.norm.weight" in keys
+        or "visual.deepstack_merger_list.0.norm.weight" in keys
+    )
+    layer50_key_ok = (
+        "model.language_model.layers.49.self_attn.q_proj.weight" in keys
+        or "language_model.layers.49.self_attn.q_proj.weight" in keys
+        or "model.layers.49.self_attn.q_proj.weight" in keys
+    )
+    embed_key_ok = (
+        "model.language_model.embed_tokens.weight" in keys
+        or "language_model.embed_tokens.weight" in keys
+        or "model.embed_tokens.weight" in keys
+    )
+    native_bf16_ok = visual_key_ok and layer50_key_ok and embed_key_ok
+    hits = {
+        "w4a8_convrot": bool(quant_ok),
+        "native_bf16_layer50": bool(native_bf16_ok),
+        "weight_s_rel": any(k.endswith("weight_s_rel") for k in keys),
+        "weight_codebook": any(k.endswith("weight_codebook") for k in keys),
+    }
+    kind = "native_bf16" if native_bf16_ok and not quant_ok else ("w4a8_convrot" if quant_ok else "unknown")
+    return bool(quant_ok or native_bf16_ok), kind, hits, len(keys), qmd
+
 def inspect_video_vae(path: Path):
     keys, _ = _keys(path)
     required = {"decoder.transformer_blocks.0.scale1", "encoder.down.5.block.0.conv1.weight"}
@@ -75,9 +125,12 @@ def _name_score(path: Path, kind: str, expected: str):
     return score
 
 def _inspect_for_kind(path: Path, kind: str):
-    if kind in ("fl2va", "ref2va", "text_encoder"):
+    if kind in ("fl2va", "ref2va"):
         md, qmd, ok, hits, n = inspect_quant(path)
         return ok and hits["weight_s_rel"] and hits["weight_codebook"], n
+    if kind == "text_encoder":
+        ok, te_kind, hits, n, qmd = inspect_text_encoder(path)
+        return ok, n
     if kind == "video_vae":
         ok, missing, n = inspect_video_vae(path)
         return ok, n
@@ -167,7 +220,7 @@ def validate(require_vae=True, mode="both", fl2va_path=None, ref2va_path=None, t
         av, err = _resolve_override_or_scan(audio_vae_path, AUDIO_VAE_DIR, EXPECTED_AUDIO_VAE, "audio VAE", "audio_vae")
         if err: errors.append(err)
 
-    for label, p in (("fl2va", diff), ("ref2va", ref), ("text_encoder", te)):
+    for label, p in (("fl2va", diff), ("ref2va", ref)):
         if not p: continue
         try:
             md, qmd, ok, hits, n = inspect_quant(p); info.append((label, p, ok, hits, n, qmd))
@@ -175,6 +228,18 @@ def validate(require_vae=True, mode="both", fl2va_path=None, ref2va_path=None, t
             if not hits["weight_s_rel"]: errors.append(f"{label}: no weight_s_rel tensors found")
             if not hits["weight_codebook"]: errors.append(f"{label}: no weight_codebook tensors found")
         except Exception as e: errors.append(f"{label}: failed reading {p}: {e}")
+
+    if te:
+        try:
+            ok, te_kind, hits, n, qmd = inspect_text_encoder(te)
+            info.append(("text_encoder", te, ok, {**hits, "format": te_kind}, n, qmd))
+            if not ok:
+                errors.append(
+                    f"text_encoder: {te.name} is neither a supported W4A8/ConvRot encoder "
+                    "nor a native MiniMax H3 Qwen3-VL-32B layer-50 BF16 checkpoint"
+                )
+        except Exception as e:
+            errors.append(f"text_encoder: failed reading {te}: {e}")
 
     if vv:
         try:
