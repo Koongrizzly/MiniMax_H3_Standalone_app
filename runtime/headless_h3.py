@@ -463,7 +463,7 @@ def split_av_latents(samples):
         raise RuntimeError("MiniMax H3 sampler did not return nested video+audio latents")
     return latent.unbind()
 
-def decode_video(video_latent, video_vae, force_tiled=False, tile_size=256, tile_overlap=128):
+def decode_video(video_latent, video_vae, force_tiled=False, tile_size=256, tile_overlap=64):
     # MiniMax H3 owns its spatial tiling internally. For the large native FP16 VAE,
     # skip Comfy's initial full-frame decode attempt and go straight to the tiled path.
     if hasattr(video_vae, "first_stage_model"):

@@ -98,7 +98,7 @@ def _save_overlay_on_frame(plan, frames_dir: Path):
     print(f'Tile debug overlay saved: {out}', flush=True)
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--latents',required=True); ap.add_argument('--vae',required=True); ap.add_argument('--frames-dir',required=True); ap.add_argument('--extended-logging', action='store_true'); ap.add_argument('--tile-debugging', action='store_true'); ap.add_argument('--tile-size', type=int, default=256); ap.add_argument('--tile-overlap', type=int, default=128)
+    ap=argparse.ArgumentParser(); ap.add_argument('--latents',required=True); ap.add_argument('--vae',required=True); ap.add_argument('--frames-dir',required=True); ap.add_argument('--extended-logging', action='store_true'); ap.add_argument('--tile-debugging', action='store_true'); ap.add_argument('--tile-size', type=int, default=256); ap.add_argument('--tile-overlap', type=int, default=64)
     ns=ap.parse_args()
     if ns.tile_size < 128:
         ap.error('--tile-size must be at least 128 px')
@@ -152,6 +152,7 @@ def main():
         mmvae.TransformerBlock.forward=traced_forward
 
     print('Decoding video frames...', flush=True)
+    print(f'H3 VAE decoder path: reference-style tiled assembly | tile={ns.tile_size}px overlap={ns.tile_overlap}px', flush=True)
     if ns.extended_logging: print(f'VAE decode details: torch.inference_mode(), {ns.tile_size}px MiniMax tiles / {ns.tile_overlap}px overlap', flush=True)
     try:
         with torch.inference_mode():
