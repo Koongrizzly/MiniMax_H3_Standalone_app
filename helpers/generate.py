@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--vram-manager-auto", action="store_true", help="Automatically bypass VRAM Lab when native sampling is estimated to fit the detected GPU")
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
     ap.add_argument("--sage-attention", action="store_true", help="Use SageAttention for the sampling worker")
+    ap.add_argument("--sol-attention", action="store_true", help="Use vendored Sol-Attn for eligible MiniMax H3 attention; falls back to existing attention otherwise")
     ap.add_argument("--disable-comfy-kitchen", action="store_true", help="Disable Comfy Kitchen quantized W4A8 / ConvRot acceleration for worker processes")
     ap.add_argument("--vram-residency-engine", choices=["static", "dynamic"], default="static")
     ap.add_argument("--vram-runtime-free-gb", type=float, default=0.5)
@@ -65,6 +66,14 @@ def main():
     ap.add_argument("--vram-residency-refill-interval", type=int, default=1)
     ap.add_argument("--vram-keep-text-encoder", action="store_true")
     ns = ap.parse_args()
+    # Sol-Attn is read by the vendored H3 model inside the isolated sampling
+    # worker. Keep it process-local so VAE/text helper workers are unaffected.
+    if ns.sol_attention:
+        os.environ["H3_SOL_ATTENTION"] = "1"
+        print("Sol-Attn: enabled for eligible MiniMax H3 attention (existing backend remains fallback)", flush=True)
+    else:
+        os.environ.pop("H3_SOL_ATTENTION", None)
+        print("Sol-Attn: disabled", flush=True)
     # Worker processes import the vendored Comfy stack afresh, so this environment
     # switch cleanly controls whether comfy.quant_ops may activate Comfy Kitchen.
     if ns.disable_comfy_kitchen:
@@ -214,9 +223,16 @@ def main():
                 seg_a = f"[{2 + extra_inputs}:a]"; extra_inputs += 1
             else:
                 seg_a = "[1:a]"
+            # Smooth the exact audio boundary without changing timeline length.
+            # The continuation has already had one video-frame worth of audio removed
+            # to stay aligned with the dropped duplicate video frame.  A hard PCM join
+            # can still click if the two waveforms meet at different amplitudes, so fade
+            # the last/first 10 ms to silence before concatenating.
+            seam_fade = min(0.010, src_d / 4.0, seg_d / 4.0)
+            src_fade_start = max(0.0, src_d - seam_fade)
             af = ";".join([
-                f"{src_a}aresample=32000,apad,atrim=duration={src_d:.9f},asetpts=PTS-STARTPTS[a0]",
-                f"{seg_a}aresample=32000,apad,atrim=duration={seg_d:.9f},asetpts=PTS-STARTPTS[a1]",
+                f"{src_a}aresample=32000,apad,atrim=duration={src_d:.9f},asetpts=PTS-STARTPTS,afade=t=out:st={src_fade_start:.9f}:d={seam_fade:.9f}[a0]",
+                f"{seg_a}aresample=32000,apad,atrim=duration={seg_d:.9f},asetpts=PTS-STARTPTS,afade=t=in:st=0:d={seam_fade:.9f}[a1]",
                 "[a0][a1]concat=n=2:v=0:a=1[a]",
             ])
             return cmd, af
@@ -370,10 +386,29 @@ def main():
             frame_files = sorted(frames_dir.glob("frame_*.png"))
             if not frame_files:
                 raise RuntimeError("Video decode produced no frames for mux")
-            exact_duration = len(frame_files) / 24.0
-            print(f"Muxing video and audio on exact frame duration: {len(frame_files)} frames / {exact_duration:.6f}s", flush=True)
-            cmd = [ffmpeg, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav),
-                   "-filter:a", f"aresample=32000,apad,atrim=duration={exact_duration:.9f},asetpts=PTS-STARTPTS",
+
+            # A glued H3 continuation begins with the supplied boundary frame, so its
+            # first decoded frame duplicates the final frame of the source clip.  Drop
+            # that one frame before encoding the continuation segment.  Trim the same
+            # 1/24 second from the head of its audio so A/V stays frame-locked.
+            seam_drop_frames = 1 if ns.glue_source else 0
+            if seam_drop_frames and len(frame_files) <= seam_drop_frames:
+                raise RuntimeError("Continuation produced too few frames to drop the duplicated seam frame")
+            mux_frame_count = len(frame_files) - seam_drop_frames
+            exact_duration = mux_frame_count / 24.0
+            audio_head_trim = seam_drop_frames / 24.0
+            if seam_drop_frames:
+                print(
+                    f"Glue seam trim: dropping duplicated first continuation frame + {audio_head_trim:.6f}s audio head; "
+                    "final audio seam will be smoothed over 10 ms",
+                    flush=True,
+                )
+            print(f"Muxing video and audio on exact frame duration: {mux_frame_count} frames / {exact_duration:.6f}s", flush=True)
+            cmd = [ffmpeg, "-y", "-framerate", "24"]
+            if seam_drop_frames:
+                cmd += ["-start_number", str(seam_drop_frames)]
+            cmd += ["-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav),
+                   "-filter:a", f"aresample=32000,atrim=start={audio_head_trim:.9f},asetpts=PTS-STARTPTS,apad,atrim=duration={exact_duration:.9f},asetpts=PTS-STARTPTS",
                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k",
                    "-t", f"{exact_duration:.9f}", str(mux_tmp)]
             subprocess.check_call(cmd)
@@ -383,7 +418,11 @@ def main():
             print(f"Audio/mux stage failed ({e}). Creating COMPLETE video-only fallback instead of leaving a partial MP4...", flush=True)
             if mux_tmp.exists(): mux_tmp.unlink()
             if segment_out.exists(): segment_out.unlink()
-            subprocess.check_call([ffmpeg, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", str(segment_out)])
+            fallback_cmd = [ffmpeg, "-y", "-framerate", "24"]
+            if ns.glue_source:
+                fallback_cmd += ["-start_number", "1"]
+            fallback_cmd += ["-i", str(frames_dir / "frame_%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", str(segment_out)]
+            subprocess.check_call(fallback_cmd)
         if ns.glue_source:
             try:
                 _concat_source_and_segment(ffmpeg, ffprobe, ns.glue_source, segment_out, out, width, height, td)

@@ -31,7 +31,7 @@ def main():
     ap.add_argument("--prompt", required=True); ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0); ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
-    ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--output")
+    ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--ref-audio-subject", action="append", type=int, default=[], help="Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic."); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
     ap.add_argument("--extended-logging", action="store_true")
@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--vram-manager-auto", action="store_true", help="Automatically bypass VRAM Lab when native sampling is estimated to fit the detected GPU")
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
     ap.add_argument("--sage-attention", action="store_true", help="Use SageAttention for the sampling worker")
+    ap.add_argument("--sol-attention", action="store_true", help="Use vendored Sol-Attn for eligible MiniMax H3 attention; falls back to existing attention otherwise")
     ap.add_argument("--disable-comfy-kitchen", action="store_true", help="Disable Comfy Kitchen quantized W4A8 / ConvRot acceleration for worker processes")
     ap.add_argument("--vram-residency-engine", choices=["static", "dynamic"], default="static")
     ap.add_argument("--vram-runtime-free-gb", type=float, default=0.5)
@@ -59,6 +60,14 @@ def main():
     ap.add_argument("--vram-residency-refill-interval", type=int, default=1)
     ap.add_argument("--vram-keep-text-encoder", action="store_true")
     ns = ap.parse_args()
+    # Sol-Attn is read by the vendored H3 model inside the isolated sampling
+    # worker. Keep it process-local so VAE/text helper workers are unaffected.
+    if ns.sol_attention:
+        os.environ["H3_SOL_ATTENTION"] = "1"
+        print("Sol-Attn: enabled for eligible MiniMax H3 attention (existing backend remains fallback)", flush=True)
+    else:
+        os.environ.pop("H3_SOL_ATTENTION", None)
+        print("Sol-Attn: disabled", flush=True)
     # Worker processes import the vendored Comfy stack afresh, so this environment
     # switch cleanly controls whether comfy.quant_ops may activate Comfy Kitchen.
     if ns.disable_comfy_kitchen:
@@ -188,7 +197,10 @@ def main():
         if ns.extended_logging: cmd += ["--extended-logging"]
         for p in ns.ref_image[:9]: cmd += ["--ref-image", str(Path(p).resolve())]
         for p in ns.ref_video[:3]: cmd += ["--ref-video", str(Path(p).resolve())]
-        for p in ns.ref_audio[:3]: cmd += ["--ref-audio", str(Path(p).resolve())]
+        for i, p in enumerate(ns.ref_audio[:3]):
+            cmd += ["--ref-audio", str(Path(p).resolve())]
+            subject_n = ns.ref_audio_subject[i] if i < len(ns.ref_audio_subject) else 0
+            cmd += ["--ref-audio-subject", str(subject_n)]
         subprocess.check_call(cmd, cwd=ROOT, env=sample_env)
         print("Sampling process exited completely. Starting VAE with clean memory...", flush=True)
 
