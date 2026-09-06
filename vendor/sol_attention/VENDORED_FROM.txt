@@ -1,0 +1,5 @@
+Source: Saganaki22/ComfyUI-sol-attn
+Archive supplied by user: ComfyUI-sol-attn-main.zip
+Vendored subset: sol_kernel/
+Integration: FrameVision MiniMax H3 native attention path
+Optional INT8 Sol modes are intentionally disabled in this integration.
