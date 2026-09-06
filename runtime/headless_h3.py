@@ -542,7 +542,7 @@ def generate(*, diffusion_model, text_encoder, video_vae, audio_vae, prompt, wid
         vv_for_refs=None
         _flush_models()
         print("Keyframe VAE unloaded before text encoder load.",flush=True)
-    print("Loading W4A8 text encoder...",flush=True)
+    print("Loading MiniMax H3 text encoder...",flush=True)
     clip=comfy.sd.load_clip([str(text_encoder)], clip_type=comfy.sd.CLIPType.MINIMAX)
     positive,negative,latent,actual_frames=build_conditioning(clip,vv_for_refs,prompt,width,height,int(frames),first_frame,last_frame,prepared_keyframes=prepared_keyframes)
     _flush_models()

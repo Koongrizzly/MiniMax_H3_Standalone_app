@@ -136,6 +136,7 @@ def main():
     for n in ('cfg','shift','audio-shift'): ap.add_argument('--'+n,type=float,required=True)
     ap.add_argument('--sampler',default='euler'); ap.add_argument('--scheduler',default='simple'); ap.add_argument('--ref-image-size',choices=['match','max'],default='match')
     ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
+    ap.add_argument('--ref-audio-subject', action='append', type=int, default=[], help='Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic.')
     ap.add_argument('--lora',action='append',default=[]); ap.add_argument('--lora-strength',action='append',type=float,default=[])
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable experimental MiniMax H3 Spectrum feature forecasting')
@@ -217,8 +218,17 @@ def main():
             if soundtrack is not None: az,at=encode_audio(avae,soundtrack); az=_cpu_latent(az); ref_items.append({'type':'audio'})
             ref_items.append({'type':'video','data':qwen,'timestamps':timestamps})
             ref_blocks.append({'kind':'video_audio' if at else 'video','latent_t':z.shape[2],'latent_h':ch//16,'latent_w':cw//16,'ref_audio_t':at,'latent':z,'audio_latent':az})
-        for path in ns.ref_audio[:3]:
+        voice_prompt_lines = []
+        for standalone_i, path in enumerate(ns.ref_audio[:3]):
             az,at=encode_audio(avae,load_audio(path)); az=_cpu_latent(az); ref_items.append({'type':'audio'}); ref_blocks.append({'kind':'audio','ref_audio_t':at,'audio_latent':az})
+            # Audio tags are assigned in native ref_items order. Reference-video
+            # soundtracks may already have consumed <Audio n> slots, so resolve
+            # the index only after this standalone item is appended.
+            audio_index = sum(1 for item in ref_items if item.get('type') == 'audio')
+            subject_n = ns.ref_audio_subject[standalone_i] if standalone_i < len(ns.ref_audio_subject) else 0
+            if 1 <= int(subject_n) <= 9:
+                voice_prompt_lines.append(f"<Audio {audio_index}> is the voice timbre reference for <Subject {int(subject_n)}>." )
+                print(f"Voice reference mapping: {Path(path).name} -> <Audio {audio_index}> -> <Subject {int(subject_n)}>", flush=True)
     del avae,video_data; _flush_models()
     if ns.extended_logging: log_mem('after Ref2VA audio reference encode / VAE flush', sync=True)
     if manager is not None: manager.set_stage('text')
@@ -227,9 +237,26 @@ def main():
         _log_checkpoint('text encoder checkpoint', ns.text_encoder); log_mem('before text encoder load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
     if ns.extended_logging or (manager is not None and manager.is_stage_managed('text')):
         qwen_patch=_install_qwen_layer_trace(manager)
-    print('Loading W4A8 text encoder for Ref2VA...',flush=True); clip=comfy.sd.load_clip([ns.text_encoder],clip_type=comfy.sd.CLIPType.MINIMAX)
+    print('Loading MiniMax H3 text encoder for Ref2VA...',flush=True); clip=comfy.sd.load_clip([ns.text_encoder],clip_type=comfy.sd.CLIPType.MINIMAX)
     if ns.extended_logging: log_mem('after text encoder object load')
-    tokens=clip.tokenize(ns.prompt,minimax_ref_items=ref_items)
+    effective_prompt = ns.prompt
+    if voice_prompt_lines:
+        # Replace any manually-entered voice-binding lines with the runtime-
+        # resolved bindings. Reference-video soundtracks can consume <Audio n>
+        # slots before standalone voice samples, so only the worker can know
+        # the final indices reliably.
+        import re as _re
+        effective_prompt = _re.sub(
+            r'(?im)^\s*<Audio\s+\d+>\s+is\s+the\s+voice\s+timbre\s+reference\s+for\s+<Subject\s+\d+>\s*\.?\s*$',
+            '',
+            effective_prompt,
+        ).lstrip()
+        # Put the bindings before the user's shot directions. This leaves the
+        # visible prompt effectively unchanged while making the association
+        # explicit to H3 on every generation that uses these voice slots.
+        effective_prompt = "\n".join(voice_prompt_lines) + "\n" + effective_prompt
+        print('Applied standalone voice-timbre reference declarations.', flush=True)
+    tokens=clip.tokenize(effective_prompt,minimax_ref_items=ref_items)
     if manager is not None and manager.is_stage_managed('text'):
         manager.begin_text_conditioning_admission()
         # comfy.sd.load_clip() is lazy: this is the first real Qwen CUDA residency
