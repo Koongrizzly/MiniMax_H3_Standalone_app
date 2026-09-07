@@ -190,28 +190,63 @@ REM Clear any partial packages from an interrupted/failed previous install first
 if errorlevel 1 goto :fail
 
 echo [4/8] Installing Ref2VA audio support...
-echo       TorchCodec 0.11.1 + private FFmpeg 7.1 shared libraries.
+echo       TorchCodec 0.11.1 + private FFmpeg shared libraries (newest supported 4-8).
 echo       This does NOT install FFmpeg through Conda and does NOT modify the GUI/runtime code.
 set "TC_FFMPEG=%ENV%\torchcodec_ffmpeg"
-set "TC_FFMPEG_ZIP=%TEMP%\minimax_ffmpeg_shared_7_1.zip"
+set "TC_FFMPEG_ZIP=%TEMP%\minimax_ffmpeg_shared.zip"
 set "TC_FFMPEG_TMP=%ENV%\torchcodec_ffmpeg_extract"
-set "TC_FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+set "TC_FFMPEG_RESULT=%TEMP%\minimax_ffmpeg_resolved.txt"
+set "TC_FFMPEG_API=https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
 
 REM TorchCodec 0.11.x is the matching line for Torch 2.11. Use --no-deps so the
 REM already matched Torch/CUDA installation cannot be replaced.
 "%PY%" -m pip install --no-warn-script-location --no-deps "torchcodec==0.11.1"
 if errorlevel 1 goto :fail
 
+REM Resolve the asset OUTSIDE FOR /F. Running a quoted Python path directly inside
+REM FOR /F command substitution is fragile in cmd.exe, especially with spaces.
+REM TorchCodec 0.11.1 supports FFmpeg majors 4-8 on Windows; prefer 8, then 7..4.
+set "TC_FFMPEG_URL="
+set "TC_FFMPEG_NAME="
+del /q "%TC_FFMPEG_RESULT%" >nul 2>&1
+"%PY%" -c "import json,re,urllib.request; u=r'%TC_FFMPEG_API%'; req=urllib.request.Request(u,headers={'User-Agent':'MiniMax-H3-installer','Accept':'application/vnd.github+json'}); d=json.load(urllib.request.urlopen(req,timeout=30)); a=d.get('assets',[]); prefs=[re.compile(r'^ffmpeg-n'+str(m)+r'(?:\.[0-9]+)*-latest-win64-'+lic+r'-shared-.*\.zip$',re.I) for m in (8,7,6,5,4) for lic in ('gpl','lgpl')]; hit=next((x for pat in prefs for x in a if pat.match(x.get('name',''))),None); print((hit['name']+'|'+hit['browser_download_url']) if hit else '')" > "%TC_FFMPEG_RESULT%" 2>nul
+if exist "%TC_FFMPEG_RESULT%" for /f "usebackq tokens=1,* delims=|" %%A in ("%TC_FFMPEG_RESULT%") do if not defined TC_FFMPEG_URL (
+  set "TC_FFMPEG_NAME=%%A"
+  set "TC_FFMPEG_URL=%%B"
+)
+
+REM If latest has no supported asset, inspect recent releases.
+if not defined TC_FFMPEG_URL (
+  del /q "%TC_FFMPEG_RESULT%" >nul 2>&1
+  "%PY%" -c "import json,re,urllib.request; u='https://api.github.com/repos/BtbN/FFmpeg-Builds/releases?per_page=20'; req=urllib.request.Request(u,headers={'User-Agent':'MiniMax-H3-installer','Accept':'application/vnd.github+json'}); rs=json.load(urllib.request.urlopen(req,timeout=30)); assets=[x for r in rs for x in r.get('assets',[])]; prefs=[re.compile(r'^ffmpeg-n'+str(m)+r'(?:\.[0-9]+)*-latest-win64-'+lic+r'-shared-.*\.zip$',re.I) for m in (8,7,6,5,4) for lic in ('gpl','lgpl')]; hit=next((x for pat in prefs for x in assets if pat.match(x.get('name',''))),None); print((hit['name']+'|'+hit['browser_download_url']) if hit else '')" > "%TC_FFMPEG_RESULT%" 2>nul
+  if exist "%TC_FFMPEG_RESULT%" for /f "usebackq tokens=1,* delims=|" %%A in ("%TC_FFMPEG_RESULT%") do if not defined TC_FFMPEG_URL (
+    set "TC_FFMPEG_NAME=%%A"
+    set "TC_FFMPEG_URL=%%B"
+  )
+)
+del /q "%TC_FFMPEG_RESULT%" >nul 2>&1
+
+if not defined TC_FFMPEG_URL (
+  echo ERROR: Could not resolve a supported FFmpeg 4-8 win64 shared ZIP from BtbN.
+  echo        GitHub API may be unavailable/rate-limited, or the release layout changed.
+  set "FAILCODE=1"
+  goto :fail
+)
+
+echo       Resolved FFmpeg asset: %TC_FFMPEG_NAME%
+
 REM TorchCodec needs FFmpeg shared DLLs on Windows. Keep a private copy inside
 REM the isolated MiniMax environment instead of adding Conda/GTK packages.
-if not exist "%TC_FFMPEG%\bin\avcodec-61.dll" (
-  echo       Downloading FFmpeg 7.1 shared build...
+if not exist "%TC_FFMPEG%\bin\avcodec-*.dll" (
+  echo       Downloading FFmpeg shared build...
   where curl.exe >nul 2>&1
   if errorlevel 1 (
     echo ERROR: Windows curl.exe was not found.
+    set "FAILCODE=1"
     goto :fail
   )
-  curl.exe -L --fail --retry 5 --retry-delay 2 --continue-at - -o "%TC_FFMPEG_ZIP%" "%TC_FFMPEG_URL%"
+  del /q "%TC_FFMPEG_ZIP%" >nul 2>&1
+  curl.exe -L --fail --retry 5 --retry-all-errors --retry-delay 2 -o "%TC_FFMPEG_ZIP%" "%TC_FFMPEG_URL%"
   if errorlevel 1 goto :fail
   if exist "%TC_FFMPEG_TMP%" rmdir /s /q "%TC_FFMPEG_TMP%"
   mkdir "%TC_FFMPEG_TMP%" >nul 2>&1
@@ -223,7 +258,7 @@ if not exist "%TC_FFMPEG%\bin\avcodec-61.dll" (
   rmdir /s /q "%TC_FFMPEG_TMP%" >nul 2>&1
   del /q "%TC_FFMPEG_ZIP%" >nul 2>&1
 ) else (
-  echo       Private FFmpeg 7.1 shared libraries already present; skipping download.
+  echo       Private FFmpeg shared libraries already present; skipping download.
 )
 
 REM Make the private FFmpeg DLL folder visible automatically whenever this
@@ -299,7 +334,9 @@ pause
 exit /b 0
 
 :fail
+if not defined FAILCODE set "FAILCODE=%ERRORLEVEL%"
+if "%FAILCODE%"=="0" set "FAILCODE=1"
 echo.
-echo INSTALL FAILED. Error code: %ERRORLEVEL%
+echo INSTALL FAILED. Error code: %FAILCODE%
 pause
-exit /b 1
+exit /b %FAILCODE%
