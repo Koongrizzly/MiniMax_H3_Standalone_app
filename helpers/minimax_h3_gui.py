@@ -888,7 +888,32 @@ class MainWindow(QMainWindow):
         ps.clicked.connect(self.save_named); pl.clicked.connect(self.load_named); safe.clicked.connect(self.safe_preset)
         prow.addWidget(self.preset_name, 1); prow.addWidget(ps); prow.addWidget(pl); prow.addWidget(safe); pf.addRow("Preset", prow); v.addWidget(preset)
         v.addStretch(1)
-        self.tabs.addTab(self._scroll_page(body), "Generation")
+
+        # The Generation tab can optionally share the queue's existing preview
+        # player.  Keep the controls in their normal scroll area on the right and
+        # reserve a splitter pane on the left for the preview when enabled.
+        page = QWidget()
+        page_layout = QHBoxLayout(page)
+        page_layout.setContentsMargins(8, 8, 8, 8)
+        page_layout.setSpacing(8)
+        self.generation_splitter = QSplitter(Qt.Orientation.Horizontal, page)
+        self.generation_splitter.setChildrenCollapsible(False)
+        self.generation_splitter.setHandleWidth(6)
+        self.generation_preview_host = QWidget(self.generation_splitter)
+        self.generation_preview_host.setObjectName("GenerationPreviewHost")
+        self.generation_preview_host.setMinimumWidth(360)
+        self.generation_preview_layout = QVBoxLayout(self.generation_preview_host)
+        self.generation_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.generation_preview_layout.setSpacing(0)
+        self.generation_preview_host.hide()
+        generation_scroll = self._scroll_page(body)
+        self.generation_splitter.addWidget(self.generation_preview_host)
+        self.generation_splitter.addWidget(generation_scroll)
+        self.generation_splitter.setStretchFactor(0, 5)
+        self.generation_splitter.setStretchFactor(1, 6)
+        self.generation_splitter.setSizes([520, 650])
+        page_layout.addWidget(self.generation_splitter, 1)
+        self.tabs.addTab(page, "Generation")
 
     def _builder_root(self) -> Path:
         return ROOT / "h3_prompt_builder"
@@ -1202,10 +1227,20 @@ class MainWindow(QMainWindow):
         splitter.setHandleWidth(6)
 
         # ---- LEFT: fixed preview/player -----------------------------------------
-        left = QWidget(splitter)
-        left.setObjectName("QueuePreviewPane")
-        left.setMinimumWidth(360)
-        left_layout = QVBoxLayout(left)
+        # The player itself is kept in a movable pane so Settings can relocate
+        # this exact widget to the Generation tab without creating a second media
+        # player or losing the currently loaded clip/playback state.
+        self.queue_preview_host = QWidget(splitter)
+        self.queue_preview_host.setObjectName("QueuePreviewHost")
+        self.queue_preview_host.setMinimumWidth(360)
+        self.queue_preview_layout = QVBoxLayout(self.queue_preview_host)
+        self.queue_preview_layout.setContentsMargins(0,0,0,0)
+        self.queue_preview_layout.setSpacing(0)
+
+        self.preview_pane = QWidget()
+        self.preview_pane.setObjectName("QueuePreviewPane")
+        self.preview_pane.setMinimumWidth(360)
+        left_layout = QVBoxLayout(self.preview_pane)
         left_layout.setContentsMargins(0,0,0,0)
         left_layout.setSpacing(8)
 
@@ -1270,6 +1305,7 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(prev, 1)
         left_layout.addStretch(0)
+        self.queue_preview_layout.addWidget(self.preview_pane, 1)
 
         # ---- RIGHT: queue lists, this side alone scrolls -------------------------
         right_scroll = QScrollArea(splitter)
@@ -1323,6 +1359,10 @@ class MainWindow(QMainWindow):
 
         clearrow = QHBoxLayout()
         clearrow.addStretch(1)
+        self.cancel_all_btn = QPushButton("Cancel all")
+        self.cancel_all_btn.setToolTip("Cancel the current run and remove all pending jobs from the queue.")
+        self.cancel_all_btn.clicked.connect(self._cancel_all_jobs)
+        clearrow.addWidget(self.cancel_all_btn)
         self.clear_cancelled_btn = QPushButton("Clear cancelled")
         self.clear_cancelled_btn.setToolTip("Remove cancelled jobs from this queue history only. Files on disk are not deleted.")
         self.clear_cancelled_btn.clicked.connect(self._clear_cancelled_jobs)
@@ -1339,12 +1379,14 @@ class MainWindow(QMainWindow):
         right_layout.addStretch(1)
 
         right_scroll.setWidget(right_content)
-        splitter.addWidget(left)
+        splitter.addWidget(self.queue_preview_host)
         splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 6)
         splitter.setSizes([520, 650])
         layout.addWidget(splitter, 1)
+        self.queue_splitter = splitter
+        self.queue_jobs_scroll = right_scroll
 
         self.tabs.addTab(page,"Queue")
         self.queue_timer = QTimer(self)
@@ -1742,6 +1784,28 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self,"Delete failed",str(exc))
 
+    def _cancel_all_jobs(self):
+        ans = QMessageBox.question(
+            self,
+            "Cancel all",
+            "This will cancel current run and delete all pending jobs.\nAre you sure ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        # Remove pending work first so the normal process-finished callback cannot
+        # immediately advance to another queued job while the active process stops.
+        self.queue_jobs = [j for j in self.queue_jobs if j.get("state") != "pending"]
+        self._save_queue_state()
+        self._refresh_queue_views()
+
+        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
+            self._stop_running_job("cancel")
+        else:
+            self.status.setText("Queue ready")
+
     def _clear_finished_jobs(self):
         # Queue-history cleanup only; generated files remain untouched.
         self.queue_jobs=[j for j in self.queue_jobs if j.get("state") not in ("finished","failed")]
@@ -2124,10 +2188,25 @@ class MainWindow(QMainWindow):
         self.system_hud_toggle.toggled.connect(self._set_system_hud_visible)
         v.addWidget(self.system_hud_toggle)
 
+        self.preview_in_main_toggle = QCheckBox("Show preview pane in main tab")
+        self.preview_in_main_toggle.setChecked(False)
+        self.preview_in_main_toggle.setToolTip(
+            "Move the Queue video preview/player to the left side of the main Generation tab. "
+            "The Generation controls move to the right and a vertical splitter handle lets you resize both sides. "
+            "When enabled, the Queue tab uses its full width for the job lists."
+        )
+        self.preview_in_main_toggle.toggled.connect(self._set_preview_in_main_tab)
+        v.addWidget(self.preview_in_main_toggle)
+
         self.sage_attention_enabled = QCheckBox("Enable SageAttention")
         self.sage_attention_enabled.setChecked(False)
         self.sage_attention_enabled.setToolTip("This affects transformer attention during sampling only; isolated video/audio VAE workers keep their normal attention path. Default: Off.")
         v.addWidget(self.sage_attention_enabled)
+
+        self.sol_attention_enabled = QCheckBox("Enable Sol Attention")
+        self.sol_attention_enabled.setChecked(False)
+        self.sol_attention_enabled.setToolTip("Enable SOL Attention in the MiniMax H3 generation backend. Default: Off.")
+        v.addWidget(self.sol_attention_enabled)
 
         self.spectrum_enabled = QCheckBox("Enable Spectrum feature forecasting")
         self.spectrum_enabled.setChecked(False)
@@ -2323,6 +2402,52 @@ class MainWindow(QMainWindow):
         v.addWidget(credits)
         v.addStretch(1)
         self.tabs.addTab(self._scroll_page(body), "Settings")
+
+    def _set_preview_in_main_tab(self, enabled):
+        """Move the single preview/player pane between Queue and Generation."""
+        if not all(hasattr(self, name) for name in (
+            "preview_pane", "queue_preview_host", "queue_preview_layout",
+            "generation_preview_host", "generation_preview_layout",
+            "queue_splitter", "generation_splitter"
+        )):
+            return
+        enabled = bool(enabled)
+        try:
+            # Remove from whichever host currently owns it before re-parenting.
+            self.queue_preview_layout.removeWidget(self.preview_pane)
+            self.generation_preview_layout.removeWidget(self.preview_pane)
+            if enabled:
+                self.preview_pane.setParent(self.generation_preview_host)
+                self.generation_preview_layout.addWidget(self.preview_pane, 1)
+                self.queue_preview_host.hide()
+                self.generation_preview_host.show()
+                self.queue_splitter.setSizes([0, max(900, self.queue_splitter.width())])
+                self.generation_splitter.setSizes([520, 650])
+            else:
+                self.preview_pane.setParent(self.queue_preview_host)
+                self.queue_preview_layout.addWidget(self.preview_pane, 1)
+                self.generation_preview_host.hide()
+                self.queue_preview_host.show()
+                self.queue_splitter.setSizes([520, 650])
+                self.generation_splitter.setSizes([0, max(900, self.generation_splitter.width())])
+            self.preview_pane.show()
+            self.queue_splitter.updateGeometry()
+            self.generation_splitter.updateGeometry()
+            self._schedule_layout_refresh()
+        except RuntimeError:
+            return
+
+        # Save this UI preference immediately, just like the HUD setting.
+        try:
+            PRESET_DIR.mkdir(parents=True, exist_ok=True)
+            p = PRESET_DIR / "minimax_h3_gui_last.json"
+            d = {}
+            if p.is_file():
+                d = json.loads(p.read_text(encoding="utf-8"))
+            d["preview_in_main_tab"] = enabled
+            p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _set_system_hud_visible(self, enabled):
         if hasattr(self, "system_hud"):
@@ -2625,12 +2750,14 @@ class MainWindow(QMainWindow):
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
+            "preview_in_main_tab": self.preview_in_main_toggle.isChecked(),
             "auto_update_enabled": self.auto_update_enabled.isChecked(),
             "font_size_pt": int(self.font_size_slider.value()) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
             "play_result_finished": self.play_result_finished.isChecked(),
             "play_result_queue_player": self.play_result_queue_player.isChecked(),
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
             "sage_attention_enabled": self.sage_attention_enabled.isChecked(),
+            "sol_attention_enabled": self.sol_attention_enabled.isChecked(),
             "vram_manager_enabled": self.vram_manager_enabled.isChecked(), "vram_manager_auto_bypass": self.vram_manager_auto_bypass.isChecked(), "vram_residency_engine": self.vram_residency_engine.currentData(), "vram_runtime_free_gb": self.vram_runtime_free.value(),
             "vram_text_headroom_gb": self.vram_text_headroom.value(), "vram_diffusion_headroom_gb": self.vram_diffusion_headroom.value(),
             "vram_offload_chunk_mb": self.vram_offload_chunk.value(), "vram_max_resident_weights_gb": self.vram_max_weights.value(),
@@ -2669,6 +2796,7 @@ class MainWindow(QMainWindow):
             self.extended_logging.setChecked(bool(d.get("extended_logging", False)))
             self.tile_debugging.setChecked(bool(d.get("tile_debugging", False)))
             self.system_hud_toggle.setChecked(bool(d.get("system_hud", True)))
+            self.preview_in_main_toggle.setChecked(bool(d.get("preview_in_main_tab", False)))
             self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
             saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
             self.font_size_slider.blockSignals(True)
@@ -2682,7 +2810,9 @@ class MainWindow(QMainWindow):
             self.play_result_queue_player.setVisible(self.play_result_finished.isChecked())
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
+            self.sol_attention_enabled.setChecked(bool(d.get("sol_attention_enabled", False)))
             self._set_system_hud_visible(self.system_hud_toggle.isChecked())
+            self._set_preview_in_main_tab(self.preview_in_main_toggle.isChecked())
             self.vram_manager_enabled.setChecked(bool(d.get("vram_manager_enabled", True)))
             self.vram_manager_auto_bypass.setChecked(bool(d.get("vram_manager_auto_bypass", True)))
             engine = str(d.get("vram_residency_engine", "static")).lower()
@@ -3090,6 +3220,7 @@ class MainWindow(QMainWindow):
             args += ["--vram-residency-fill" if self.vram_residency_fill.isChecked() else "--no-vram-residency-fill"]
         if self.spectrum_enabled.isChecked(): args += ["--spectrum"]
         if self.sage_attention_enabled.isChecked(): args += ["--sage-attention"]
+        if self.sol_attention_enabled.isChecked(): args += ["--sol-attention"]
         # Video-VAE tiling is independent from sampling-side VRAM Manager activation.
         # Keep the proven 256/128 defaults unless the user deliberately changes them for testing.
         tile_size = int(self.vram_video_vae_tile_size.value())
