@@ -26,6 +26,7 @@ import comfy.ops
 import comfy.patcher_extension
 import comfy.quant_ops
 from comfy.ldm.modules.attention import optimized_attention
+from sol_attention import try_sol_attention
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
@@ -146,11 +147,11 @@ class Attention(nn.Module):
     def forward(self, x, rope_freqs=None, transformer_options={}):
         s = x.shape[0]
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
-        v = v.view(s, self.heads, self.head_dim)
+        q = q.view(1, s, self.heads, self.head_dim)
+        k = k.view(1, s, self.heads, self.head_dim)
+        v = v.view(1, s, self.heads, self.head_dim)
         if rope_freqs is not None:
             # fused per-head RMSNorm + partial split-half rope, in place on the qkv buffer
-            q = q.view(1, s, self.heads, self.head_dim)
-            k = k.view(1, s, self.heads, self.head_dim)
             qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
             kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
             rot = rope_freqs.shape[-3] * 2
@@ -160,14 +161,25 @@ class Attention(nn.Module):
             else:
                 comfy.quant_ops.ck.rms_rope_split_half_(
                     q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
-            q = q[0]
-            k = k[0]
         else:
-            q = self.q_norm(q.view(s, self.heads, self.head_dim))
-            k = self.k_norm(k.view(s, self.heads, self.head_dim))
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        # FrameVision's native Sol-Attn path consumes the zero-copy BTHD views
+        # above. It is opt-in and fail-open: unsupported shapes/devices/kernels
+        # return None and preserve the existing Comfy optimized/Sage backend.
+        sol_out = try_sol_attention(
+            q, k, v,
+            video_span=(transformer_options or {}).get("sol_h3_video_span"),
+            min_tokens=4096,
+            tau=1.0,
+        )
+        if sol_out is not None:
+            return self.out_proj(sol_out.view(s, self.heads * self.head_dim))
+
+        q = q[0].transpose(0, 1).unsqueeze(0)
+        k = k[0].transpose(0, 1).unsqueeze(0)
+        v = v[0].transpose(0, 1).unsqueeze(0)
         out = optimized_attention(q, k, v, self.heads, mask=None, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out.squeeze(0))
 
@@ -687,6 +699,11 @@ class MiniMaxH3Model(nn.Module):
         # Text/reference/conditioning rows never enter forecast history.
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
         audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
+        # Sol-Attn uses this packed span to keep all conditioning/reference/audio
+        # KV blocks before the generated video exact. Publishing it here also
+        # ensures the token-refiner attention above always stays on Comfy/Sage.
+        if isinstance(transformer_options, dict):
+            transformer_options["sol_h3_video_span"] = (video_seg[0], video_seg[1])
         va, vb, _ = video_seg
         aa, ab, _ = audio_seg
 
