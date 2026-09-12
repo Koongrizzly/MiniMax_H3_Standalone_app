@@ -3258,7 +3258,9 @@ class MainWindow(QMainWindow):
         if not path.is_file():
             return
         if self.play_result_queue_player.isChecked():
-            self.tabs.setCurrentIndex(2)
+            # Follow the preview pane to whichever tab currently owns it.
+            # Generate is tab 0; Queue is tab 2.
+            self.tabs.setCurrentIndex(0 if self.preview_in_main_toggle.isChecked() else 2)
             self._load_preview(job, autoplay=True)
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
