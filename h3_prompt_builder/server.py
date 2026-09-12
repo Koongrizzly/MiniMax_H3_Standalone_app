@@ -35,6 +35,7 @@ DEFAULT_PORT = 8785
 APP_VERSION = "2.9.1-beta.2"
 LLAMA_BUNDLE_DIR = APP_ROOT.parent / "presets" / "bin" / "llama"
 LLAMA_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=50"
 LLAMA_DOWNLOAD_LOCK = threading.Lock()
 LLAMA_DOWNLOAD_STATE = {"active": False, "stage": "idle", "message": "", "percent": 0.0, "downloaded": 0, "total": 0, "error": "", "runner": ""}
 HISTORY_LOCK = threading.Lock()
@@ -111,14 +112,8 @@ def _set_llama_download_state(**updates) -> None:
         LLAMA_DOWNLOAD_STATE.update(updates)
 
 
-def _github_latest_llama_cuda12_assets() -> tuple[list[dict], str]:
-    req = urllib.request.Request(
-        LLAMA_RELEASE_API,
-        headers={"User-Agent": "MiniMax-H3-Prompt-Builder", "Accept": "application/vnd.github+json"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        release = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
-    tag = str(release.get("tag_name") or "latest")
+def _llama_cuda12_assets_from_release(release: dict) -> tuple[list[dict], str] | None:
+    tag = str(release.get("tag_name") or "unknown")
     assets = release.get("assets") or []
     main = None
     cudart = None
@@ -130,11 +125,55 @@ def _github_latest_llama_cuda12_assets() -> tuple[list[dict], str]:
         elif low == "cudart-llama-bin-win-cuda-12.4-x64.zip":
             cudart = a
     if not main:
-        raise RuntimeError("Latest llama.cpp release does not contain the Windows x64 CUDA 12.4 bundle")
+        return None
     selected = [main]
     if cudart:
         selected.append(cudart)
     return selected, tag
+
+
+def _github_latest_llama_cuda12_assets() -> tuple[list[dict], str]:
+    headers = {"User-Agent": "MiniMax-H3-Prompt-Builder", "Accept": "application/vnd.github+json"}
+
+    # Prefer GitHub's current latest release. llama.cpp occasionally publishes a
+    # release before every Windows CUDA asset has finished uploading, so a
+    # missing CUDA 12.4 archive must not make first-time setup fail immediately.
+    req = urllib.request.Request(LLAMA_RELEASE_API, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        latest = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+    found = _llama_cuda12_assets_from_release(latest)
+    if found:
+        return found
+
+    latest_tag = str(latest.get("tag_name") or "latest")
+    _set_llama_download_state(
+        stage="checking",
+        message=f"CUDA 12.4 bundle not present in {latest_tag}; checking recent llama.cpp releases…",
+        percent=0.0,
+    )
+
+    # Fall back to recent non-draft releases, newest first. This handles the
+    # publication window where /releases/latest exists but its desired asset
+    # is not available yet.
+    req = urllib.request.Request(LLAMA_RELEASES_API, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        releases = json.loads(resp.read().decode("utf-8", errors="replace") or "[]")
+    if not isinstance(releases, list):
+        releases = []
+    for release in releases:
+        if not isinstance(release, dict) or release.get("draft"):
+            continue
+        tag = str(release.get("tag_name") or "")
+        if tag and tag == latest_tag:
+            continue
+        found = _llama_cuda12_assets_from_release(release)
+        if found:
+            return found
+
+    raise RuntimeError(
+        "No recent llama.cpp release contains the Windows x64 CUDA 12.4 bundle "
+        "(checked latest plus up to 50 older releases)"
+    )
 
 
 def _download_file_with_progress(url: str, dest: Path, base_done: int, grand_total: int, label: str) -> int:
