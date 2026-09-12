@@ -392,13 +392,14 @@ class ImagePreviewDialog(QDialog):
 RESOLUTION_PRESETS = {
     "576 × 320":  {"16:9": (576, 320),  "9:16": (320, 576),  "1:1": (320, 320)},
     "736 × 384":  {"16:9": (736, 384),  "9:16": (384, 736),  "1:1": (384, 384)},
+    "832 × 448":  {"16:9": (832, 448),  "9:16": (448, 832),  "1:1": (448, 448)},
     "832 × 480":  {"16:9": (832, 480),  "9:16": (480, 832),  "1:1": (480, 480)},
     "960 × 544":  {"16:9": (960, 544),  "9:16": (544, 960),  "1:1": (544, 544)},
     "1280 × 720": {"16:9": (1280, 704), "9:16": (704, 1280), "1:1": (704, 704)},
     "1344 × 768": {"16:9": (1344, 768), "9:16": (768, 1344), "1:1": (768, 768)},
     "1920 × 1088":{"16:9": (1920, 1088),"9:16": (1088, 1920),"1:1": (1088, 1088)},
 }
-DEFAULT_RESOLUTION = "832 × 480"
+DEFAULT_RESOLUTION = "832 × 448"
 NORMAL_FRAME_MAX = 719   # last H3 native-grid value below 30 seconds (29.958 s at 24 FPS)
 EXPERIMENTAL_FRAME_MAX = 2385  # last H3 native-grid value at/below 100 seconds (99.375 s at 24 FPS)
 FRAME_PRESETS = sorted(set(list(range(124, NORMAL_FRAME_MAX + 1, 17)) + [480]))
@@ -693,6 +694,7 @@ class MainWindow(QMainWindow):
         self.wheel_filter = NoWheelFilter(self)
         self._build()
         self._apply_style()
+        self._apply_first_run_defaults()
         self.load_last()
         self._load_queue_state()
         self._sync_resolution()
@@ -809,7 +811,7 @@ class MainWindow(QMainWindow):
         self.frames = QComboBox()
         for x in FRAME_PRESETS:
             self.frames.addItem(f"{x} frames — {x / 24.0:.2f} s", x)
-        self._set_frame_count(362)
+        self._set_frame_count(124)
         self.experimental_long_duration = QCheckBox("Experimental long duration")
         self.experimental_long_duration.setChecked(False)
         self.experimental_long_duration.toggled.connect(self._sync_long_duration_mode)
@@ -1160,7 +1162,7 @@ class MainWindow(QMainWindow):
             self.frames.setToolTip(
                 "Fixed MiniMax H3 frame count at 24 FPS. Normal mode stops at 719 frames = 29.96 seconds. "
                 "Enable Experimental long duration for values above 30 seconds, up to 2385 frames = 99.38 seconds. "
-                "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM. Default: 362 frames."
+                "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM. Default: 124 frames."
             )
 
     def _apply_prompt_builder_payload(self, payload):
@@ -2189,7 +2191,7 @@ class MainWindow(QMainWindow):
         v.addWidget(self.system_hud_toggle)
 
         self.preview_in_main_toggle = QCheckBox("Show preview pane in main tab")
-        self.preview_in_main_toggle.setChecked(False)
+        self.preview_in_main_toggle.setChecked(True)
         self.preview_in_main_toggle.setToolTip(
             "Move the Queue video preview/player to the left side of the main Generation tab. "
             "The Generation controls move to the right and a vertical splitter handle lets you resize both sides. "
@@ -2214,12 +2216,12 @@ class MainWindow(QMainWindow):
         v.addWidget(self.spectrum_enabled)
 
         self.play_result_finished = QCheckBox("Play result when finished")
-        self.play_result_finished.setChecked(False)
+        self.play_result_finished.setChecked(True)
         v.addWidget(self.play_result_finished)
 
         self.play_result_queue_player = QCheckBox("Use player in Queue (Off = Windows default player)")
-        self.play_result_queue_player.setChecked(False)
-        self.play_result_queue_player.setVisible(False)
+        self.play_result_queue_player.setChecked(True)
+        self.play_result_queue_player.setVisible(True)
         self.play_result_finished.toggled.connect(self.play_result_queue_player.setVisible)
         v.addWidget(self.play_result_queue_player)
 
@@ -2259,7 +2261,7 @@ class MainWindow(QMainWindow):
         mnote.setWordWrap(True); mf.addRow(mnote)
         self.use_hybrid_model = QCheckBox("Use hybrid model")
         self.use_hybrid_model.setChecked(False)
-        self.use_hybrid_model.setToolTip("When enabled, use the selected hybrid MiniMax H3 checkpoint for T2VA/FL2VA and Ref2VA generation instead of the separate FL2VA and Ref2VA diffusion checkpoints. This setting is remembered after restart.")
+        self.use_hybrid_model.setToolTip("When enabled, use one hybrid MiniMax H3 checkpoint for T2VA/FL2VA and Ref2VA. A selected file/folder is preferred; when blank or stale, the MiniMax model folders are scanned automatically for a compatible hybrid .safetensors file. This setting is remembered after restart.")
         self.hybrid_model = ModelPathRow("Select hybrid MiniMax H3 .safetensors checkpoint")
         mf.addRow(self.use_hybrid_model)
         mf.addRow("Hybrid checkpoint", self.hybrid_model)
@@ -2352,8 +2354,8 @@ class MainWindow(QMainWindow):
         self.vram_video_vae_tile_size.setToolTip("MiniMax video-VAE spatial tile size. Safe/current default is 256 px. Larger tiles may decode faster but use more VRAM. Test carefully for OOMs and visible tile seams.")
         vf.addRow("Video VAE tile size", self.vram_video_vae_tile_size)
 
-        self.vram_video_vae_tile_overlap = QSpinBox(); self.vram_video_vae_tile_overlap.setRange(0, 512); self.vram_video_vae_tile_overlap.setSingleStep(32); self.vram_video_vae_tile_overlap.setValue(128); self.vram_video_vae_tile_overlap.setSuffix(" px")
-        self.vram_video_vae_tile_overlap.setToolTip("Overlap between MiniMax video-VAE spatial tiles. Safe/current default is 128 px. 64 px is a speed test candidate, but lower overlap can make tile boundaries visible in the final MP4. Overlap must stay smaller than tile size.")
+        self.vram_video_vae_tile_overlap = QSpinBox(); self.vram_video_vae_tile_overlap.setRange(0, 512); self.vram_video_vae_tile_overlap.setSingleStep(32); self.vram_video_vae_tile_overlap.setValue(64); self.vram_video_vae_tile_overlap.setSuffix(" px")
+        self.vram_video_vae_tile_overlap.setToolTip("Overlap between MiniMax video-VAE spatial tiles. Default: 64 px. Increase it only if visible tile boundaries appear in the final MP4. Overlap must stay smaller than tile size.")
         vf.addRow("Video VAE tile overlap", self.vram_video_vae_tile_overlap)
 
         self.vram_audio_vae_reserve = QDoubleSpinBox(); self.vram_audio_vae_reserve.setRange(0.10, 16.0); self.vram_audio_vae_reserve.setDecimals(2); self.vram_audio_vae_reserve.setSingleStep(0.25); self.vram_audio_vae_reserve.setValue(1.0); self.vram_audio_vae_reserve.setSuffix(" GB")
@@ -2403,7 +2405,7 @@ class MainWindow(QMainWindow):
         v.addStretch(1)
         self.tabs.addTab(self._scroll_page(body), "Settings")
 
-    def _set_preview_in_main_tab(self, enabled):
+    def _set_preview_in_main_tab(self, enabled, persist=True):
         """Move the single preview/player pane between Queue and Generation."""
         if not all(hasattr(self, name) for name in (
             "preview_pane", "queue_preview_host", "queue_preview_layout",
@@ -2438,16 +2440,17 @@ class MainWindow(QMainWindow):
             return
 
         # Save this UI preference immediately, just like the HUD setting.
-        try:
-            PRESET_DIR.mkdir(parents=True, exist_ok=True)
-            p = PRESET_DIR / "minimax_h3_gui_last.json"
-            d = {}
-            if p.is_file():
-                d = json.loads(p.read_text(encoding="utf-8"))
-            d["preview_in_main_tab"] = enabled
-            p.write_text(json.dumps(d, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        if persist:
+            try:
+                PRESET_DIR.mkdir(parents=True, exist_ok=True)
+                p = PRESET_DIR / "minimax_h3_gui_last.json"
+                d = {}
+                if p.is_file():
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                d["preview_in_main_tab"] = enabled
+                p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     def _set_system_hud_visible(self, enabled):
         if hasattr(self, "system_hud"):
@@ -2483,20 +2486,20 @@ class MainWindow(QMainWindow):
         self.res_class.setToolTip(
             "Fixed MiniMax H3 resolution preset. No free-form width/height values are used. "
             "The 1280 × 720 display preset generates at MiniMax-valid 1280 × 704 (704p). "
-            "Default: 832 × 480 for 16:9. Higher resolutions need substantially more VRAM/RAM and time."
+            "Default: 832 × 448 for 16:9. Higher resolutions need substantially more VRAM/RAM and time."
         )
         self.resolved.setToolTip("Exact width × height that will be sent to the backend for the selected aspect ratio.")
         self.frames.setToolTip(
             "Fixed MiniMax H3 frame count at 24 FPS. Normal mode stops at 719 frames = 29.96 seconds. "
             "Enable Experimental long duration for values above 30 seconds, up to 2385 frames = 99.38 seconds. "
-            "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM. Default: 362 frames."
+            "The maximum frame count that will actually run depends on the available system RAM and GPU VRAM. Default: 124 frames."
         )
         self.experimental_long_duration.setToolTip(
             "Unlock experimental H3 durations above the normal 30-second range. Values follow the native 17k+5 frame grid "
             "up to 2385 frames = 99.38 seconds. The maximum duration that will actually run depends on available system RAM "
             "and GPU VRAM; this switch exposes research values and does not guarantee that every resolution or hardware setup can reach 100 seconds."
         )
-        self.steps.setToolTip("Number of diffusion/sampling steps. More steps take longer. Default: 15.")
+        self.steps.setToolTip("Number of diffusion/sampling steps. More steps take longer. Default good quality without a speed LoRA: 20 steps. First-run setting is 15 steps, or 4 when a detected EMA speed LoRA is loaded automatically.")
         self.seed.setToolTip("Random seed. Use -1 for a new random seed each generation. Default: -1 (random).")
         self.prompt.setToolTip(
             "Full video instruction sent to MiniMax H3. You can include action, camera direction, dialogue, "
@@ -2519,7 +2522,7 @@ class MainWindow(QMainWindow):
         self.shift.setToolTip("Video timestep/sigma shift. Validated starting value for this install: 12.")
         self.audio_shift.setToolTip("Audio timestep/sigma shift. Validated starting value for this install: 3.")
         self.sampler.setToolTip("Diffusion sampler algorithm. Default: Euler. Change only when intentionally testing sampler behavior.")
-        self.scheduler.setToolTip("Sigma/timestep schedule used by the sampler. Default: simple.")
+        self.scheduler.setToolTip("Sigma/timestep schedule used by the sampler. First-run default is simple without a speed LoRA; when an EMA speed LoRA is auto-detected the app selects beta.")
         self.preset_name.setToolTip("Name used when saving the current GUI configuration as a JSON preset.")
 
         self.output_folder.setToolTip(f"Folder for generated MP4 files. Leave empty to use: {DEFAULT_OUTPUT_DIR}")
@@ -2832,7 +2835,7 @@ class MainWindow(QMainWindow):
             self.vram_video_vae_reserve.setValue(float(d.get("vram_video_vae_reserve_gb", 2.0)))
             self.vram_audio_vae_reserve.setValue(float(d.get("vram_audio_vae_reserve_gb", 1.0)))
             self.vram_video_vae_tile_size.setValue(int(d.get("vram_video_vae_tile_size", 256)))
-            self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 128)))
+            self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 64)))
             self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False))); self.hybrid_model.edit.setText(d.get("hybrid_model", ""))
             self.fl2va_model.edit.setText(d.get("fl2va_model", "")); self.ref2va_model.edit.setText(d.get("ref2va_model", "")); self.text_encoder_model.edit.setText(d.get("text_encoder_model", "")); self.video_vae_model.edit.setText(d.get("video_vae_model", "")); self.audio_vae_model.edit.setText(d.get("audio_vae_model", ""))
             saved_loras = d.get("loras", []) or []
@@ -2843,6 +2846,100 @@ class MainWindow(QMainWindow):
             self.append_log(f"Preset warning: {e}\n")
         self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
         self._sync_resolution(); self._sync_mode()
+
+    @staticmethod
+    def _looks_like_speed_ema_lora(path: Path) -> bool:
+        name = path.name.lower()
+        if path.suffix.lower() != ".safetensors" or "ema" not in name:
+            return False
+        speed_markers = ("turbo", "4step", "4_step", "4-step", "speed", "fast", "distill", "acceler")
+        return any(marker in name for marker in speed_markers)
+
+    def _find_first_speed_ema_lora(self):
+        if not DEFAULT_LORA_DIR.is_dir():
+            return None
+        try:
+            files = sorted(DEFAULT_LORA_DIR.rglob("*.safetensors"), key=lambda x: str(x).lower())
+        except OSError:
+            return None
+        return next((p for p in files if self._looks_like_speed_ema_lora(p)), None)
+
+    def _apply_first_run_defaults(self):
+        """Apply defaults only when this install has no saved GUI state yet."""
+        if (PRESET_DIR / "minimax_h3_gui_last.json").is_file():
+            return
+        self.res_class.setCurrentText(DEFAULT_RESOLUTION)
+        self.aspect.setCurrentText("16:9")
+        self._set_frame_count(124)
+        self.vram_video_vae_tile_overlap.setValue(64)
+        self.preview_in_main_toggle.setChecked(True)
+        self._set_preview_in_main_tab(True, persist=False)
+        self.play_result_finished.setChecked(True)
+        self.play_result_queue_player.setChecked(True)
+        self.play_result_queue_player.setVisible(True)
+        self.steps.setValue(15)
+        self.scheduler.setCurrentText("simple")
+
+        speed_lora = self._find_first_speed_ema_lora()
+        if speed_lora is not None and self.lora_rows:
+            row, strength = self.lora_rows[0]
+            row.edit.setText(str(speed_lora))
+            strength.setValue(1.0)
+            self.steps.setValue(4)
+            self.scheduler.setCurrentText("beta")
+
+    def _resolve_hybrid_model_path(self, populate=False):
+        """Resolve a hybrid checkpoint from an explicit file/folder or auto-discover it."""
+        raw = self.hybrid_model.path().strip()
+        roots = []
+        if raw:
+            requested = Path(raw).expanduser()
+            if requested.is_file() and requested.suffix.lower() == ".safetensors":
+                return requested.resolve()
+            if requested.is_dir():
+                roots.append(requested)
+
+        roots.extend([
+            ROOT / "models" / "minimax_h3" / "diffusion_models",
+            ROOT / "models" / "diffusion_models",
+            ROOT / "models" / "minimax_h3",
+            ROOT / "models",
+        ])
+        seen = set()
+        candidates = []
+        for root in roots:
+            try:
+                key = str(root.resolve()).lower()
+            except OSError:
+                key = str(root).lower()
+            if key in seen or not root.is_dir():
+                continue
+            seen.add(key)
+            try:
+                for candidate in root.rglob("*.safetensors"):
+                    name = candidate.name.lower()
+                    if "hybrid" in name and ("minimax" in name or "h3" in name or "ref2va" in name):
+                        candidates.append(candidate)
+            except OSError:
+                continue
+
+        if not candidates:
+            return None
+
+        def score(path: Path):
+            name = path.name.lower()
+            return (
+                0 if "ref2va_hybrid" in name else 1,
+                0 if "b20-49" in name or "b20_49" in name else 1,
+                0 if "prun" in name else 1,
+                len(str(path)),
+                str(path).lower(),
+            )
+
+        found = sorted(set(candidates), key=score)[0].resolve()
+        if populate:
+            self.hybrid_model.edit.setText(str(found))
+        return found
 
     def save_last(self):
         PRESET_DIR.mkdir(parents=True, exist_ok=True); (PRESET_DIR / "minimax_h3_gui_last.json").write_text(json.dumps(self.settings_dict(), indent=2), encoding="utf-8")
@@ -2873,7 +2970,8 @@ class MainWindow(QMainWindow):
 
     def model_override_args(self, mode=None):
         args = []
-        hybrid = self.hybrid_model.path().strip() if self.use_hybrid_model.isChecked() else ""
+        hybrid_path = self._resolve_hybrid_model_path(populate=True) if self.use_hybrid_model.isChecked() else None
+        hybrid = str(hybrid_path) if hybrid_path else ""
         if hybrid:
             if mode == 2:
                 args += ["--ref2va-checkpoint", hybrid]
@@ -3103,9 +3201,9 @@ class MainWindow(QMainWindow):
         if not PYTHON.is_file(): self.status.setText("Environment missing"); return
         mode = self.mode.currentIndex()
         if self.use_hybrid_model.isChecked():
-            hybrid = self.hybrid_model.path().strip()
-            if not hybrid or not Path(hybrid).is_file():
-                QMessageBox.warning(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
+            hybrid = self._resolve_hybrid_model_path(populate=True)
+            if hybrid is None:
+                QMessageBox.warning(self, "Hybrid model missing", "Use hybrid model is enabled, but no compatible hybrid .safetensors checkpoint was found in the selected path or MiniMax model folders.")
                 return
         self.status.setText("Validating…")
         args = ["-m", "runtime.validate_models"] + self.model_override_args(mode)
@@ -3240,10 +3338,11 @@ class MainWindow(QMainWindow):
             out=base.with_name(f"{base.stem}_{n:03d}{base.suffix}"); n+=1
         args += ["--output",str(out)]
         if self.use_hybrid_model.isChecked():
-            model_path = self.hybrid_model.path()
-            if not model_path or not Path(model_path).is_file():
-                QMessageBox.critical(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found."); return
-            model_label = f"Hybrid: {Path(model_path).name}"
+            resolved_hybrid = self._resolve_hybrid_model_path(populate=True)
+            if resolved_hybrid is None:
+                QMessageBox.critical(self, "Hybrid model missing", "Use hybrid model is enabled, but no compatible hybrid .safetensors checkpoint was found in the selected path or MiniMax model folders."); return
+            model_path = str(resolved_hybrid)
+            model_label = f"Hybrid: {resolved_hybrid.name}"
         else:
             model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
             model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
@@ -3258,8 +3357,6 @@ class MainWindow(QMainWindow):
         if not path.is_file():
             return
         if self.play_result_queue_player.isChecked():
-            # Follow the preview pane to whichever tab currently owns it.
-            # Generate is tab 0; Queue is tab 2.
             self.tabs.setCurrentIndex(0 if self.preview_in_main_toggle.isChecked() else 2)
             self._load_preview(job, autoplay=True)
         else:

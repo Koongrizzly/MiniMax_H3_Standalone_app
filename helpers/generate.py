@@ -32,8 +32,8 @@ def main():
 
     ap = argparse.ArgumentParser(description="MiniMax-H3 W4A8 ConvRot standalone generator")
     ap.add_argument("--prompt", default="A cinematic red sports car races through rain-soaked neon streets at night, dynamic tracking camera, realistic reflections and natural engine sound.")
-    ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15)
+    ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=448)
+    ap.add_argument("--frames", type=int, default=124); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15)
     ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
     ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
