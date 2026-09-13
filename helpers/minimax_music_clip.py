@@ -205,6 +205,24 @@ def _fmt_time(seconds: float) -> str:
     return f"{minutes:02d}:{sec:05.2f}"
 
 
+
+
+def _read_text_tolerant(path) -> str:
+    """Read text files without failing on legacy or malformed byte sequences."""
+    p = Path(path)
+    raw = p.read_bytes()
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("utf-8", errors="replace")
+
+
+def _subprocess_text_kwargs() -> dict:
+    """Capture subprocess text without crashing on odd console glyphs."""
+    return {"text": True, "encoding": "utf-8", "errors": "replace"}
+
 def _existing_executable(candidates: Iterable[Path | str]) -> str:
     for candidate in candidates:
         text = str(candidate)
@@ -248,7 +266,7 @@ def probe_duration(path: str) -> float:
     cp = subprocess.run(
         [probe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     try:
@@ -449,7 +467,7 @@ def analyze_music(audio_path: str, sensitivity: int = 10) -> AnalysisResult:
         cp = subprocess.run(
             [ffmpeg, "-y", "-i", audio_path, "-vn", "-ac", "1", "-ar", "44100", "-acodec", "pcm_s16le", str(wav_path)],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if cp.returncode != 0 or not wav_path.is_file():
@@ -1749,7 +1767,7 @@ def _whisper_task(progress, audio_path: str) -> List[LyricSegment]:
     try:
         cp = subprocess.run(
             [ffmpeg, "-y", "-i", audio_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path)],
-            capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if cp.returncode != 0 or not wav_path.is_file():
             raise RuntimeError("Could not prepare audio for Whisper.cpp:\n" + (cp.stderr or cp.stdout or ""))
@@ -1760,7 +1778,7 @@ def _whisper_task(progress, audio_path: str) -> List[LyricSegment]:
             "-l", "auto", "-t", str(threads), "-oj", "-of", str(result_prefix), "-np",
         ]
         cp = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=str(cli.parent), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if cp.returncode != 0:
@@ -1804,7 +1822,7 @@ def _extract_audio_slice(audio: str, out_path: Path, start: float, duration: flo
         "-t", f"{max(0.10, duration):.6f}", "-vn", "-ac", "2", "-ar", "32000",
         "-c:a", "pcm_s16le", str(out_path),
     ]
-    cp = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if cp.returncode != 0 or not out_path.is_file():
         raise RuntimeError("Could not create Ref2VA audio slice:\n" + (cp.stderr or cp.stdout or ""))
 
@@ -1961,7 +1979,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             env=os.environ.copy(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             bufsize=1,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -2042,7 +2060,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
             ffmpeg, "-y", "-i", shot.output_path, "-an", "-vf", vf,
             "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(target),
         ]
-        cp = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if cp.returncode != 0 or not target.is_file():
             raise RuntimeError(f"Could not trim shot {shot.index}:\n" + (cp.stderr or cp.stdout or ""))
         trimmed.append(target)
@@ -2054,7 +2072,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
     cp = subprocess.run(
         [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(video_only)],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if cp.returncode != 0:
@@ -2062,7 +2080,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
         cp = subprocess.run(
             [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-an", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(video_only)],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     if cp.returncode != 0 or not video_only.is_file():
@@ -2078,7 +2096,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
     if song_duration > 0:
         cmd += ["-t", f"{song_duration:.6f}"]
     cmd += [str(final)]
-    cp = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if cp.returncode != 0 or not final.is_file():
         raise RuntimeError("Final mux failed:\n" + (cp.stderr or cp.stdout or ""))
     progress(f"Saved final music video: {final}")
@@ -2620,7 +2638,7 @@ class MiniMaxMusicClipWidget(QWidget):
             marker = candidate / marker_name
             try:
                 if marker.is_file():
-                    data = json.loads(marker.read_text(encoding="utf-8"))
+                    data = _read_text_tolerant(json.loads(marker))
                     if str(data.get("identity") or "") == identity:
                         break
                 # An empty folder is safe to claim; a legacy/non-empty folder is not.
@@ -2720,7 +2738,7 @@ class MiniMaxMusicClipWidget(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Open MiniMax music project", "", "JSON (*.json)")
         if not path: return
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8")); self.project = self._project_from_dict(data); self.project_path = path; self._sync_ui_from_project(); self.status.setText(f"Opened: {path}")
+            data = _read_text_tolerant(json.loads(Path(path))); self.project = self._project_from_dict(data); self.project_path = path; self._sync_ui_from_project(); self.status.setText(f"Opened: {path}")
             self._write_autosave(force=True)
         except Exception as exc:
             QMessageBox.critical(self, "Open project failed", str(exc))
@@ -3553,7 +3571,7 @@ class MiniMaxMusicClipWidget(QWidget):
         try:
             if not AUTOSAVE_PATH.is_file():
                 return False
-            data = json.loads(AUTOSAVE_PATH.read_text(encoding="utf-8"))
+            data = json.loads(_read_text_tolerant(AUTOSAVE_PATH))
             if not isinstance(data, dict):
                 return False
             # Current format wraps the project so we can also remember the explicit
@@ -3609,7 +3627,7 @@ class MiniMaxMusicClipWidget(QWidget):
     def _load_settings(self) -> None:
         try:
             if SETTINGS_PATH.is_file():
-                data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                data = json.loads(_read_text_tolerant(SETTINGS_PATH))
                 self.project.output_dir = str(data.get("output_dir") or self.project.output_dir)
                 self.project.resolution = str(data.get("resolution") or self.project.resolution)
                 self.project.aspect = str(data.get("aspect") or self.project.aspect)
@@ -3698,7 +3716,7 @@ def _queue_cli_main(argv: Sequence[str]) -> Optional[int]:
     try:
         pos = list(argv).index("--queue-assemble")
         project_path = Path(argv[pos + 1]).resolve()
-        data = json.loads(project_path.read_text(encoding="utf-8"))
+        data = json.loads(_read_text_tolerant(project_path))
         project = MiniMaxMusicClipWidget._project_from_dict(data)
         result = _assembly_task(lambda text: print(text, flush=True), project)
         print(f"Saved final music video: {result}", flush=True)
