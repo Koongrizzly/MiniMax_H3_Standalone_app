@@ -139,11 +139,34 @@ def _inspect_for_kind(path: Path, kind: str):
         return ok, n
     return False, 0
 
+
+
+def _is_experimental_diffusion_override(raw, kind: str):
+    """Return an explicit INT8/hybrid MiniMax diffusion checkpoint that should be
+    handed to Comfy's real loader instead of being rejected by this W4A8-era
+    pre-validator. Automatic discovery remains strict so normal installs do not
+    silently select experimental files.
+    """
+    if not raw or kind not in ("fl2va", "ref2va"):
+        return None
+    try:
+        p = Path(raw).expanduser().resolve()
+    except Exception:
+        return None
+    if not p.is_file() or p.suffix.lower() != ".safetensors":
+        return None
+    name = p.name.lower()
+    markers = ("int8", "hybrid", "partialint8", "partial_int8", "sparseref")
+    return p if any(marker in name for marker in markers) else None
+
 def _resolve_override_or_scan(raw, folder: Path, expected: str, label: str, kind: str):
     # Explicit override always wins. A folder override is scanned recursively.
     if raw:
         p = Path(raw).expanduser().resolve()
         if p.is_file():
+            experimental = _is_experimental_diffusion_override(raw, kind)
+            if experimental is not None:
+                return experimental, None
             try:
                 ok, _ = _inspect_for_kind(p, kind)
             except Exception as e:
@@ -221,7 +244,16 @@ def validate(require_vae=True, mode="both", fl2va_path=None, ref2va_path=None, t
         if err: errors.append(err)
 
     for label, p in (("fl2va", diff), ("ref2va", ref)):
-        if not p: continue
+        if not p:
+            continue
+        explicit_raw = fl2va_path if label == "fl2va" else ref2va_path
+        if _is_experimental_diffusion_override(explicit_raw, label) is not None:
+            # The checkpoint was explicitly chosen by the user. INT8/hybrid files
+            # can use a tensor layout or safetensors metadata pattern that this
+            # older W4A8 validator does not understand. Let comfy.sd's diffusion
+            # loader be the authoritative compatibility test.
+            info.append((label, p, True, {"experimental_override": True}, 0, None))
+            continue
         try:
             md, qmd, ok, hits, n = inspect_quant(p); info.append((label, p, ok, hits, n, qmd))
             if not ok: errors.append(f"{label}: {p.name} does not look like a supported W4A8/ConvRot checkpoint")
