@@ -1,4 +1,4 @@
-![MiniMax H3 INT4 Standalone](/presets/setsave/2026-08-16%2020_56_27-MiniMax%20H3%20INT4%20Standalone.jpg)
+![MiniMax H3 INT4 Standalone](/presets/setsave/2026-08-16%2020_56_27-MiniMax%20H3%20INT4%20Standalone.jpg.jpg)
 
 
 # MiniMax H3 INT4 Standalone
