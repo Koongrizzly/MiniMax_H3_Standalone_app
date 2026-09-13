@@ -18,7 +18,7 @@ It supports :
 
   Added support for Sol attention and SLA attention, (only 1 has effect at the same time, i like SLA more, faster and better quality in the test runs that i did)
 
-  Best quality/speed combination i found : use included speedup lora (use BETA instead of SIMPLE Scheduler for this particular lora) at 10 instead of 4 steps, activate SLA attention + Spectrum forecadst in the settings, speed will be almost as fast as using 4 or 6 steps but quality is better. 8 steps was about same speed like 4 steps but quality was almost as bad as 4 steps so i keep it at 10 steps now. 
+  Best quality/speed combination i found : use included speedup lora (use BETA instead of SIMPLE Scheduler for this particular lora) at 10 instead of 4 steps, activate SLA attention + Spectrum forecast in the settings, speed will be almost as fast as using 4 or 6 steps but quality is better.
   
   
 - 08/16/26: imported the Framevision music clip creator and converted it for use with MiniMax H3
