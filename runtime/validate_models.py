@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json
+import argparse, json, os
 from pathlib import Path
 from safetensors import safe_open
 from .paths import (
@@ -159,6 +159,52 @@ def _is_experimental_diffusion_override(raw, kind: str):
     markers = ("int8", "hybrid", "partialint8", "partial_int8", "sparseref")
     return p if any(marker in name for marker in markers) else None
 
+def _shared_model_folders(component_folder: Path):
+    """Return compatible shared MiniMax model folders without recursively searching disks.
+
+    Standalone upgrades are often unpacked without the very large model files. When
+    the local component folder is empty, reuse an existing FrameVision MiniMax model
+    installation if one is present. Explicit GUI overrides still take precedence.
+    """
+    component = component_folder.name
+    roots = []
+
+    # Optional explicit shared-model roots for portable/custom installs.
+    for env_name in ("MINIMAX_H3_MODELS", "FRAMEVISION_MINIMAX_H3_MODELS"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            roots.append(Path(raw).expanduser())
+
+    # Common FrameVision install locations. Checking drive roots is cheap and avoids
+    # an expensive recursive disk search.
+    if os.name == "nt":
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            roots.append(Path(f"{letter}:\\FrameVision-main\\models\\minimax_h3"))
+
+    # Also support a FrameVision-main folder beside the standalone parent.
+    try:
+        standalone_root = component_folder.parents[2]
+        roots.append(standalone_root.parent / "FrameVision-main" / "models" / "minimax_h3")
+    except Exception:
+        pass
+
+    seen = set()
+    result = []
+    local_root = component_folder.parent.resolve()
+    for root in roots:
+        try:
+            root = root.resolve()
+        except Exception:
+            continue
+        key = str(root).lower()
+        if key in seen or root == local_root:
+            continue
+        seen.add(key)
+        candidate = root / component
+        if candidate.is_dir():
+            result.append(candidate)
+    return result
+
 def _resolve_override_or_scan(raw, folder: Path, expected: str, label: str, kind: str):
     # Explicit override always wins. A folder override is scanned recursively.
     if raw:
@@ -189,6 +235,25 @@ def _resolve_override_or_scan(raw, folder: Path, expected: str, label: str, kind
             pass
 
     candidates = _safe_candidates(folder)
+    # If this standalone copy has no local models, transparently reuse an existing
+    # FrameVision MiniMax installation. This keeps upgrades/moves from losing model
+    # discovery while preserving local files and explicit GUI overrides as priority.
+    if not candidates and not raw:
+        for shared_folder in _shared_model_folders(folder):
+            shared_candidates = _safe_candidates(shared_folder)
+            if shared_candidates:
+                folder = shared_folder
+                exact = folder / expected
+                if exact.is_file():
+                    try:
+                        ok, _ = _inspect_for_kind(exact, kind)
+                        if ok:
+                            return exact, None
+                    except Exception:
+                        pass
+                candidates = shared_candidates
+                break
+
     valid = []
     read_errors = []
     for cand in candidates:
