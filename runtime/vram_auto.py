@@ -191,6 +191,53 @@ def _stage_decision(required: float, usable, label: str, needed: bool = True):
     }
 
 
+def _is_large_int8_hybrid_checkpoint(path) -> bool:
+    """Return True for the large experimental/fused INT8 hybrid H3 checkpoints.
+
+    These models are roughly 19-21 GiB on disk. On 24 GiB cards FL2VA/I2V can
+    look safe to the generic W4A8 estimator while its diffusion activations still
+    push CUDA to the physical limit and spill heavily into WDDM shared memory.
+    """
+    if not path:
+        return False
+    try:
+        p = Path(path)
+        name = p.name.lower()
+        hybrid_name = any(token in name for token in ("hybrid", "sparseref", "fused"))
+        int8_name = "int8" in name
+        if not (hybrid_name and int8_name):
+            return False
+        # Keep the rule narrowly scoped to the large diffusion checkpoints, not
+        # unrelated INT8 assets that happen to contain the same words.
+        size_gib = _file_gib(p, 0.0)
+        return size_gib >= 17.0
+    except Exception:
+        return False
+
+
+def _force_fl2va_hybrid_manager(stages, *, width: int, height: int, mode: str, diffusion_model_path=None):
+    """Force managed diffusion for large INT8 hybrids above the 480p class.
+
+    832x480 and smaller keep the normal automatic decision. Ref2VA is deliberately
+    untouched because current 24 GiB tests show its automatic path behaves well.
+    """
+    if str(mode).lower() != "fl2va":
+        return
+    if not _is_large_int8_hybrid_checkpoint(diffusion_model_path):
+        return
+    if int(width) * int(height) <= 832 * 480:
+        return
+
+    d = stages.get("diffusion")
+    if not d:
+        return
+    d["use_manager"] = True
+    d["reason"] = (
+        "large INT8 hybrid FL2VA/I2V above 832x480; forcing managed diffusion "
+        "to prevent 24 GiB CUDA saturation and WDDM shared-memory spill"
+    )
+
+
 def decide_vram_stages(
     width: int,
     height: int,
@@ -207,6 +254,7 @@ def decide_vram_stages(
     ref_video_count: int = 0,
     ref_audio_count: int = 0,
     ref_image_size: str = "match",
+    diffusion_model_path=None,
 ):
     """Return independent automatic VRAM decisions for every expensive H3 stage."""
     gpu = query_primary_gpu_vram()
@@ -263,6 +311,13 @@ def decide_vram_stages(
             needed=True,
         ),
     }
+    _force_fl2va_hybrid_manager(
+        stages,
+        width=width,
+        height=height,
+        mode=mode,
+        diffusion_model_path=diffusion_model_path,
+    )
     return {
         "gpu_name": name,
         "total_gib": total,
