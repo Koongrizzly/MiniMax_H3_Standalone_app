@@ -156,6 +156,7 @@ def main():
         stage_plan = decide_vram_stages(
             width, height, ns.frames, "fl2va",
             text_encoder_path=te, video_vae_path=vv, audio_vae_path=av,
+            diffusion_model_path=diff,
             reference_needed=reference_needed, reference_frames=reference_frames,
             reference_audio=bool(ns.continue_video and ns.continue_audio_memory),
         )
