@@ -2207,8 +2207,16 @@ class MainWindow(QMainWindow):
 
         self.sol_attention_enabled = QCheckBox("Enable Sol Attention")
         self.sol_attention_enabled.setChecked(False)
-        self.sol_attention_enabled.setToolTip("Enable SOL Attention in the MiniMax H3 generation backend. Default: Off.")
+        self.sol_attention_enabled.setToolTip("Enable SOL Attention in the MiniMax H3 generation backend. Default: Off. If SLA is also enabled, SLA takes priority for that job.")
         v.addWidget(self.sol_attention_enabled)
+
+        self.sla_attention_enabled = QCheckBox("Enable H3 SLA Attention")
+        self.sla_attention_enabled.setChecked(False)
+        self.sla_attention_enabled.setToolTip(
+            "Enable MiniMax H3 block-sparse SLA attention using the tested 0.85 preset and Comfy Kitchen sol_attn kernel. "
+            "SLA takes priority over Sol Attention. On a 24 GB GPU, keep enough runtime-free VRAM for the sparse kernel workspace (about 1.5 GB worked in testing)."
+        )
+        v.addWidget(self.sla_attention_enabled)
 
         self.spectrum_enabled = QCheckBox("Enable Spectrum feature forecasting")
         self.spectrum_enabled.setChecked(False)
@@ -2761,6 +2769,7 @@ class MainWindow(QMainWindow):
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
             "sage_attention_enabled": self.sage_attention_enabled.isChecked(),
             "sol_attention_enabled": self.sol_attention_enabled.isChecked(),
+            "sla_attention_enabled": self.sla_attention_enabled.isChecked(),
             "vram_manager_enabled": self.vram_manager_enabled.isChecked(), "vram_manager_auto_bypass": self.vram_manager_auto_bypass.isChecked(), "vram_residency_engine": self.vram_residency_engine.currentData(), "vram_runtime_free_gb": self.vram_runtime_free.value(),
             "vram_text_headroom_gb": self.vram_text_headroom.value(), "vram_diffusion_headroom_gb": self.vram_diffusion_headroom.value(),
             "vram_offload_chunk_mb": self.vram_offload_chunk.value(), "vram_max_resident_weights_gb": self.vram_max_weights.value(),
@@ -2814,6 +2823,7 @@ class MainWindow(QMainWindow):
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
             self.sol_attention_enabled.setChecked(bool(d.get("sol_attention_enabled", False)))
+            self.sla_attention_enabled.setChecked(bool(d.get("sla_attention_enabled", False)))
             self._set_system_hud_visible(self.system_hud_toggle.isChecked())
             self._set_preview_in_main_tab(self.preview_in_main_toggle.isChecked())
             self.vram_manager_enabled.setChecked(bool(d.get("vram_manager_enabled", True)))
@@ -3319,6 +3329,7 @@ class MainWindow(QMainWindow):
         if self.spectrum_enabled.isChecked(): args += ["--spectrum"]
         if self.sage_attention_enabled.isChecked(): args += ["--sage-attention"]
         if self.sol_attention_enabled.isChecked(): args += ["--sol-attention"]
+        if self.sla_attention_enabled.isChecked(): args += ["--sla-attention"]
         # Video-VAE tiling is independent from sampling-side VRAM Manager activation.
         # Keep the proven 256/128 defaults unless the user deliberately changes them for testing.
         tile_size = int(self.vram_video_vae_tile_size.value())

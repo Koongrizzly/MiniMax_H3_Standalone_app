@@ -43,6 +43,7 @@ def main():
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
     ap.add_argument("--sage-attention", action="store_true", help="Use SageAttention for the sampling worker")
     ap.add_argument("--sol-attention", action="store_true", help="Use vendored Sol-Attn for eligible MiniMax H3 attention; falls back to existing attention otherwise")
+    ap.add_argument("--sla-attention", action="store_true", help="Enable MiniMax H3 SLA block-sparse attention with the tested 0.85 preset")
     ap.add_argument("--disable-comfy-kitchen", action="store_true", help="Disable Comfy Kitchen quantized W4A8 / ConvRot acceleration for worker processes")
     ap.add_argument("--vram-residency-engine", choices=["static", "dynamic"], default="static")
     ap.add_argument("--vram-runtime-free-gb", type=float, default=0.5)
@@ -60,6 +61,18 @@ def main():
     ap.add_argument("--vram-residency-refill-interval", type=int, default=1)
     ap.add_argument("--vram-keep-text-encoder", action="store_true")
     ns = ap.parse_args()
+    # SLA and the standalone Sol attention override both own the same H3 attention path.
+    # When both are selected, SLA owns this job so Sol cannot intercept it first.
+    if ns.sla_attention and ns.sol_attention:
+        ns.sol_attention = False
+        print("[SLA] Sol-Attn suppressed for this job because SLA Attention is enabled.", flush=True)
+    if ns.sla_attention:
+        if ns.disable_comfy_kitchen:
+            print("[SLA] ERROR: SLA requires Comfy Kitchen; turn Comfy Kitchen on.", flush=True)
+            return 2
+        from runtime.sla_backend import ensure_comfy_kitchen_sla_backend
+        if not ensure_comfy_kitchen_sla_backend(auto_upgrade=True):
+            return 2
     # Sol-Attn is read by the vendored H3 model inside the isolated sampling
     # worker. Keep it process-local so VAE/text helper workers are unaffected.
     if ns.sol_attention:
@@ -146,6 +159,7 @@ def main():
         cmd = [py, "-m", "runtime.sample_worker_ref", "--diffusion", str(ref), "--text-encoder", str(te), "--video-vae", str(vv), "--audio-vae", str(av), "--prompt", ns.prompt, "--width", str(ns.width), "--height", str(ns.height), "--frames", str(ns.frames), "--steps", str(ns.steps), "--cfg", str(ns.cfg), "--seed", str(ns.seed), "--shift", str(ns.shift), "--audio-shift", str(ns.audio_shift), "--sampler", ns.sampler, "--scheduler", ns.scheduler, "--ref-image-size", ns.ref_image_size, "--out", str(lat)]
         if ns.experimental_long_duration: cmd += ["--experimental-long-duration"]
         if ns.spectrum: cmd += ["--spectrum"]
+        if ns.sla_attention: cmd += ["--sla-attention"]
         sample_env = os.environ.copy()
         comfy_args = []
         if ns.sage_attention:
