@@ -44,6 +44,7 @@ def main():
     ap.add_argument('--lora', action='append', default=[]); ap.add_argument('--lora-strength', action='append', type=float, default=[])
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable MiniMax H3 Spectrum feature forecasting')
+    ap.add_argument('--sla-attention', action='store_true', help='Enable MiniMax H3 SLA block-sparse attention')
     ap.add_argument('--experimental-long-duration', action='store_true', help='Allow native-grid research durations up to 2385 frames')
     ap.add_argument('--vram-manager', action='store_true')
     ap.add_argument('--vram-managed-stage', action='append', choices=['reference','text','diffusion'], default=[], help='Limit VRAM Manager to selected worker stage(s); omitted means all stages')
@@ -177,6 +178,31 @@ def main():
     model=apply_loras(model, zip(ns.lora, ns.lora_strength))
     if ns.extended_logging: log_mem('after LoRA patching', sync=True)
     model=patch_sigma(model,ns.shift,ns.audio_shift)
+    if ns.sla_attention:
+        from runtime.sla_backend import ensure_comfy_kitchen_sla_backend
+        if not ensure_comfy_kitchen_sla_backend(auto_upgrade=False):
+            raise RuntimeError('SLA requested but comfy_kitchen.sol_attn is unavailable; refusing dense fallback')
+        import comfy_kitchen as _sla_ck
+        print(f"[SLA] sparse kernel backend READY | comfy_kitchen.sol_attn={getattr(_sla_ck, 'sol_attn', None)!r}", flush=True)
+        from h3_sla.patch import patch_h3_sla
+        model = patch_h3_sla(
+            model,
+            sparsity_ratio=0.85,
+            block_size=32,
+            min_seq_len=12288,
+            dense_last_steps=1,
+            protect_audio=True,
+            dense_backend='comfy_kitchen',
+            dense_steps='1',
+            disable_fp16_accum=True,
+            stabilize_motion=False,
+            reference_protection='Off',
+            tail_correction=False,
+            use_int8_qk=False,
+            use_int8_pv=False,
+            engine='comfy_kitchen',
+        )
+        print('[SLA] enabled | tested preset | sparsity=0.85 | block=32 | min_seq_len=12288 | dense_last_steps=1 | dense_steps=1 | protect_audio=ON | ref_protection=Off | dense_backend=comfy_kitchen | engine=comfy_kitchen', flush=True)
     spectrum_controller = None
     if ns.spectrum:
         from runtime.h3_spectrum import MiniMaxH3Spectrum, MIN_FIT_POINTS
