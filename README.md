@@ -50,6 +50,8 @@ It supports :
 
 - Optional SageAttention acceleration
 
+- Optional Sol Attention
+
 - System hud with job progress
 
 - options for extended logging and debugging 
