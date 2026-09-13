@@ -2257,7 +2257,7 @@ class MainWindow(QMainWindow):
         v.addWidget(outg)
 
         models = QGroupBox("Model overrides"); mf = QFormLayout(models)
-        mnote = QLabel("Leave a field empty for automatic model discovery. The app scans the matching MiniMax model folder and selects a compatible checkpoint; an override can be a .safetensors file or a folder to scan.")
+        mnote = QLabel("Leave a field empty for automatic model discovery. Explicit overrides can use supported INT4/W4A8 or INT8 ConvRot .safetensors checkpoints. Hybrid mode can use a manually selected hybrid checkpoint or auto-discover one.")
         mnote.setWordWrap(True); mf.addRow(mnote)
         self.use_hybrid_model = QCheckBox("Use hybrid model")
         self.use_hybrid_model.setChecked(False)
@@ -2265,8 +2265,8 @@ class MainWindow(QMainWindow):
         self.hybrid_model = ModelPathRow("Select hybrid MiniMax H3 .safetensors checkpoint")
         mf.addRow(self.use_hybrid_model)
         mf.addRow("Hybrid checkpoint", self.hybrid_model)
-        self.fl2va_model = ModelPathRow("Blank = auto-scan diffusion_models for FL2VA")
-        self.ref2va_model = ModelPathRow("Blank = auto-scan diffusion_models for Ref2VA")
+        self.fl2va_model = ModelPathRow("Blank = auto-scan FL2VA; supports INT4/W4A8 or INT8 override")
+        self.ref2va_model = ModelPathRow("Blank = auto-scan Ref2VA; supports INT4/W4A8 or INT8 override")
         self.text_encoder_model = ModelPathRow("Blank = auto-scan text_encoders")
         self.video_vae_model = ModelPathRow("Blank = auto-scan models\\minimax_h3\\video_vae")
         self.audio_vae_model = ModelPathRow("Blank = auto-scan audio_vae")
@@ -3345,7 +3345,7 @@ class MainWindow(QMainWindow):
             model_label = f"Hybrid: {resolved_hybrid.name}"
         else:
             model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
-            model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
+            model_label=Path(model_path).name if model_path else ("Ref2VA default" if mode==2 else "FL2VA default")
         job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
