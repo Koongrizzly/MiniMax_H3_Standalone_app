@@ -27,6 +27,7 @@ PRESET_DIR = ROOT / "presets" / "setsave"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 DEFAULT_LORA_DIR = ROOT / "models" / "minimax_h3" / "loras"
 LOG_DIR = ROOT / "logs"
+APP_ICON = ROOT / "assets" / "grizzlymax-app.ico"
 
 APP_UPDATE_REPO = "Koongrizzly/MiniMax_H3_Standalone_app"
 APP_UPDATE_PAGE = f"https://github.com/{APP_UPDATE_REPO}"
@@ -3468,9 +3469,28 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # Give the standalone GUI its own Windows taskbar identity instead of being
+    # grouped under python.exe / the generic Qt application icon.
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "GetGoingFast.GrizzlyMax.MiniMaxH3"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("MiniMax H3 INT4 Standalone")
+
+    app_icon = QIcon(str(APP_ICON)) if APP_ICON.is_file() else QIcon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+
     w = MainWindow()
+    if not app_icon.isNull():
+        w.setWindowIcon(app_icon)
+
     # Start in the state most users keep this control-heavy GUI in.  A later
     # manual restore/resize is respected by MainWindow.changeEvent().
     w.showMaximized()
