@@ -76,7 +76,7 @@ function quickDraft(v){
   if(v.referenceEnabled)lines.push(`REFERENCE LOCK: The supplied image defines the subject's appearance${v.referenceLock?`, including ${v.referenceLock}`:""}; preserve that exact design, proportions, colors and identity in every shot.`);
   if(v.dialogue)lines.push(`DIALOGUE LOCK: The character says exactly: ${finish(v.dialogue)} Mouth movement and timing match the words.`);
   const audio=v.soundEnabled?(v.sound?finish(v.sound):"native stereo ambience, tactile close-up effects and reactions synchronized exactly to their visible source") : "complete silence";
-  lines.push(`FINAL QUALITY LOCK: ${camera} Preserve subject identity, wardrobe, environment geography, screen direction, lighting logic and story progression across every cut. Use believable weight, inertia, contact, occlusion and cause-and-effect motion. Sound treatment: ${finish(audio)} No continuity jumps, duplicated anatomy, accidental extra subjects, unreadable action or generic filler imagery.${v.avoid?` Exclude ${finish(v.avoid)}`:""}`);
+  lines.push(`FINAL QUALITY LOCK: ${camera} Preserve subject identity, wardrobe, environment geography, screen direction, lighting logic and story progression throughout the entire clip. Use believable weight, inertia, contact, occlusion and cause-and-effect motion. Sound treatment: ${finish(audio)} No continuity jumps, duplicated anatomy, accidental extra subjects, unreadable action or generic filler imagery.${v.avoid?` Exclude ${finish(v.avoid)}`:""}`);
   return lines.join("\n\n").slice(0,12000);
 }
 function expandStory(idea){
@@ -123,7 +123,7 @@ function formatGeneratedPrompt(v,result){
   if(labeled.test(text))return qualityBreak(text.replace(/[ \t\r\n]+(?=(?:SHOT|BEAT)\s+\d+\s*\[[^\]]+\]\s*:)/gi,"\n\n"));
   const ranges=[...text.matchAll(/\[((?:\d+:)?\d+(?:\.\d+)?)\s*[–—-]\s*((?:\d+:)?\d+(?:\.\d+)?)\]/g)];
   if(ranges.length!==shotCount(v))return qualityBreak(text);
-  const precedingBreak=text.lastIndexOf("\n\n",ranges[0].index),blockStart=precedingBreak>=0?precedingBreak+2:0,prefix=text.slice(0,blockStart).trim(),label=effectiveFlow(v)==="One continuous shot"?"BEAT":"SHOT",shots=[];
+  const precedingBreak=text.lastIndexOf("\n\n",ranges[0].index),blockStart=precedingBreak>=0?precedingBreak+2:0,prefix=text.slice(0,blockStart).trim(),label=usesBeatLabels(v)?"BEAT":"SHOT",shots=[];
   const cleanSegment=(segment,range)=>segment.replace(range[0],"").replace(/\s+([,.;!?])/g,"$1").replace(/^[\s,;:–—-]+/,"").trim();
   let cursor=blockStart,suffix="",timestampsLead=ranges[0].index-blockStart<=20;
   if(timestampsLead){
@@ -180,12 +180,19 @@ function effectiveFlow(v){
   if(/meditat|contemplat|quiet|gentle|tender|slow|dreamscape|romantic/i.test(context))return"Slow, deliberate pacing";
   return"Multiple cinematic shots";
 }
-function flowText(flow){return({"Let H3 decide":"Let the model choose the most effective shot progression for clarity and impact.","One continuous shot":"Present the action as one coherent continuous shot without cuts.","Multiple cinematic shots":"Use a small number of motivated cinematic shots with smooth, readable transitions.","Fast commercial-style cuts":"Use energetic commercial-style cuts while keeping the subject and action easy to follow.","Slow, deliberate pacing":"Use slow, deliberate pacing with time for each action and expression to register.","Stand-up performance":"Keep the performer anchored and let delivery, pauses and audience reaction determine the cuts.","Sitcom dialogue beats":"Build a readable setup, interruption or complication, response and comic payoff with conversational coverage.","TV comedy scene beats":"Use flexible episodic coverage that supports grounded character interaction, dialogue and reaction.","Slapstick escalation":"Stage physical cause and effect clearly, escalating through anticipation, impact and reaction.","Sketch comedy beats":"Move quickly from setup to escalation to a decisive punchline without repeating the gag.","Dark comedy restraint":"Keep the visual treatment serious and controlled so irony and uncomfortable contrast create the humor.","Parody genre beats":"Use the target genre’s authentic visual grammar, then exaggerate selected conventions for the payoff.","Surreal comedy progression":"Escalate impossible events through coherent visual logic and matter-of-fact reactions."})[flow]||"";}
+function isTrueContinuousFlow(vOrFlow){const flow=typeof vOrFlow==="string"?vOrFlow:String(vOrFlow?.flow||"");return flow==="One continuous shot";}
+function isMidpointContinuousFlow(vOrFlow){const flow=typeof vOrFlow==="string"?vOrFlow:String(vOrFlow?.flow||"");return flow==="One continuous shot + midpoint timestamp";}
+function isContinuousFlow(vOrFlow){return isTrueContinuousFlow(vOrFlow)||isMidpointContinuousFlow(vOrFlow);}
+function isNoHardCutsFlow(vOrFlow){const flow=typeof vOrFlow==="string"?vOrFlow:String(vOrFlow?.flow||"");return flow==="No hard cuts";}
+function usesBeatLabels(vOrFlow){return isContinuousFlow(vOrFlow)||isNoHardCutsFlow(vOrFlow);}
+function flowText(flow){return ({"Let H3 decide":"Let the model choose the most effective shot progression for clarity and impact.","One continuous shot":"One genuinely unbroken take with no internal timeline sections or cuts.","One continuous shot + midpoint timestamp":"One unbroken take with a single midpoint timing marker to steer the action without introducing a cut.","No hard cuts":"Use several timed beats connected by soft or hidden transitions; avoid visible hard edits.","Multiple cinematic shots":"Use a small number of motivated cinematic shots with smooth, readable transitions.","Fast commercial-style cuts":"Use energetic commercial-style cuts while keeping the subject and action easy to follow.","Slow, deliberate pacing":"Use slow, deliberate pacing with time for each action and expression to register.","Stand-up performance":"Keep the performer anchored and let delivery, pauses and audience reaction determine the cuts.","Sitcom dialogue beats":"Build a readable setup, interruption or complication, response and comic payoff with conversational coverage.","TV comedy scene beats":"Use flexible episodic coverage that supports grounded character interaction, dialogue and reaction.","Slapstick escalation":"Stage physical cause and effect clearly, escalating through anticipation, impact and reaction.","Sketch comedy beats":"Move quickly from setup to escalation to a decisive punchline without repeating the gag.","Dark comedy restraint":"Keep the visual treatment serious and controlled so irony and uncomfortable contrast create the humor.","Parody genre beats":"Use the target genre’s authentic visual grammar, then exaggerate selected conventions for the payoff.","Surreal comedy progression":"Escalate impossible events through coherent visual logic and matter-of-fact reactions."})[flow]||"";}
 function flowProfile(flow,duration){
   const shots=duration>=13?"five to six":duration>=9?"four to five":"three to four";
   return({
     "Let H3 decide":"Choose the clearest shot progression for the idea, varying composition and scale while preserving story geography.",
-    "One continuous shot":"Tell the entire story in one motivated unbroken camera move with purposeful reframing and a clear beginning, escalation and ending.",
+    "One continuous shot":"Tell the entire story as one genuinely unbroken take. Do not subdivide it into timed shots or beats. Camera reframing must happen through visible continuous movement only.",
+    "One continuous shot + midpoint timestamp":"Tell the story as one genuinely unbroken take with exactly one midpoint beat marker for guidance. The marker is not an edit: camera and action must flow through it continuously with no cut.",
+    "No hard cuts":"Use several timed beats connected only through continuous camera movement, occlusion, whip movement, match movement, dissolves or other soft/hidden transitions. Avoid visible hard cuts.",
     "Multiple cinematic shots":`Use ${shots} distinct, action-motivated shots that establish the scene, develop the action, reveal the payoff and land on a final reaction.`,
     "Dynamic action sequence":`Build ${shots} fast, clearly differentiated shots: establish geography, enter low tracking or pursuit, cut to point of view and impact detail, include a reaction or scale shot, then finish with an escalating climax. Use hard cuts motivated by movement; preserve screen direction and never repeat an angle.`,
     "Suspense / thriller buildup":`Build ${shots} progressively tighter shots. Begin with controlled distance, introduce one suspicious detail, alternate subjective point of view with restrained reactions, delay confirmation and finish on a decisive reveal or disturbing implication.`,
@@ -203,7 +210,9 @@ function flowProfile(flow,duration){
   })[flow]||"";
 }
 function shotCount(v){
-  if(v.flow==="One continuous shot")return v.duration>=12?5:v.duration>=8?4:3;
+  if(isTrueContinuousFlow(v))return 1;
+  if(isMidpointContinuousFlow(v))return 2;
+  if(isNoHardCutsFlow(v))return v.duration>=12?5:v.duration>=8?4:3;
   if(v.duration>=13)return 6;
   if(v.duration>=9)return 5;
   return v.duration>=6?4:3;
@@ -219,7 +228,9 @@ function timelineRanges(v){
   return ranges;
 }
 function timelineTemplate(v){
-  const label=v.flow==="One continuous shot"?"BEAT":"SHOT";
+  if(isTrueContinuousFlow(v))return "CONTINUOUS TAKE: Describe the full action from beginning to end as one uninterrupted camera move. Do not add timestamps, shot numbers, beat numbers, cuts or edit points.";
+  if(isMidpointContinuousFlow(v)){const mid=v.duration/2;return `CONTINUOUS TAKE START [${formatTime(0)}]:\nMIDPOINT BEAT [${formatTime(mid)}]:`; }
+  const label=usesBeatLabels(v)?"BEAT":"SHOT";
   return timelineRanges(v).map((r,i)=>`${label} ${i+1} [${formatTime(r[0])}–${formatTime(r[1])}]:`).join("\n");
 }
 function continuityAnchor(v){
@@ -234,9 +245,9 @@ function sanitizeStyleReferences(text){
     .replace(/Tim\s+Burton(?:'s)?/gi,"playfully macabre gothic");
 }
 function fallbackTimeline(v){
-  const ranges=timelineRanges(v),continuous=v.flow==="One continuous shot",flow=effectiveFlow(v),events=storyEvents(v.idea);
-  if(events.length>=3)return eventDrivenTimeline(v,ranges,events,flow,continuous);
-  return eventDrivenTimeline(v,ranges,builtInStoryEvents(v),flow,continuous);
+  const ranges=timelineRanges(v),continuous=isContinuousFlow(v),softNoHardCuts=isNoHardCutsFlow(v),flow=effectiveFlow(v),events=storyEvents(v.idea);
+  if(events.length>=3)return eventDrivenTimeline(v,ranges,events,flow,continuous,softNoHardCuts);
+  return eventDrivenTimeline(v,ranges,builtInStoryEvents(v),flow,continuous,softNoHardCuts);
 }
 function builtInStoryEvents(v){
   if(isClayCafe(v.idea))return[
@@ -323,7 +334,7 @@ function fitEvents(events,count){
 }
 function lowerEventStart(text){return String(text||"").replace(/^(It|The|A|An|He|She|They|We)\b/,word=>word.toLowerCase());}
 function capitalizeEvent(text){return String(text||"").replace(/^(\s*["']?)([a-z])/,(_,prefix,letter)=>prefix+letter.toUpperCase());}
-function eventDrivenTimeline(v,ranges,events,flow,continuous){
+function eventDrivenTimeline(v,ranges,events,flow,continuous,softNoHardCuts=false){
   const fitted=fitEvents(events,ranges.length);
   const grammar=isTutorial(v.idea)?[
     "Open in a personable handheld two-shot with the finished result visible immediately; keep the hook direct to camera and duck the music beneath speech.",
@@ -412,8 +423,11 @@ function eventDrivenTimeline(v,ranges,events,flow,continuous){
   ];
   return ranges.map((r,i)=>{
     const direction=grammar[Math.round(i*(grammar.length-1)/Math.max(1,ranges.length-1))];
-    const transition=continuous?(i===0?"Begin one unbroken camera move; ":"Without cutting, reframe; "):i===0?"":"Cut on the preceding movement; ";
-    return `${continuous?"BEAT":"SHOT"} ${i+1} [${formatTime(r[0])}–${formatTime(r[1])}]: ${transition}${direction} ${finish(capitalizeEvent(fitted[i]))}`;
+    const transition=continuous?(i===0?"Begin one unbroken camera move; ":"Without cutting, continue through visible camera movement; "):softNoHardCuts?(i===0?"Begin smoothly; ":"Transition without a hard cut using continuous motion, occlusion, match movement or another hidden/soft transition; "):i===0?"":"Cut on the preceding movement; ";
+    const label=(continuous||softNoHardCuts)?"BEAT":"SHOT";
+    if(isTrueContinuousFlow(v))return `${transition}${direction} ${finish(capitalizeEvent(fitted[i]))}`;
+    if(isMidpointContinuousFlow(v))return `${i===0?`CONTINUOUS TAKE START [${formatTime(0)}]`:`MIDPOINT BEAT [${formatTime(v.duration/2)}]`}: ${transition}${direction} ${finish(capitalizeEvent(fitted[i]))}`;
+    return `${label} ${i+1} [${formatTime(r[0])}–${formatTime(r[1])}]: ${transition}${direction} ${finish(capitalizeEvent(fitted[i]))}`;
   });
 }
 function shotPlanPrompt(v){
@@ -440,7 +454,7 @@ function directGenerationPrompt(v){
   const mediumRule=mediumSpecificRule(v);
   return `Write one finished, copy-ready MiniMax Hailuo H3 video prompt. Expand the premise into a specific ${v.duration}-second visual story. Output only the prompt. Begin immediately with the visual description; do not add a title, heading or label such as “MiniMax Hailuo H3 Video Prompt.”
 
-Start with a compact paragraph locking the ${v.style} look, characters, wardrobe, location and lighting. The selected visual style is authoritative: preserve its medium, rendering method, materials, palette, lighting and camera language; never replace it with a generic cinematic look or another medium. Complete every exact time range below. Each shot needs a different concrete story event, purposeful framing or camera move, visible performance and synchronized sound. Invent useful actions, props, reactions, cause and effect, and a decisive ending instead of repeating the premise. ${dialogueRule}
+Start with a compact paragraph locking the ${v.style} look, characters, wardrobe, location and lighting. The selected visual style is authoritative: preserve its medium, rendering method, materials, palette, lighting and camera language; never replace it with a generic cinematic look or another medium. ${isTrueContinuousFlow(v)?"Write the entire clip as one uninterrupted take with no timestamps, shot numbers, beat numbers, cuts or edit points. Camera changes must be achieved only through visible continuous movement and reframing.":isMidpointContinuousFlow(v)?"Write one uninterrupted take with exactly one midpoint timing marker. The midpoint is only a story guidance marker and must not cause any cut or discontinuity.":isNoHardCutsFlow(v)?"Complete every timed beat below, but connect beats without visible hard cuts; use continuous movement, occlusion, match movement, whip movement, dissolves or other soft/hidden transitions.":"Complete every exact time range below. Each shot needs a different concrete story event, purposeful framing or camera move, visible performance and synchronized sound."} Invent useful actions, props, reactions, cause and effect, and a decisive ending instead of repeating the premise. ${dialogueRule}
 
 ${mediumRule?`${mediumRule} This medium lock overrides any incompatible camera or shot-flow selection.`:""}
 
@@ -545,16 +559,19 @@ function formatPlannedDialogue(line){
   return match?`${match[1].trim()} says, “${match[2].trim().replace(/^[“"]|[”"]$/g,"")}”`:`A visible speaker says, “${cleanLine}”`;
 }
 function renderShotPlan(v,plan){
-  const camera=v.camera==="Automatic cinematic camera"?automaticCamera(v):finish(v.camera),continuous=v.flow==="One continuous shot";
+  const camera=v.camera==="Automatic cinematic camera"?automaticCamera(v):finish(v.camera),continuous=isContinuousFlow(v),softNoHardCuts=isNoHardCutsFlow(v);
   const lines=[`${v.duration}-second ${v.ratio} ${v.resolution} ${v.style.toLowerCase()} video. ${styleProfile(v.style)} ${continuityAnchor(v)} CONTINUITY: ${finish(plan.continuity)}`];
   timelineRanges(v).forEach((range,index)=>{
-    const shot=plan.shots[index],dialogue=normalizeDialogue(shot.dialogue).map(formatPlannedDialogue).join(" "),transition=continuous?(index?"Without cutting, transition through visible camera movement. ":"Begin one unbroken take. "):(index?"Cut on motivated movement. ":"Open on this shot. ");
-    lines.push(`${continuous?"BEAT":"SHOT"} ${index+1} [${formatTime(range[0])}–${formatTime(range[1])}]: ${transition}${finish(shot.camera)} ${finish(shot.action)}${dialogue?` ${dialogue}`:""}${v.soundEnabled?` Sound: ${finish(shot.sound)}`:" Sound: complete silence."}`);
+    const shot=plan.shots[index],dialogue=normalizeDialogue(shot.dialogue).map(formatPlannedDialogue).join(" "),transition=continuous?(index?"Without cutting, continue through visible camera movement. ":"Begin one unbroken take. "):softNoHardCuts?(index?"Use a soft or hidden transition with no hard cut. ":"Begin smoothly. "):(index?"Cut on motivated movement. ":"Open on this shot. ");
+    const body=`${transition}${finish(shot.camera)} ${finish(shot.action)}${dialogue?` ${dialogue}`:""}${v.soundEnabled?` Sound: ${finish(shot.sound)}`:" Sound: complete silence."}`;
+    if(isTrueContinuousFlow(v))lines.push(body);
+    else if(isMidpointContinuousFlow(v))lines.push(`${index===0?`CONTINUOUS TAKE START [${formatTime(0)}]`:`MIDPOINT BEAT [${formatTime(v.duration/2)}]`}: ${body}`);
+    else lines.push(`${softNoHardCuts?"BEAT":"SHOT"} ${index+1} [${formatTime(range[0])}–${formatTime(range[1])}]: ${body}`);
   });
   if(v.referenceEnabled)lines.push(`REFERENCE LOCK: The supplied image defines the subject's appearance${v.referenceLock?`, including ${v.referenceLock}`:""}; preserve that exact design, proportions, colors and identity in every shot.`);
   if(v.dialogue)lines.push(`DIALOGUE LOCK: Preserve the user's exact requested wording and speaker assignment: ${finish(v.dialogue)}`);
   const audio=v.soundEnabled?(v.sound?finish(v.sound):"native stereo ambience, tactile close-up effects and reactions synchronized exactly to their visible source"):"complete silence";
-  lines.push(`FINAL QUALITY LOCK: ${camera} Preserve subject identity, wardrobe, environment geography, screen direction, lighting logic and story progression across every cut. Use believable weight, inertia, contact, occlusion and cause-and-effect motion. Sound treatment: ${finish(audio)} No continuity jumps, duplicated anatomy, accidental extra subjects, unreadable action, dialogue placeholders or generic filler imagery.${v.avoid?` Exclude ${finish(v.avoid)}`:""}`);
+  lines.push(`FINAL QUALITY LOCK: ${camera} Preserve subject identity, wardrobe, environment geography, screen direction, lighting logic and story progression throughout the entire clip. Use believable weight, inertia, contact, occlusion and cause-and-effect motion. Sound treatment: ${finish(audio)} No continuity jumps, duplicated anatomy, accidental extra subjects, unreadable action, dialogue placeholders or generic filler imagery.${v.avoid?` Exclude ${finish(v.avoid)}`:""}`);
   return lines.join("\n\n").slice(0,12000);
 }
 function plannerPrompt(v){
@@ -562,7 +579,7 @@ function plannerPrompt(v){
   const dialogueRule=dialogueRequested(v)?"DIALOGUE IS MANDATORY. Write the actual concise words spoken inside the timed shots, in quotation marks, and identify the visible speaker for every line. If the user asks people to explain something but does not supply exact wording, invent natural, specific lines that perform the explanation. Never substitute phrases such as ‘talks about,’ ‘explains the process,’ ‘voiceover continues,’ or ‘full dialogue here.’ Preserve every requested speaker and let them visibly take turns.":"Do not invent dialogue unless it materially helps the supplied idea.";
   return `You are a visual storyteller writing one finished, copy-ready prompt for MiniMax Hailuo H3. The user's text is a STORY SEED, not the finished prompt. Invent the actual on-screen story and exploit H3's strengths in multi-shot sequencing, expressive motion, camera control, physical interaction, continuity and synchronized native stereo sound.
 
-OUTPUT ONLY THE FINISHED VIDEO PROMPT. Start with one compact OVERALL LOOK AND CONTINUITY paragraph defining format, stable subject appearance, environment geography, lighting direction and style-specific art direction. Then reproduce every line of the supplied timeline below and complete it. Times are mandatory and immutable: they must begin at 0:00.0, remain contiguous without gaps or overlaps, and end at exactly ${formatTime(v.duration)}. Each segment must describe a distinct visible event, shot scale or lens perspective, motivated camera movement, transition, physical motion, performance or expression, style-specific lighting, and synchronized sound. Every cut needs a different visual purpose; do not repeat an angle. Preserve screen direction and cause-and-effect action across cuts. ${v.flow==="One continuous shot"?"This is one unbroken take: use the timed BEAT labels, never cut, and connect every reframe through visible camera movement.":"Use the SHOT labels and make every edit concrete."}
+OUTPUT ONLY THE FINISHED VIDEO PROMPT. Start with one compact OVERALL LOOK AND CONTINUITY paragraph defining format, stable subject appearance, environment geography, lighting direction and style-specific art direction. ${isTrueContinuousFlow(v)?"Then write the complete action as one uninterrupted take. Do not use timestamps, SHOT labels, BEAT labels, cut instructions or edit points anywhere. The camera may pan, track, orbit, crane, push, pull, rack focus or reframe, but all changes must happen visibly and continuously in the same take.":isMidpointContinuousFlow(v)?`Then use exactly the two supplied continuous-take guide lines: one at 0:00.0 and one midpoint marker at ${formatTime(v.duration/2)}. Do not add any other timestamps. The midpoint is NOT a cut; action and camera motion must pass through it seamlessly.`:isNoHardCutsFlow(v)?"Then reproduce every supplied timed BEAT and complete it. Times are mandatory and immutable. These are pacing beats, not hard edits: connect them through visible camera movement, occlusion, match movement, whip movement, dissolves or other soft/hidden transitions. Never write a hard cut.":`Then reproduce every line of the supplied timeline below and complete it. Times are mandatory and immutable: they must begin at 0:00.0, remain contiguous without gaps or overlaps, and end at exactly ${formatTime(v.duration)}. Each segment must describe a distinct visible event, shot scale or lens perspective, motivated camera movement, transition, physical motion, performance or expression, style-specific lighting, and synchronized sound. Every cut needs a different visual purpose; do not repeat an angle. Preserve screen direction and cause-and-effect action across cuts. Use the SHOT labels and make every edit concrete.`}
 
 ${dialogueRule}
 
@@ -571,7 +588,7 @@ End with one FINAL QUALITY LOCK paragraph covering identity, wardrobe, anatomy, 
 MANDATORY TIMELINE TO COMPLETE
 ${timelineTemplate(v)}
 
-QUALITY TEST: Several concrete story events must be newly invented from the seed. The result is invalid if any time range is missing, altered, generic, or left empty.
+QUALITY TEST: Several concrete story events must be newly invented from the seed. ${isTrueContinuousFlow(v)?"The result is invalid if it contains timestamps, shot/beat numbering, or any cut/edit instruction.":isMidpointContinuousFlow(v)?"The result is invalid if it contains more than the single required midpoint marker or treats that marker as a cut.":"The result is invalid if any required time range is missing, altered, generic, or left empty."}
 
 USER SETTINGS
 ${JSON.stringify(creativeBrief,null,2)}`;
