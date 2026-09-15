@@ -859,7 +859,14 @@ class MainWindow(QMainWindow):
         self.ref_images = RefList("Reference images (max 9)", "Images (*.png *.jpg *.jpeg *.webp *.bmp)", 9)
         self.ref_videos = RefList("Reference videos (max 3; soundtrack extracted when present)", "Video (*.mp4 *.mov *.mkv *.webm *.avi)", 3)
         self.ref_audios = RefList("Standalone reference audio (max 3)", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg)", 3)
-        rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios); v.addWidget(self.ref_group)
+        self.lock_source_audio = QCheckBox("Use Audio 1 as exact source / output")
+        self.lock_source_audio.setChecked(False)
+        self.lock_source_audio.setToolTip(
+            "OFF: all standalone audio files are used as normal Ref2VA references so MiniMax can reinterpret or regenerate audio. "
+            "ON: Audio 1 is encoded into H3's target audio latent and locked during denoising, so the video follows the exact real timing while the untouched Audio 1 file is used in the final output. "
+            "Additional audio files, if any, stay normal references."
+        )
+        rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios); rfl.addWidget(self.lock_source_audio); v.addWidget(self.ref_group)
 
         loras = QGroupBox("LoRA adapters (up to 3)"); lf = QFormLayout(loras)
         lnote = QLabel(f"Optional MiniMax H3 diffusion-model LoRAs. Browse starts in {DEFAULT_LORA_DIR}. Files from any other folder can also be selected. Strength 1.0 = normal; 0 disables that slot.")
@@ -2527,6 +2534,10 @@ class MainWindow(QMainWindow):
         self.ref_images.setToolTip("Ref2VA reference images. MiniMax H3 supports up to 9 images.")
         self.ref_videos.setToolTip("Ref2VA reference videos. MiniMax H3 supports up to 3 videos.")
         self.ref_audios.setToolTip("Ref2VA standalone audio references. MiniMax H3 supports up to 3 audio files.")
+        self.lock_source_audio.setToolTip(
+            "OFF: all standalone audio files are used as normal Ref2VA references. "
+            "ON: Audio slot 1 becomes the exact source/output track while still helping drive the video timing."
+        )
         self.cfg.setToolTip("Classifier-free guidance strength used by the sampler. Default: 1.0.")
         self.shift.setToolTip("Video timestep/sigma shift. Validated starting value for this install: 12.")
         self.audio_shift.setToolTip("Audio timestep/sigma shift. Validated starting value for this install: 3.")
@@ -2758,7 +2769,7 @@ class MainWindow(QMainWindow):
             "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(),
-            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
+            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "lock_source_audio": self.lock_source_audio.isChecked(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
@@ -2798,7 +2809,7 @@ class MainWindow(QMainWindow):
             self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", "")); self.continue_video.edit.setText(d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self._sync_continue_video_options()
-            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", []))
+            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
             old_output = d.get("output", "")
@@ -3320,7 +3331,13 @@ class MainWindow(QMainWindow):
             args += ["--ref-image-size",self.ref_size.currentText()]
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
-            for pth in self.ref_audios.paths(): args += ["--ref-audio",pth]
+            ref_audios = self.ref_audios.paths()
+            for pth in ref_audios: args += ["--ref-audio",pth]
+            if self.lock_source_audio.isChecked():
+                if not ref_audios:
+                    QMessageBox.warning(self, "Source audio required", "Use Audio 1 as exact source / output needs at least one standalone audio file in Audio slot 1.")
+                    return
+                args += ["--lock-source-audio-index", "1"]
         args += self.model_override_args(mode)
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():

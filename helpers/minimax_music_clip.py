@@ -1928,6 +1928,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             "--shift", str(project.shift), "--audio-shift", str(project.audio_shift),
             "--ref-image-size", project.ref_image_size,
             "--ref-audio", str(audio_chunk),
+            "--lock-source-audio-index", "1",
             "--output", str(out_path),
         ]
         if project.use_hybrid_model:
@@ -3338,6 +3339,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "--shift", str(self.project.shift), "--audio-shift", str(self.project.audio_shift),
             "--ref-image-size", self.project.ref_image_size,
             "--ref-audio", str(audio_chunk),
+            "--lock-source-audio-index", "1",
             "--output", str(out_path),
         ]
         if self.project.use_hybrid_model:
