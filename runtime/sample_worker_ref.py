@@ -136,6 +136,7 @@ def main():
     for n in ('cfg','shift','audio-shift'): ap.add_argument('--'+n,type=float,required=True)
     ap.add_argument('--sampler',default='euler'); ap.add_argument('--scheduler',default='simple'); ap.add_argument('--ref-image-size',choices=['match','max'],default='match')
     ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
+    ap.add_argument('--lock-source-audio-index', type=int, default=0, help='1-based standalone --ref-audio slot to use as the target H3 audio latent with denoise mask 0. 0 keeps normal Ref2VA audio generation.')
     ap.add_argument('--ref-audio-subject', action='append', type=int, default=[], help='Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic.')
     ap.add_argument('--lora',action='append',default=[]); ap.add_argument('--lora-strength',action='append',type=float,default=[])
     ap.add_argument('--extended-logging', action='store_true')
@@ -220,8 +221,12 @@ def main():
             ref_items.append({'type':'video','data':qwen,'timestamps':timestamps})
             ref_blocks.append({'kind':'video_audio' if at else 'video','latent_t':z.shape[2],'latent_h':ch//16,'latent_w':cw//16,'ref_audio_t':at,'latent':z,'audio_latent':az})
         voice_prompt_lines = []
+        locked_source_audio = None
         for standalone_i, path in enumerate(ns.ref_audio[:3]):
             az,at=encode_audio(avae,load_audio(path)); az=_cpu_latent(az); ref_items.append({'type':'audio'}); ref_blocks.append({'kind':'audio','ref_audio_t':at,'audio_latent':az})
+            if ns.lock_source_audio_index == standalone_i + 1:
+                locked_source_audio = az.clone()
+                print(f"Locked source audio selected: standalone slot {standalone_i + 1} | {Path(path).name} | encoded latent steps={at}", flush=True)
             # Audio tags are assigned in native ref_items order. Reference-video
             # soundtracks may already have consumed <Audio n> slots, so resolve
             # the index only after this standalone item is appended.
@@ -230,6 +235,32 @@ def main():
             if 1 <= int(subject_n) <= 9:
                 voice_prompt_lines.append(f"<Audio {audio_index}> is the voice timbre reference for <Subject {int(subject_n)}>." )
                 print(f"Voice reference mapping: {Path(path).name} -> <Audio {audio_index}> -> <Subject {int(subject_n)}>", flush=True)
+    if ns.lock_source_audio_index:
+        if not (1 <= ns.lock_source_audio_index <= min(3, len(ns.ref_audio))):
+            raise ValueError(f'--lock-source-audio-index {ns.lock_source_audio_index} does not refer to a supplied standalone --ref-audio slot')
+        if locked_source_audio is None:
+            raise RuntimeError('Locked source audio was requested but no encoded source latent was produced')
+        video_target, audio_template = latent['samples'].unbind()
+        target_t = int(audio_template.shape[-1])
+        source_t = int(locked_source_audio.shape[-1])
+        if source_t > target_t:
+            locked_source_audio = locked_source_audio[..., :target_t]
+            print(f'Locked source audio fit: cropped latent timeline {source_t} -> {target_t} steps.', flush=True)
+        elif source_t < target_t:
+            pad_shape = list(locked_source_audio.shape)
+            pad_shape[-1] = target_t - source_t
+            locked_source_audio = torch.cat((locked_source_audio, torch.zeros(pad_shape, dtype=locked_source_audio.dtype)), dim=-1)
+            print(f'Locked source audio fit: zero-padded latent timeline {source_t} -> {target_t} steps.', flush=True)
+        target_device = audio_template.device
+        locked_source_audio = locked_source_audio.to(device=target_device, dtype=audio_template.dtype)
+        latent['samples'] = comfy.nested_tensor.NestedTensor((video_target, locked_source_audio))
+        # Nested denoise mask: video=1 means generate normally; audio=0 means keep
+        # the encoded source audio latent fixed while H3 jointly attends to it.
+        latent['noise_mask'] = comfy.nested_tensor.NestedTensor((
+            torch.ones_like(video_target),
+            torch.zeros_like(locked_source_audio),
+        ))
+        print(f'Locked source audio ACTIVE | target audio latent={tuple(locked_source_audio.shape)} | denoise mask=0 | video denoise mask=1', flush=True)
     del avae,video_data; _flush_models()
     if ns.extended_logging: log_mem('after Ref2VA audio reference encode / VAE flush', sync=True)
     if manager is not None: manager.set_stage('text')
@@ -313,7 +344,7 @@ def main():
             use_int8_pv=False,
             engine='comfy_kitchen',
         )
-        print('[SLA] enabled | tested preset | sparsity=0.85 | block=32 | min_seq_len=12288 | dense_last_steps=1 | dense_steps=1 | protect_audio=ON | ref_protection=Off | dense_backend=comfy_kitchen | engine=comfy_kitchen', flush=True)
+        print('[SLA] enabled | screenshot preset | sparsity=0.85 | block=32 | min_seq_len=12288 | dense_last_steps=1 | dense_steps=1 | protect_audio=ON | ref_protection=Off | dense_backend=comfy_kitchen | engine=comfy_kitchen', flush=True)
     spectrum = None
     if ns.spectrum:
         from runtime.h3_spectrum import MiniMaxH3Spectrum, MIN_FIT_POINTS
