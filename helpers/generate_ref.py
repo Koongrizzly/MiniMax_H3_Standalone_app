@@ -28,10 +28,10 @@ from runtime.ffmpeg_tools import ensure_ffmpeg_tools, tool_path
 
 def main():
     ap = argparse.ArgumentParser(description="MiniMax-H3 Ref2VA W4A8 standalone generator")
-    ap.add_argument("--prompt", required=True); ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=448)
-    ap.add_argument("--frames", type=int, default=124); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
-    ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0); ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
-    ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--ref-audio-subject", action="append", type=int, default=[], help="Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic."); ap.add_argument("--output")
+    ap.add_argument("--prompt", required=True); ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
+    ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0); ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="beta")
+    ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--ref-audio-subject", action="append", type=int, default=[], help="Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic."); ap.add_argument("--lock-source-audio-index", type=int, default=0, help="1-based standalone ref-audio slot to lock as the target H3 audio and mux unchanged to the result"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
     ap.add_argument("--extended-logging", action="store_true")
@@ -43,7 +43,7 @@ def main():
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
     ap.add_argument("--sage-attention", action="store_true", help="Use SageAttention for the sampling worker")
     ap.add_argument("--sol-attention", action="store_true", help="Use vendored Sol-Attn for eligible MiniMax H3 attention; falls back to existing attention otherwise")
-    ap.add_argument("--sla-attention", action="store_true", help="Enable MiniMax H3 SLA block-sparse attention with the tested 0.85 preset")
+    ap.add_argument("--sla-attention", action="store_true", help="Enable MiniMax H3 SLA block-sparse attention with the screenshot preset")
     ap.add_argument("--disable-comfy-kitchen", action="store_true", help="Disable Comfy Kitchen quantized W4A8 / ConvRot acceleration for worker processes")
     ap.add_argument("--vram-residency-engine", choices=["static", "dynamic"], default="static")
     ap.add_argument("--vram-runtime-free-gb", type=float, default=0.5)
@@ -61,18 +61,6 @@ def main():
     ap.add_argument("--vram-residency-refill-interval", type=int, default=1)
     ap.add_argument("--vram-keep-text-encoder", action="store_true")
     ns = ap.parse_args()
-    # SLA and the standalone Sol attention override both own the same H3 attention path.
-    # When both are selected, SLA owns this job so Sol cannot intercept it first.
-    if ns.sla_attention and ns.sol_attention:
-        ns.sol_attention = False
-        print("[SLA] Sol-Attn suppressed for this job because SLA Attention is enabled.", flush=True)
-    if ns.sla_attention:
-        if ns.disable_comfy_kitchen:
-            print("[SLA] ERROR: SLA requires Comfy Kitchen; turn Comfy Kitchen on.", flush=True)
-            return 2
-        from runtime.sla_backend import ensure_comfy_kitchen_sla_backend
-        if not ensure_comfy_kitchen_sla_backend(auto_upgrade=True):
-            return 2
     # Sol-Attn is read by the vendored H3 model inside the isolated sampling
     # worker. Keep it process-local so VAE/text helper workers are unaffected.
     if ns.sol_attention:
@@ -117,6 +105,36 @@ def main():
         fl2va_path=ns.fl2va_checkpoint, ref2va_path=ns.ref2va_checkpoint,
         text_encoder_path=ns.text_encoder, video_vae_path=ns.video_vae, audio_vae_path=ns.audio_vae,
     )
+    # Explicit experimental ConvRot/hybrid diffusion overrides are allowed to reach
+    # Comfy's real diffusion loader.  validate_models.py was written around the
+    # stock W4A8 checkpoint signatures and can reject newer INT8/hybrid layouts
+    # before comfy.sd.load_diffusion_model() gets a chance to inspect them.
+    # Keep every non-diffusion validation error intact; this bypass applies only
+    # to a user-selected .safetensors diffusion checkpoint with a recognized
+    # experimental/quantized filename.
+    override_raw = ns.ref2va_checkpoint
+    override_path = Path(override_raw).expanduser() if override_raw else None
+    override_name = override_path.name.lower() if override_path else ""
+    allow_loader_probe = bool(
+        override_path
+        and override_path.is_file()
+        and override_path.suffix.lower() == ".safetensors"
+        and any(tag in override_name for tag in ("int8", "hybrid", "convrot", "partial"))
+    )
+    if errors and allow_loader_probe:
+        diffusion_errors = [e for e in errors if str(e).startswith("Ref2VA model:")]
+        other_errors = [e for e in errors if not str(e).startswith("Ref2VA model:")]
+        if diffusion_errors and not other_errors:
+            print(
+                "[MODEL] Experimental diffusion override: validator rejection bypassed; "
+                "passing checkpoint to Comfy diffusion loader for authoritative compatibility test.",
+                flush=True,
+            )
+            for e in diffusion_errors:
+                print("[MODEL] Validator note:", e, flush=True)
+            ref = override_path
+            errors = []
+
     if errors:
         print("Model validation failed before generation:")
         for e in errors: print(" -", e)
@@ -148,6 +166,7 @@ def main():
             ref_video_count=len(ns.ref_video),
             ref_audio_count=len(ns.ref_audio),
             ref_image_size=ns.ref_image_size,
+            diffusion_model_path=ref,
         )
         print_vram_stage_decisions(stage_plan, ns.width, ns.height, ns.frames)
         managed_sample_stages = [x for x in ("reference", "text", "diffusion") if stage_plan["stages"][x]["use_manager"]]
@@ -215,6 +234,11 @@ def main():
             cmd += ["--ref-audio", str(Path(p).resolve())]
             subject_n = ns.ref_audio_subject[i] if i < len(ns.ref_audio_subject) else 0
             cmd += ["--ref-audio-subject", str(subject_n)]
+        if ns.lock_source_audio_index:
+            if not (1 <= ns.lock_source_audio_index <= min(3, len(ns.ref_audio))):
+                raise ValueError(f"--lock-source-audio-index {ns.lock_source_audio_index} does not refer to a supplied --ref-audio")
+            cmd += ["--lock-source-audio-index", str(ns.lock_source_audio_index)]
+            print(f"Source-audio lock requested: standalone audio slot {ns.lock_source_audio_index}", flush=True)
         subprocess.check_call(cmd, cwd=ROOT, env=sample_env)
         print("Sampling process exited completely. Starting VAE with clean memory...", flush=True)
 
@@ -251,11 +275,18 @@ def main():
             ae["H3_COMFY_ARGS"] = f"--novram --reserve-vram {max(0.1, ns.vram_audio_vae_reserve_gb):g}"
             if ns.vram_manager_auto: print("[VRAM-AUTO] audio VAE decode launching MANAGED (--novram)", flush=True)
         try:
-            audio_cmd = [py, "-m", "runtime.audio_decode_worker", "--latents", str(lat), "--vae", str(av), "--wav", str(wav)]
-            if ns.extended_logging: audio_cmd += ["--extended-logging"]
-            subprocess.check_call(audio_cmd, cwd=ROOT, env=ae)
-            print('Muxing video and audio...', flush=True)
-            tmp = td / "mux.mp4"; subprocess.check_call([ff, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k", "-shortest", str(tmp)])
+            if ns.lock_source_audio_index:
+                # The source waveform is authoritative. H3 already saw its encoded latent
+                # during sampling; mux the untouched source file instead of a VAE round-trip.
+                mux_audio = str(Path(ns.ref_audio[ns.lock_source_audio_index - 1]).resolve())
+                print(f'Muxing video with untouched locked source audio: {mux_audio}', flush=True)
+            else:
+                audio_cmd = [py, "-m", "runtime.audio_decode_worker", "--latents", str(lat), "--vae", str(av), "--wav", str(wav)]
+                if ns.extended_logging: audio_cmd += ["--extended-logging"]
+                subprocess.check_call(audio_cmd, cwd=ROOT, env=ae)
+                mux_audio = str(wav)
+                print('Muxing video and generated audio...', flush=True)
+            tmp = td / "mux.mp4"; subprocess.check_call([ff, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", mux_audio, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k", "-shortest", str(tmp)])
             if out.exists(): out.unlink()
             shutil.move(str(tmp), str(out)); audio_ok = True
         except subprocess.CalledProcessError:

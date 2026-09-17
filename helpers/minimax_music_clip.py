@@ -16,8 +16,8 @@ Design rules:
 - The original full song is muxed back at final assembly; generated clip audio is not used
   as the final soundtrack.
 
-This first helper intentionally does not import the old LTX Music Clip Creator. It keeps a
-small project JSON and calls the existing helpers/generate_ref.py backend.
+This standalone helper keeps each real job as a persistent reopenable project and calls the
+existing helpers/generate_ref.py backend.
 """
 
 import json
@@ -36,7 +36,9 @@ import tempfile
 import urllib.request
 import zipfile
 import time
+import uuid
 import wave
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -91,6 +93,10 @@ HELPERS_DIR = ROOT / "helpers"
 OUTPUT_ROOT = ROOT / "output" / "minimax_music_clips"
 SETTINGS_PATH = ROOT / "presets" / "minimax_music_clip_settings.json"
 AUTOSAVE_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip.json"
+PROJECT_MANIFEST_NAME = "minimax_music_project.json"
+PROJECT_MARKER_NAME = ".minimax_music_project.json"
+PROJECT_ASSETS_DIRNAME = "project_assets"
+_PROJECT_MANIFEST_LOCK = threading.Lock()
 WHISPER_DIR = ROOT / "presets" / "bin" / "whisper"
 WHISPER_MODEL = WHISPER_DIR / "ggml-small.bin"
 WHISPER_RUNTIME_ZIP = WHISPER_DIR / "_whisper_runtime.zip"
@@ -121,6 +127,203 @@ def _music_project_identity(title: str, audio_path: str) -> str:
     if not title_key and not audio_key:
         return ""
     return hashlib.sha1((title_key + "\n" + audio_key).encode("utf-8", "ignore")).hexdigest()
+
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _safe_asset_name(index: int, path: str) -> str:
+    src = Path(path)
+    stem = _safe_stem(src.stem) or f"asset_{index:03d}"
+    suffix = src.suffix.lower() or ".bin"
+    return f"{index:03d}_{stem}{suffix}"
+
+
+def _copy_project_asset(source: str | Path, destination: Path) -> str:
+    """Keep a project-local snapshot without changing the live source path."""
+    try:
+        src = Path(source).expanduser().resolve()
+        if not src.is_file():
+            return ""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if src == destination.resolve():
+                return str(destination)
+        except Exception:
+            pass
+        need_copy = not destination.is_file()
+        if not need_copy:
+            try:
+                ss, ds = src.stat(), destination.stat()
+                need_copy = ss.st_size != ds.st_size or ss.st_mtime_ns > ds.st_mtime_ns
+            except Exception:
+                need_copy = False
+        if need_copy:
+            shutil.copy2(src, destination)
+        return str(destination)
+    except Exception:
+        return ""
+
+
+def _project_manifest_path(project: "MusicProject") -> Optional[Path]:
+    try:
+        out_dir = Path(str(project.output_dir or "")).expanduser()
+        if not project.output_identity or not str(out_dir) or out_dir.resolve() == OUTPUT_ROOT.resolve():
+            return None
+        return out_dir.resolve() / PROJECT_MANIFEST_NAME
+    except Exception:
+        return None
+
+
+def _persist_project_manifest(project: "MusicProject", snapshot_assets: bool = True) -> Optional[Path]:
+    """Atomically persist the complete reopenable job state inside the job folder."""
+    manifest = _project_manifest_path(project)
+    if manifest is None:
+        return None
+    try:
+        out_dir = manifest.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not project.project_id:
+            project.project_id = uuid.uuid4().hex
+        if not project.created_at:
+            project.created_at = _utc_now_iso()
+        project.updated_at = _utc_now_iso()
+
+        assets = {"master_audio": {}, "references": [], "audio_chunks_dir": "audio_chunks", "prompt_files": {}}
+        assets_root = out_dir / PROJECT_ASSETS_DIRNAME
+        if snapshot_assets:
+            audio_src = str(project.audio_path or "")
+            if audio_src and Path(audio_src).is_file():
+                suffix = Path(audio_src).suffix.lower() or ".audio"
+                local_audio = assets_root / f"master_track{suffix}"
+                copied = _copy_project_asset(audio_src, local_audio)
+                assets["master_audio"] = {
+                    "source": audio_src,
+                    "snapshot": str(local_audio.relative_to(out_dir)) if copied else "",
+                }
+            refs_dir = assets_root / "references"
+            for idx, ref in enumerate(project.references, start=1):
+                src = str(ref.path or "")
+                local = refs_dir / _safe_asset_name(idx, src or ref.name)
+                copied = _copy_project_asset(src, local) if src else ""
+                assets["references"].append({
+                    "name": ref.name,
+                    "source": src,
+                    "snapshot": str(local.relative_to(out_dir)) if copied else "",
+                })
+        else:
+            try:
+                if manifest.is_file():
+                    old = json.loads(_read_text_tolerant(manifest))
+                    if isinstance(old.get("assets"), dict):
+                        assets = old["assets"]
+            except Exception:
+                pass
+
+        raw_dir = out_dir / "raw_clips"
+        if raw_dir.is_dir():
+            for shot in project.shots:
+                prompt_file = raw_dir / f"shot_{shot.index:03d}_prompt.txt"
+                if prompt_file.is_file():
+                    assets.setdefault("prompt_files", {})[str(shot.index)] = str(prompt_file.relative_to(out_dir))
+                    if not getattr(shot, "generation_prompt", ""):
+                        try:
+                            shot.generation_prompt = _read_text_tolerant(prompt_file)
+                        except Exception:
+                            pass
+
+        payload = {
+            "manifest_version": 1,
+            "project_id": project.project_id,
+            "identity": project.output_identity,
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+            "project": asdict(project),
+            "assets": assets,
+        }
+        with _PROJECT_MANIFEST_LOCK:
+            tmp = manifest.with_suffix(manifest.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(manifest))
+            marker = out_dir / PROJECT_MARKER_NAME
+            marker.write_text(json.dumps({
+                "identity": project.output_identity,
+                "project_id": project.project_id,
+                "title": project.title,
+                "audio_path": project.audio_path,
+                "manifest": PROJECT_MANIFEST_NAME,
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
+        return manifest
+    except Exception:
+        return None
+
+
+def _load_project_manifest(job_dir: Path) -> tuple["MusicProject", Path]:
+    """Load a persistent job folder and repair moved asset/output paths."""
+    job_dir = job_dir.expanduser().resolve()
+    manifest = job_dir / PROJECT_MANIFEST_NAME
+    if not manifest.is_file():
+        parent_candidate = job_dir.parent / PROJECT_MANIFEST_NAME
+        if parent_candidate.is_file():
+            job_dir, manifest = job_dir.parent, parent_candidate
+    if not manifest.is_file():
+        legacy = job_dir / PROJECT_MARKER_NAME
+        if legacy.is_file():
+            raise RuntimeError(
+                "This is a legacy MiniMax music job. It only has the old identity marker and no full project snapshot. "
+                "New jobs created with this version are reopenable automatically."
+            )
+        raise RuntimeError(f"No {PROJECT_MANIFEST_NAME} was found in the selected job folder.")
+
+    data = json.loads(_read_text_tolerant(manifest))
+    project_data = data.get("project") if isinstance(data.get("project"), dict) else data
+    project = MiniMaxMusicClipWidget._project_from_dict(project_data)
+    project.project_id = str(data.get("project_id") or project.project_id or uuid.uuid4().hex)
+    project.created_at = str(data.get("created_at") or project.created_at or "")
+    project.updated_at = str(data.get("updated_at") or project.updated_at or "")
+    project.output_dir = str(job_dir)
+
+    assets = data.get("assets") if isinstance(data.get("assets"), dict) else {}
+    master = assets.get("master_audio") if isinstance(assets.get("master_audio"), dict) else {}
+    if not Path(str(project.audio_path or "")).is_file():
+        rel = str(master.get("snapshot") or "")
+        local = job_dir / rel if rel else None
+        if local is not None and local.is_file():
+            project.audio_path = str(local.resolve())
+
+    ref_meta = assets.get("references") if isinstance(assets.get("references"), list) else []
+    by_name = {str(x.get("name") or ""): x for x in ref_meta if isinstance(x, dict)}
+    for ref in project.references:
+        if Path(str(ref.path or "")).is_file():
+            continue
+        meta = by_name.get(ref.name, {})
+        rel = str(meta.get("snapshot") or "") if isinstance(meta, dict) else ""
+        local = job_dir / rel if rel else None
+        if local is not None and local.is_file():
+            ref.path = str(local.resolve())
+
+    raw_dir = job_dir / "raw_clips"
+    if raw_dir.is_dir():
+        for shot in project.shots:
+            if not (shot.output_path and Path(shot.output_path).is_file()):
+                preferred = raw_dir / f"shot_{shot.index:03d}.mp4"
+                if preferred.is_file():
+                    shot.output_path = str(preferred.resolve())
+                    shot.status = "Generated"
+                else:
+                    retries = sorted(raw_dir.glob(f"shot_{shot.index:03d}_retry_*.mp4"), key=lambda x: x.stat().st_mtime_ns, reverse=True)
+                    if retries:
+                        shot.output_path = str(retries[0].resolve())
+                        shot.status = "Generated"
+            prompt_file = raw_dir / f"shot_{shot.index:03d}_prompt.txt"
+            if prompt_file.is_file() and not getattr(shot, "generation_prompt", ""):
+                try:
+                    shot.generation_prompt = _read_text_tolerant(prompt_file)
+                except Exception:
+                    pass
+    return project, manifest
 
 
 def _cleanup_music_clip_temp_artifacts() -> None:
@@ -378,6 +581,7 @@ class MusicShot:
     lyrics: str = ""
     section: str = ""
     prompt: str = ""
+    generation_prompt: str = ""  # exact prompt handed to MiniMax for latest generation
     reference_names: List[str] = field(default_factory=list)
     internal_cuts: List[float] = field(default_factory=list)  # song-absolute seconds
     output_path: str = ""
@@ -395,7 +599,10 @@ class MusicShot:
 
 @dataclass
 class MusicProject:
-    version: int = 1
+    version: int = 2
+    project_id: str = ""
+    created_at: str = ""
+    updated_at: str = ""
     audio_path: str = ""
     output_dir: str = ""
     output_identity: str = ""
@@ -446,6 +653,7 @@ class MusicProject:
     turbo_lora_path: str = ""
     turbo_lora_strength: float = 1.0
     randomize_reference_characters: bool = False
+    unlimited_random_references: bool = False
     reference_random_seed: int = -1
     references: List[ReferenceAsset] = field(default_factory=list)
     lyrics: List[LyricSegment] = field(default_factory=list)
@@ -1407,19 +1615,20 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
 
 
 def _randomized_character_reference_names(project: MusicProject, shot: MusicShot, enabled: Sequence[ReferenceAsset]) -> List[str]:
-    """Return a stable per-shot random character subset when the feature is enabled.
+    """Return a stable per-shot random Character subset.
 
-    Only enabled Character references participate. One to five characters are selected
-    per shot (or fewer when fewer are available). The project-level seed is refreshed
-    when the plan/prompts are rebuilt, then saved with the project so retries keep the
-    same shot-to-reference mapping.
+    Normal random mode keeps the established one-or-two random picks. Unlimited
+    random mode treats the full Character pool as a shuffled deck: references are
+    consumed across clips without repetition until every item has been used, then a
+    new deterministic shuffled round begins. The saved project seed makes rebuilds
+    and retries reproduce the exact same assignment.
     """
     if not bool(getattr(project, "randomize_reference_characters", False)):
         return []
     chars = [r for r in enabled if _normalise_reference_kind(r.kind) == "Character" and r.name]
     if not chars:
         return []
-    max_count = min(5, len(chars))
+    max_count = min(2, len(chars))
     try:
         base_seed = int(getattr(project, "reference_random_seed", -1))
     except Exception:
@@ -1430,24 +1639,55 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
             project.reference_random_seed = int(base_seed)
         except Exception:
             pass
-    rng = random.Random(f"{base_seed}:{int(getattr(shot, 'index', 0) or 0)}:{len(chars)}")
-    count = rng.randint(1, max_count)
+
+    try:
+        shot_index = max(1, int(getattr(shot, "index", 1) or 1))
+    except Exception:
+        shot_index = 1
+
+    # Existing random behavior for the normal <=9-reference mode.
+    if not bool(getattr(project, "unlimited_random_references", False)):
+        rng = random.Random(f"{base_seed}:{shot_index}:{len(chars)}")
+        count = rng.randint(1, max_count)
+        names = [r.name for r in chars]
+        if count >= len(names):
+            rng.shuffle(names)
+            return names
+        return list(rng.sample(names, count))
+
     names = [r.name for r in chars]
-    if count >= len(names):
-        rng.shuffle(names)
-        return names
-    return list(rng.sample(names, count))
+
+    # Determine how many cards all earlier clips consumed. Counts are generated from
+    # per-shot deterministic RNGs so requesting shot N never depends on call order.
+    def count_for(index: int) -> int:
+        if len(names) <= 1:
+            return 1
+        return random.Random(f"{base_seed}:count:{index}:{len(names)}").randint(1, 2)
+
+    offset = sum(count_for(i) for i in range(1, shot_index))
+    count = count_for(shot_index)
+
+    # Build only the rounds needed for this shot. Each round contains every ref once.
+    needed = offset + count
+    stream: List[str] = []
+    round_no = 0
+    while len(stream) < needed:
+        deck = list(names)
+        random.Random(f"{base_seed}:round:{round_no}:{len(names)}").shuffle(deck)
+        stream.extend(deck)
+        round_no += 1
+    return stream[offset:offset + count]
 
 
 def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
-    """Conservative first-pass router with optional per-shot random character refs.
+    """Conservative router with optional random Character references.
 
-    Users can edit the assignment in the shot table. This avoids sending all nine references
-    blindly while still giving the director useful defaults. When random character refs are
-    enabled, one to five Character references are chosen per shot while non-character
-    context (background/style plus explicitly named props/anchors) stays stable.
+    Unlimited random mode may contain any number of source Character refs, but an
+    individual MiniMax Ref2VA shot still receives at most nine total references.
     """
-    enabled = [r for r in project.references if r.enabled and Path(r.path).is_file()]
+    unlimited_pool = bool(getattr(project, "randomize_reference_characters", False) and getattr(project, "unlimited_random_references", False))
+    source_refs = project.references if unlimited_pool else project.references[:9]
+    enabled = [r for r in source_refs if r.enabled and Path(r.path).is_file()]
     randomize_chars = bool(getattr(project, "randomize_reference_characters", False))
     blob = " ".join((shot.prompt, shot.lyrics, project.characters_subjects, project.main_idea)).lower()
     chosen: List[str] = []
@@ -1457,8 +1697,6 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
             if randomize_chars and kind == "Character":
                 continue
             chosen.append(ref.name)
-    # Background/location and style refs are normally project-wide context, so include
-    # them even when the user did not repeat their names in every shot prompt.
     for ref in enabled:
         kind = _normalise_reference_kind(ref.kind)
         if kind in ("Background / Location", "Style / Mood") and ref.name not in chosen:
@@ -1470,8 +1708,6 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
     elif not any(_normalise_reference_kind(r.kind) == "Character" and r.name in chosen for r in enabled):
         chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character"]
         chosen.extend(x for x in chars[:2] if x not in chosen)
-    # Objects/props and picture/composition anchors remain opt-in by name/purpose so an
-    # unrelated prop or storyboard image is not injected into every shot automatically.
     return chosen[:9]
 
 
@@ -1918,6 +2154,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             selected_names = [next(iter(refs_by_name))]
         selected = [refs_by_name[n] for n in selected_names[:9]]
         generation_prompt = build_generation_prompt(project, shot, selected)
+        shot.generation_prompt = generation_prompt
         (raw_dir / f"shot_{shot.index:03d}_prompt.txt").write_text(generation_prompt, encoding="utf-8")
         cmd = [
             str(MINIMAX_PY), "-u", str(GENERATE_REF),
@@ -2034,6 +2271,54 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
     return results
 
 
+def _probe_video_frame_count(path: str) -> int:
+    """Return decoded video-frame count, or 0 when ffprobe cannot provide it."""
+    probe = ffprobe_path()
+    if not probe:
+        return 0
+    cp = subprocess.run(
+        [probe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+         "-show_entries", "stream=nb_read_frames", "-of", "default=nw=1:nk=1", path],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        return max(0, int((cp.stdout or "").strip()))
+    except Exception:
+        return 0
+
+
+def _assembly_frame_plan(project: MusicProject) -> List[Tuple[MusicShot, int]]:
+    """Build one authoritative 24-fps edit timeline for the whole song.
+
+    Each shot uses adjacent absolute frame boundaries instead of independently
+    rounding floating-point durations. That prevents one-frame rounding errors from
+    accumulating across a long music video.
+    """
+    if not project.shots:
+        return []
+    ordered = list(project.shots)
+    plan: List[Tuple[MusicShot, int]] = []
+    previous_boundary = int(round(float(ordered[0].edit_start) * FPS))
+    for pos, shot in enumerate(ordered):
+        start_boundary = int(round(float(shot.edit_start) * FPS))
+        if pos and abs(start_boundary - previous_boundary) > 1:
+            raise RuntimeError(
+                f"Shot timeline is not contiguous at shot {shot.index}: "
+                f"previous boundary={previous_boundary}, start={start_boundary} frames."
+            )
+        end_boundary = int(round(float(shot.edit_end) * FPS))
+        target_frames = end_boundary - previous_boundary
+        if target_frames <= 0:
+            raise RuntimeError(
+                f"Shot {shot.index} has an invalid edit range "
+                f"({shot.edit_start:.6f} -> {shot.edit_end:.6f})."
+            )
+        plan.append((shot, target_frames))
+        previous_boundary = end_boundary
+    return plan
+
+
 def _assembly_task(progress, project: MusicProject) -> str:
     ffmpeg = ffmpeg_path()
     if not ffmpeg:
@@ -2044,71 +2329,109 @@ def _assembly_task(progress, project: MusicProject) -> str:
     if missing:
         raise RuntimeError("Missing generated clips for shots: " + ", ".join(map(str, missing)))
 
+    # One shared frame plan is the sync invariant. Never round each shot duration
+    # independently, because those one-frame errors accumulate across many cuts.
+    frame_plan = _assembly_frame_plan(project)
+    expected_total_frames = sum(frame_count for _shot, frame_count in frame_plan)
+
     out_dir = Path(project.output_dir or OUTPUT_ROOT / _safe_stem(project.audio_path)).resolve()
     temp_dir = out_dir / "_assembly"
     temp_dir.mkdir(parents=True, exist_ok=True)
     trimmed: List[Path] = []
-    for i, shot in enumerate(project.shots, start=1):
-        progress(f"Trimming shot {shot.index} ({i}/{len(project.shots)})...")
+    for i, (shot, target_frames) in enumerate(frame_plan, start=1):
+        progress(
+            f"Trimming shot {shot.index} ({i}/{len(frame_plan)}) - "
+            f"{target_frames} frames @ {FPS} fps..."
+        )
         target = temp_dir / f"trim_{shot.index:03d}.mp4"
-        # tpad makes tiny source-duration mismatches non-fatal; trim then enforces the edit slot.
+
+        # Keep the tested MiniMax audio-context cut point, then normalize to native
+        # 24 fps and take an exact integer number of frames. Playback speed is never
+        # stretched or slowed to repair the finished video.
         vf = (
-            f"tpad=stop_mode=clone:stop_duration=1.0,"
-            f"trim=start={shot.trim_in:.6f}:duration={shot.edit_duration:.6f},"
+            "tpad=stop_mode=clone:stop_duration=1.0,"
+            f"trim=start={shot.trim_in:.6f},"
+            "setpts=PTS-STARTPTS,"
+            f"fps={FPS},"
+            f"trim=start_frame=0:end_frame={target_frames},"
             "setpts=PTS-STARTPTS"
         )
         cmd = [
             ffmpeg, "-y", "-i", shot.output_path, "-an", "-vf", vf,
+            "-r", str(FPS), "-fps_mode", "cfr",
             "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(target),
         ]
-        cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cp = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         if cp.returncode != 0 or not target.is_file():
             raise RuntimeError(f"Could not trim shot {shot.index}:\n" + (cp.stderr or cp.stdout or ""))
+        actual_frames = _probe_video_frame_count(str(target))
+        if actual_frames and actual_frames != target_frames:
+            raise RuntimeError(
+                f"Shot {shot.index} trim produced {actual_frames} frames; "
+                f"the timeline requires {target_frames}. Assembly stopped rather than hiding sync drift."
+            )
         trimmed.append(target)
 
     concat_file = temp_dir / "concat.txt"
-    concat_file.write_text("\n".join("file '" + str(p).replace("'", "'\\''") + "'" for p in trimmed), encoding="utf-8")
+    concat_file.write_text(
+        "\n".join("file '" + str(p).replace("'", "'\\''") + "'" for p in trimmed),
+        encoding="utf-8",
+    )
     video_only = temp_dir / "video_only.mp4"
-    progress("Concatenating trimmed shots...")
+    progress("Concatenating frame-locked shots...")
+
+    # Re-encode the stitch rather than packet-copying dozens of independent MP4
+    # timelines. Every input is already exact CFR 24 fps; this normalizes timestamps
+    # without retiming the footage.
     cp = subprocess.run(
-        [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(video_only)],
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
+        [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
+         "-an", "-r", str(FPS), "-fps_mode", "cfr",
+         "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(video_only)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    if cp.returncode != 0:
-        # Codec-copy concat can fail with odd source headers. Re-encode fallback.
-        cp = subprocess.run(
-            [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-an", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(video_only)],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
     if cp.returncode != 0 or not video_only.is_file():
         raise RuntimeError("Could not concatenate clips:\n" + (cp.stderr or cp.stdout or ""))
 
+    actual_total_frames = _probe_video_frame_count(str(video_only))
+    if actual_total_frames and actual_total_frames != expected_total_frames:
+        raise RuntimeError(
+            f"Assembled timeline produced {actual_total_frames} frames; expected "
+            f"{expected_total_frames}. Assembly stopped rather than stretching the video or masking drift."
+        )
+
+    expected_duration = expected_total_frames / float(FPS)
+    progress(
+        f"Timeline verified: {expected_total_frames} frames @ {FPS} fps "
+        f"({expected_duration:.3f}s). Muxing the untouched master song..."
+    )
     final = out_dir / f"{_safe_stem(project.title or project.audio_path)}_minimax_music_video.mp4"
-    song_duration = project.analysis.duration or probe_duration(project.audio_path)
-    progress("Muxing the original master song...")
     cmd = [
         ffmpeg, "-y", "-i", str(video_only), "-i", project.audio_path,
-        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+        str(final),
     ]
-    if song_duration > 0:
-        cmd += ["-t", f"{song_duration:.6f}"]
-    cmd += [str(final)]
-    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    cp = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     if cp.returncode != 0 or not final.is_file():
         raise RuntimeError("Final mux failed:\n" + (cp.stderr or cp.stdout or ""))
     progress(f"Saved final music video: {final}")
-    # These are disposable project work folders. Keep raw_clips + final output,
-    # but do not accumulate assembly/audio/queue scratch after a successful build.
-    for disposable in (temp_dir, out_dir / "audio_chunks", out_dir / "_queue"):
+
+    # Keep raw clips and WAV chunks as permanent project assets. Only assembly and
+    # queue scratch are disposable after a successful build.
+    for disposable in (temp_dir, out_dir / "_queue"):
         try:
             if disposable.is_dir():
                 shutil.rmtree(disposable, ignore_errors=True)
         except Exception:
             pass
+    _persist_project_manifest(project, snapshot_assets=False)
     return str(final)
 
 
@@ -2244,10 +2567,8 @@ class MiniMaxMusicClipWidget(QWidget):
 
         actions = QHBoxLayout()
         self.btn_new = QPushButton("New project", self.page_project)
-        self.btn_open = QPushButton("Open project...", self.page_project)
-        self.btn_save = QPushButton("Save project", self.page_project)
-        self.btn_save_as = QPushButton("Save project as...", self.page_project)
-        actions.addWidget(self.btn_new); actions.addWidget(self.btn_open); actions.addWidget(self.btn_save); actions.addWidget(self.btn_save_as); actions.addStretch(1)
+        self.btn_open = QPushButton("Load project...", self.page_project)
+        actions.addWidget(self.btn_new); actions.addWidget(self.btn_open); actions.addStretch(1)
         lay.addStretch(1)
         outer.addLayout(actions)
 
@@ -2255,8 +2576,6 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_output.clicked.connect(self._browse_output)
         self.btn_new.clicked.connect(self._new_project)
         self.btn_open.clicked.connect(self._open_project)
-        self.btn_save.clicked.connect(self._save_project)
-        self.btn_save_as.clicked.connect(lambda: self._save_project(force_as=True))
 
     def _build_refs_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_refs)
@@ -2269,11 +2588,19 @@ class MiniMaxMusicClipWidget(QWidget):
         info.setWordWrap(True); lay.addWidget(info)
         self.check_randomize_ref_characters = QCheckBox("Randomize reference characters per clip", body)
         self.check_randomize_ref_characters.setToolTip(
-            "When enabled, each shot automatically picks a random subset of enabled Character references. "
-            "The shot uses between 1 and 5 character refs at a time (or fewer when fewer are available). "
+            "When enabled, each shot automatically picks one or two enabled Character references. "
             "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh the random combinations."
         )
         lay.addWidget(self.check_randomize_ref_characters)
+        self.check_unlimited_random_refs = QCheckBox("Unlimited random refs", body)
+        self.check_unlimited_random_refs.setToolTip(
+            "Only available while random reference characters are enabled. Removes the 9-image project-pool limit, "
+            "allows loading a whole folder, and cycles through the complete Character pool without repeating an image until all have been used."
+        )
+        self.check_unlimited_random_refs.setVisible(False)
+        lay.addWidget(self.check_unlimited_random_refs)
+        self.check_randomize_ref_characters.toggled.connect(self._update_unlimited_random_ref_controls)
+        self.check_unlimited_random_refs.toggled.connect(self._update_unlimited_random_ref_controls)
         self.refs_table = QTableWidget(0, 6, body)
         # Put the useful editable fields first. Long filenames/paths are supporting
         # metadata and must never consume the reference tab at the expense of role
@@ -2296,10 +2623,14 @@ class MiniMaxMusicClipWidget(QWidget):
         lay.addWidget(self.refs_table, 1)
         row = QHBoxLayout()
         self.btn_add_ref = QPushButton("Add reference image...", self.page_refs)
+        self.btn_add_ref_folder = QPushButton("Add reference folder...", self.page_refs)
+        self.btn_add_ref_folder.setToolTip("Add every supported image in a folder to the unlimited random Character reference pool.")
+        self.btn_add_ref_folder.setVisible(False)
         self.btn_remove_ref = QPushButton("Remove selected", self.page_refs)
-        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_remove_ref); row.addStretch(1)
+        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_add_ref_folder); row.addWidget(self.btn_remove_ref); row.addStretch(1)
         outer.addLayout(row)
         self.btn_add_ref.clicked.connect(self._add_reference)
+        self.btn_add_ref_folder.clicked.connect(self._add_reference_folder)
         self.btn_remove_ref.clicked.connect(self._remove_reference)
 
     def _build_analysis_tab(self) -> None:
@@ -2568,6 +2899,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.sage_attention = self.check_sage.isChecked()
         self.project.spectrum = self.check_spectrum.isChecked()
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
+        self.project.unlimited_random_references = bool(self.project.randomize_reference_characters and self.check_unlimited_random_refs.isChecked())
         self.project.references = self._refs_from_table()
 
     def _sync_ui_from_project(self) -> None:
@@ -2590,6 +2922,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
+        self.check_unlimited_random_refs.setChecked(bool(getattr(p, "unlimited_random_references", False)))
+        self._update_unlimited_random_ref_controls()
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
 
     def _project_dict(self) -> Dict[str, Any]:
@@ -2611,19 +2945,30 @@ class MiniMaxMusicClipWidget(QWidget):
             beats=[Beat(**x) for x in a.get("beats", []) if isinstance(x, dict)],
             sections=[Section(**x) for x in a.get("sections", []) if isinstance(x, dict)],
         )
-        p.shots = [MusicShot(**x) for x in data.get("shots", []) if isinstance(x, dict)]
+        shot_fields = set(MusicShot.__dataclass_fields__)
+        p.shots = [MusicShot(**{k: v for k, v in x.items() if k in shot_fields}) for x in data.get("shots", []) if isinstance(x, dict)]
         return p
 
     def _ensure_project_output_folder(self, reset_generated_state: bool = True) -> Path:
-        """Bind output to the current title+track pair so unrelated projects never share clips."""
+        """Bind output to the current title+track pair and create its persistent manifest."""
         title = self.edit_title.text().strip() if hasattr(self, "edit_title") else self.project.title
         audio = self.edit_audio.text().strip() if hasattr(self, "edit_audio") else self.project.audio_path
         identity = _music_project_identity(title, audio)
         if not identity:
             return Path(self.project.output_dir or OUTPUT_ROOT)
 
+        previous_identity = str(self.project.output_identity or "")
+        if previous_identity and previous_identity != identity:
+            self.project.project_id = ""
+            self.project.created_at = ""
+            self.project.updated_at = ""
+            self.project_path = ""
+
         if self.project.output_identity == identity and self.project.output_dir:
-            return Path(self.project.output_dir)
+            out = Path(self.project.output_dir)
+            self.project_path = str(out / PROJECT_MANIFEST_NAME)
+            _persist_project_manifest(self.project, snapshot_assets=True)
+            return out
 
         label = _safe_stem(title or (Path(audio).stem if audio else "music_project")) or "music_project"
         track_label = _safe_stem(Path(audio).stem) if audio else ""
@@ -2634,15 +2979,13 @@ class MiniMaxMusicClipWidget(QWidget):
         base = OUTPUT_ROOT / label
         candidate = base
         serial = 2
-        marker_name = ".minimax_music_project.json"
         while candidate.exists():
-            marker = candidate / marker_name
+            marker = candidate / PROJECT_MARKER_NAME
             try:
                 if marker.is_file():
-                    data = _read_text_tolerant(json.loads(marker))
+                    data = json.loads(_read_text_tolerant(marker))
                     if str(data.get("identity") or "") == identity:
                         break
-                # An empty folder is safe to claim; a legacy/non-empty folder is not.
                 elif not any(candidate.iterdir()):
                     break
             except Exception:
@@ -2650,14 +2993,25 @@ class MiniMaxMusicClipWidget(QWidget):
             candidate = Path(str(base) + f"_{serial}")
             serial += 1
 
-        old_identity = self.project.output_identity
+        old_identity = previous_identity
         candidate.mkdir(parents=True, exist_ok=True)
-        try:
-            (candidate / marker_name).write_text(json.dumps({
-                "identity": identity, "title": title, "audio_path": audio
-            }, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+        if not self.project.project_id:
+            try:
+                existing_manifest = candidate / PROJECT_MANIFEST_NAME
+                existing_marker = candidate / PROJECT_MARKER_NAME
+                existing = {}
+                if existing_manifest.is_file():
+                    existing = json.loads(_read_text_tolerant(existing_manifest))
+                elif existing_marker.is_file():
+                    existing = json.loads(_read_text_tolerant(existing_marker))
+                self.project.project_id = str(existing.get("project_id") or "")
+                self.project.created_at = str(existing.get("created_at") or "")
+            except Exception:
+                pass
+        if not self.project.project_id:
+            self.project.project_id = uuid.uuid4().hex
+        if not self.project.created_at:
+            self.project.created_at = _utc_now_iso()
 
         self.project.output_identity = identity
         self.project.output_dir = str(candidate)
@@ -2669,6 +3023,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 shot.output_path = ""
                 if shot.status == "Generated":
                     shot.status = "Planned"
+        self.project_path = str(candidate / PROJECT_MANIFEST_NAME)
+        _persist_project_manifest(self.project, snapshot_assets=True)
         return candidate
 
     # ---- project file operations ----
@@ -2689,9 +3045,12 @@ class MiniMaxMusicClipWidget(QWidget):
             "vram_async_streams", "vram_video_vae_reserve_gb", "vram_audio_vae_reserve_gb",
             "vram_residency_fill", "vram_residency_target_free_gb", "vram_residency_warmup_blocks",
             "vram_residency_refill_interval", "sage_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
-            "randomize_reference_characters",
+            "randomize_reference_characters", "unlimited_random_references",
         ):
             setattr(self.project, name, getattr(old, name))
+        self.project.project_id = ""
+        self.project.created_at = ""
+        self.project.updated_at = ""
         self.project_path = ""
         _cleanup_music_clip_temp_artifacts()
         self._sync_ui_from_project()
@@ -2711,6 +3070,10 @@ class MiniMaxMusicClipWidget(QWidget):
             self.project.title = self.edit_title.text().strip()
             self.project.output_identity = ""
             self.project.output_dir = str(OUTPUT_ROOT)
+            self.project.project_id = ""
+            self.project.created_at = ""
+            self.project.updated_at = ""
+            self.project_path = ""
             self.edit_output.setText(str(OUTPUT_ROOT))
             for shot in self.project.shots:
                 shot.output_path = ""
@@ -2724,36 +3087,94 @@ class MiniMaxMusicClipWidget(QWidget):
         if path: self.edit_output.setText(path)
 
     def _save_project(self, force_as: bool = False) -> None:
-        if force_as or not self.project_path:
-            default_dir = Path(self.edit_output.text().strip() or OUTPUT_ROOT); default_dir.mkdir(parents=True, exist_ok=True)
-            path, _ = QFileDialog.getSaveFileName(self, "Save MiniMax music project", str(default_dir / "minimax_music_project.json"), "JSON (*.json)")
-            if not path: return
-            self.project_path = path
-        Path(self.project_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(self.project_path).write_text(json.dumps(self._project_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-        self.status.setText(f"Saved project: {self.project_path}")
+        """Compatibility entry point: project saving is automatic and job-folder scoped."""
+        self._pull_ui()
+        self._ensure_project_output_folder(reset_generated_state=False)
+        manifest = _persist_project_manifest(self.project, snapshot_assets=True)
+        if manifest is not None:
+            self.project_path = str(manifest)
+            self.status.setText(f"Project autosaved: {manifest.parent.name}")
         self._save_settings()
         self._write_autosave(force=True)
 
     def _open_project(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open MiniMax music project", "", "JSON (*.json)")
-        if not path: return
+        start_dir = self.project.output_dir if self.project.output_dir and Path(self.project.output_dir).is_dir() else str(OUTPUT_ROOT)
+        folder = QFileDialog.getExistingDirectory(self, "Load MiniMax music job folder", start_dir)
+        if not folder:
+            return
         try:
-            data = _read_text_tolerant(json.loads(Path(path))); self.project = self._project_from_dict(data); self.project_path = path; self._sync_ui_from_project(); self.status.setText(f"Opened: {path}")
+            project, manifest = _load_project_manifest(Path(folder))
+            self.project = project
+            self.project_path = str(manifest)
+            self._sync_ui_from_project()
+            self.status.setText(f"Loaded project {self.project.project_id[:8]}: {manifest.parent.name}")
+            _persist_project_manifest(self.project, snapshot_assets=True)
             self._write_autosave(force=True)
         except Exception as exc:
-            QMessageBox.critical(self, "Open project failed", str(exc))
+            QMessageBox.critical(self, "Load project failed", str(exc))
 
     # ---- refs ----
+    def _unlimited_random_refs_enabled(self) -> bool:
+        return bool(
+            getattr(self, "check_randomize_ref_characters", None)
+            and self.check_randomize_ref_characters.isChecked()
+            and getattr(self, "check_unlimited_random_refs", None)
+            and self.check_unlimited_random_refs.isChecked()
+        )
+
+    def _update_unlimited_random_ref_controls(self, *_args) -> None:
+        random_on = bool(getattr(self, "check_randomize_ref_characters", None) and self.check_randomize_ref_characters.isChecked())
+        unlimited_on = bool(random_on and getattr(self, "check_unlimited_random_refs", None) and self.check_unlimited_random_refs.isChecked())
+        if getattr(self, "check_unlimited_random_refs", None) is not None:
+            self.check_unlimited_random_refs.setVisible(random_on)
+        if getattr(self, "btn_add_ref_folder", None) is not None:
+            self.btn_add_ref_folder.setVisible(unlimited_on)
+
+    @staticmethod
+    def _supported_reference_image(path: str | Path) -> bool:
+        return Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+    def _append_reference_paths(self, paths: Sequence[str]) -> None:
+        current = self._refs_from_table()
+        unlimited = self._unlimited_random_refs_enabled()
+        existing = {os.path.normcase(os.path.abspath(r.path)) for r in current if r.path}
+        added = 0
+        for path in paths:
+            if not unlimited and len(current) >= 9:
+                break
+            if not self._supported_reference_image(path):
+                continue
+            norm = os.path.normcase(os.path.abspath(path))
+            if norm in existing:
+                continue
+            current.append(ReferenceAsset(name=Path(path).stem, kind="Character", path=str(path)))
+            existing.add(norm)
+            added += 1
+        self.project.references = current
+        self._populate_refs()
+        if paths and not unlimited and len(current) >= 9:
+            self.status.setText("Reference pool is limited to 9. Enable Randomize reference characters and Unlimited random refs to load more.")
+        elif added:
+            self.status.setText(f"Added {added} reference image{'s' if added != 1 else ''}.")
+
     def _add_reference(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Add MiniMax reference images", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
-        if not paths: return
-        current = self._refs_from_table()
-        for path in paths:
-            if len(current) >= 9: break
-            if any(os.path.normcase(r.path) == os.path.normcase(path) for r in current): continue
-            current.append(ReferenceAsset(name=Path(path).stem, kind="Character", path=path))
-        self.project.references = current; self._populate_refs()
+        if not paths:
+            return
+        self._append_reference_paths(paths)
+
+    def _add_reference_folder(self) -> None:
+        if not self._unlimited_random_refs_enabled():
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Add random reference folder", "")
+        if not folder:
+            return
+        root = Path(folder)
+        paths = [str(p) for p in sorted(root.iterdir(), key=lambda x: x.name.lower()) if p.is_file() and self._supported_reference_image(p)]
+        if not paths:
+            QMessageBox.information(self, "No reference images", "That folder contains no supported image files.")
+            return
+        self._append_reference_paths(paths)
 
     def _remove_reference(self) -> None:
         rows = sorted({i.row() for i in self.refs_table.selectedIndexes()}, reverse=True)
@@ -2762,7 +3183,12 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _populate_refs(self) -> None:
         self.refs_table.blockSignals(True); self.refs_table.setRowCount(0)
-        for ref in self.project.references[:9]:
+        # The table is the editable project reference pool. In unlimited-random
+        # mode it must display the *entire* pool; otherwise the first UI refresh
+        # would silently collapse the project back to nine refs. MiniMax still
+        # receives at most nine refs per individual shot in auto_assign_references().
+        visible_refs = self.project.references if self._unlimited_random_refs_enabled() else self.project.references[:9]
+        for ref in visible_refs:
             row = self.refs_table.rowCount(); self.refs_table.insertRow(row); self.refs_table.setRowHeight(row, 92)
             use = QTableWidgetItem(""); use.setFlags(use.flags() | Qt.ItemIsUserCheckable); use.setCheckState(Qt.Checked if ref.enabled else Qt.Unchecked); self.refs_table.setItem(row, 0, use)
             preview = QLabel(self.refs_table); preview.setAlignment(Qt.AlignCenter); preview.setMinimumSize(112, 78); preview.setMaximumSize(112, 78)
@@ -2796,7 +3222,10 @@ class MiniMaxMusicClipWidget(QWidget):
             role_widget = self.refs_table.cellWidget(row, 2)
             kind = _normalise_reference_kind(role_widget.currentText() if isinstance(role_widget, QComboBox) else txt(2))
             refs.append(ReferenceAsset(name=txt(4) or Path(txt(5)).stem, kind=kind, path=txt(5), description=txt(3), enabled=bool(self.refs_table.item(row,0) and self.refs_table.item(row,0).checkState() == Qt.Checked)))
-        return refs[:9]
+        # Nine is the per-shot MiniMax input ceiling, not a project-pool ceiling.
+        # Keep every row when unlimited random refs is enabled so _pull_ui(),
+        # autosave and project persistence cannot throw away refs 10+.
+        return refs if self._unlimited_random_refs_enabled() else refs[:9]
 
     # ---- one-click video clip workflow ----
     def create_video_clip(self) -> None:
@@ -3323,6 +3752,7 @@ class MiniMaxMusicClipWidget(QWidget):
             selected_names = [next(iter(refs_by_name))]
         selected = [refs_by_name[n] for n in selected_names[:9]]
         generation_prompt = build_generation_prompt(self.project, shot, selected)
+        shot.generation_prompt = generation_prompt
 
         # Persist the exact text handed to MiniMax for audit/debugging. This makes it
         # impossible to confuse the Director editor, autosave state, and actual queue prompt.
@@ -3514,6 +3944,7 @@ class MiniMaxMusicClipWidget(QWidget):
         else:
             self._set_ready("Generation finished." if not failures else f"Generation finished with {len(failures)} failed shot(s).")
         if failures: QMessageBox.warning(self, "Some shots failed", "\n\n".join(failures[:5]))
+        self._write_autosave(force=True)
 
     def _assemble(self) -> None:
         if not self.project.shots: QMessageBox.warning(self, "No plan", "Create and generate the shot plan first."); return
@@ -3524,6 +3955,7 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _assembly_done(self, path: str) -> None:
         self._set_ready(f"Final video saved: {path}")
+        self._write_autosave(force=True)
         QMessageBox.information(self, "Finished", f"Final music video saved:\n{path}")
 
     def _open_output_folder(self) -> None:
@@ -3600,6 +4032,8 @@ class MiniMaxMusicClipWidget(QWidget):
             tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
             os.replace(str(tmp), str(AUTOSAVE_PATH))
             self._autosave_last_text = compare_text
+            # Once a real job folder exists, that folder owns a complete project manifest.
+            _persist_project_manifest(self.project, snapshot_assets=True)
             # Generation preferences also survive deliberate New Project/session resets.
             self._save_settings()
         except Exception:
@@ -3659,6 +4093,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
+                self.project.unlimited_random_references = bool(data.get("unlimited_random_references", self.project.unlimited_random_references))
         except Exception:
             pass
 
@@ -3687,6 +4122,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
+                "unlimited_random_references": self.project.unlimited_random_references,
             }
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
