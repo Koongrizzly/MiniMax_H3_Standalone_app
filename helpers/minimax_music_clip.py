@@ -92,6 +92,7 @@ ROOT = _detect_project_root()
 HELPERS_DIR = ROOT / "helpers"
 OUTPUT_ROOT = ROOT / "output" / "minimax_music_clips"
 SETTINGS_PATH = ROOT / "presets" / "minimax_music_clip_settings.json"
+MAIN_GUI_SETTINGS_PATH = ROOT / "presets" / "setsave" / "minimax_h3_gui_last.json"
 AUTOSAVE_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip.json"
 PROJECT_MANIFEST_NAME = "minimax_music_project.json"
 PROJECT_MARKER_NAME = ".minimax_music_project.json"
@@ -260,6 +261,49 @@ def _persist_project_manifest(project: "MusicProject", snapshot_assets: bool = T
         return None
 
 
+def _latest_shot_output(raw_dir: Path, shot_index: int, current_path: str = "") -> Optional[Path]:
+    """Return the active rendered clip for a shot.
+
+    A successful recreation is intentionally written to shot_###_retry_TIMESTAMP.mp4 so
+    the original can stay open in a media player.  The newest retry is therefore the
+    authoritative output whenever one exists.  The stable shot_###.mp4 is only the
+    fallback for shots that have never been recreated.
+    """
+    if not raw_dir.is_dir():
+        return None
+
+    retries = []
+    try:
+        retries = [
+            path for path in raw_dir.glob(f"shot_{int(shot_index):03d}_retry_*.mp4")
+            if path.is_file() and path.stat().st_size > 0
+        ]
+    except Exception:
+        retries = []
+
+    if retries:
+        # Filename timestamps are sortable, and mtime is a useful tie breaker for the
+        # rare case where more than one retry was created in the same second.
+        retries.sort(key=lambda path: (path.name.lower(), path.stat().st_mtime_ns), reverse=True)
+        return retries[0].resolve()
+
+    current = Path(current_path) if current_path else None
+    if current is not None:
+        try:
+            if current.is_file() and current.stat().st_size > 0:
+                return current.resolve()
+        except Exception:
+            pass
+
+    base = raw_dir / f"shot_{int(shot_index):03d}.mp4"
+    try:
+        if base.is_file() and base.stat().st_size > 0:
+            return base.resolve()
+    except Exception:
+        pass
+    return None
+
+
 def _load_project_manifest(job_dir: Path) -> tuple["MusicProject", Path]:
     """Load a persistent job folder and repair moved asset/output paths."""
     job_dir = job_dir.expanduser().resolve()
@@ -307,16 +351,13 @@ def _load_project_manifest(job_dir: Path) -> tuple["MusicProject", Path]:
     raw_dir = job_dir / "raw_clips"
     if raw_dir.is_dir():
         for shot in project.shots:
-            if not (shot.output_path and Path(shot.output_path).is_file()):
-                preferred = raw_dir / f"shot_{shot.index:03d}.mp4"
-                if preferred.is_file():
-                    shot.output_path = str(preferred.resolve())
-                    shot.status = "Generated"
-                else:
-                    retries = sorted(raw_dir.glob(f"shot_{shot.index:03d}_retry_*.mp4"), key=lambda x: x.stat().st_mtime_ns, reverse=True)
-                    if retries:
-                        shot.output_path = str(retries[0].resolve())
-                        shot.status = "Generated"
+            active = _latest_shot_output(raw_dir, shot.index, shot.output_path)
+            if active is not None:
+                shot.output_path = str(active)
+                shot.status = "Generated"
+            elif shot.status == "Generated":
+                shot.output_path = ""
+                shot.status = "Planned"
             prompt_file = raw_dir / f"shot_{shot.index:03d}_prompt.txt"
             if prompt_file.is_file() and not getattr(shot, "generation_prompt", ""):
                 try:
@@ -655,6 +696,10 @@ class MusicProject:
     randomize_reference_characters: bool = False
     unlimited_random_references: bool = False
     reference_random_seed: int = -1
+    # Snapshot of the authoritative main MiniMax GUI generation settings used for
+    # this project/job. The Music Clip Creator no longer owns a second copy of
+    # model/runtime controls; this is persisted only for review/reproducibility.
+    generation_settings_snapshot: Dict[str, Any] = field(default_factory=dict)
     references: List[ReferenceAsset] = field(default_factory=list)
     lyrics: List[LyricSegment] = field(default_factory=list)
     analysis: AnalysisResult = field(default_factory=AnalysisResult)
@@ -2111,6 +2156,123 @@ def _recreate_output_path(raw_dir: Path, shot_index: int) -> Tuple[Path, bool]:
     return candidate, True
 
 
+def _effective_generation_settings(project: MusicProject) -> Dict[str, Any]:
+    """Return the main-GUI generation settings snapshot with legacy fallbacks.
+
+    New standalone builds make the main MiniMax GUI the single source of truth.
+    Legacy project fields are kept only so older saved projects remain runnable.
+    """
+    raw = getattr(project, "generation_settings_snapshot", {})
+    cfg = dict(raw) if isinstance(raw, dict) else {}
+    cfg.setdefault("steps", int(getattr(project, "steps", 15)))
+    cfg.setdefault("cfg", float(getattr(project, "cfg", 1.0)))
+    cfg.setdefault("shift", float(getattr(project, "shift", 12.0)))
+    cfg.setdefault("audio_shift", float(getattr(project, "audio_shift", 3.0)))
+    cfg.setdefault("sampler", "euler")
+    cfg.setdefault("scheduler", "beta")
+    cfg.setdefault("ref_size", str(getattr(project, "ref_image_size", "match") or "match"))
+    cfg.setdefault("vram_manager_enabled", bool(getattr(project, "vram_manager_enabled", True)))
+    cfg.setdefault("vram_manager_auto_bypass", bool(getattr(project, "vram_auto_bypass", True)))
+    cfg.setdefault("vram_residency_engine", str(getattr(project, "vram_residency_engine", "static") or "static"))
+    cfg.setdefault("vram_runtime_free_gb", float(getattr(project, "vram_runtime_free_gb", 0.5)))
+    cfg.setdefault("vram_text_headroom_gb", float(getattr(project, "vram_text_headroom_gb", 1.0)))
+    cfg.setdefault("vram_diffusion_headroom_gb", float(getattr(project, "vram_diffusion_headroom_gb", 1.0)))
+    cfg.setdefault("vram_offload_chunk_mb", int(getattr(project, "vram_offload_chunk_mb", 512)))
+    cfg.setdefault("vram_max_resident_weights_gb", float(getattr(project, "vram_max_resident_weights_gb", 0.0)))
+    cfg.setdefault("vram_block_check_interval", int(getattr(project, "vram_block_check_interval", 1)))
+    cfg.setdefault("vram_async_streams", int(getattr(project, "vram_async_streams", 2)))
+    cfg.setdefault("vram_video_vae_reserve_gb", float(getattr(project, "vram_video_vae_reserve_gb", 2.0)))
+    cfg.setdefault("vram_audio_vae_reserve_gb", float(getattr(project, "vram_audio_vae_reserve_gb", 1.0)))
+    cfg.setdefault("vram_residency_fill", bool(getattr(project, "vram_residency_fill", False)))
+    cfg.setdefault("vram_residency_target_free_gb", float(getattr(project, "vram_residency_target_free_gb", 0.5)))
+    cfg.setdefault("vram_residency_warmup_blocks", int(getattr(project, "vram_residency_warmup_blocks", 2)))
+    cfg.setdefault("vram_residency_refill_interval", int(getattr(project, "vram_residency_refill_interval", 1)))
+    cfg.setdefault("sage_attention_enabled", bool(getattr(project, "sage_attention", False)))
+    cfg.setdefault("spectrum_enabled", bool(getattr(project, "spectrum", False)))
+    cfg.setdefault("sol_attention_enabled", False)
+    cfg.setdefault("sla_attention_enabled", False)
+    cfg.setdefault("use_hybrid_model", bool(getattr(project, "use_hybrid_model", False)))
+    cfg.setdefault("hybrid_model", str(getattr(project, "hybrid_model_path", "") or ""))
+    legacy_lora = str(getattr(project, "turbo_lora_path", "") or "").strip()
+    if "loras" not in cfg:
+        cfg["loras"] = ([{"path": legacy_lora, "strength": float(getattr(project, "turbo_lora_strength", 1.0))}] if legacy_lora else [])
+    return cfg
+
+
+def _append_main_gui_generation_args(args: List[str], project: MusicProject) -> Dict[str, Any]:
+    """Append model/runtime switches from the authoritative main MiniMax settings."""
+    cfg = _effective_generation_settings(project)
+
+    use_hybrid = bool(cfg.get("use_hybrid_model", False))
+    hybrid = str(cfg.get("hybrid_model", "") or "").strip()
+    ref2va = str(cfg.get("ref2va_model", "") or "").strip()
+    if use_hybrid:
+        hp = Path(hybrid)
+        if not hp.is_file():
+            raise RuntimeError("Use hybrid model is enabled in the main MiniMax settings, but the selected hybrid checkpoint was not found.")
+        args += ["--ref2va-checkpoint", str(hp.resolve())]
+    elif ref2va:
+        rp = Path(ref2va)
+        if not rp.is_file():
+            raise RuntimeError(f"Selected Ref2VA checkpoint was not found: {ref2va}")
+        args += ["--ref2va-checkpoint", str(rp.resolve())]
+
+    for key, flag in (("text_encoder_model", "--text-encoder"), ("video_vae_model", "--video-vae"), ("audio_vae_model", "--audio-vae")):
+        raw = str(cfg.get(key, "") or "").strip()
+        if raw:
+            mp = Path(raw)
+            if not mp.is_file():
+                raise RuntimeError(f"Selected MiniMax model file was not found: {raw}")
+            args += [flag, str(mp.resolve())]
+
+    if bool(cfg.get("vram_manager_enabled", True)):
+        args += ["--vram-manager-auto" if bool(cfg.get("vram_manager_auto_bypass", True)) else "--vram-manager"]
+        args += [
+            "--vram-residency-engine", str(cfg.get("vram_residency_engine", "static") or "static"),
+            "--vram-runtime-free-gb", str(float(cfg.get("vram_runtime_free_gb", 0.5))),
+            "--vram-text-headroom-gb", str(float(cfg.get("vram_text_headroom_gb", 1.0))),
+            "--vram-diffusion-headroom-gb", str(float(cfg.get("vram_diffusion_headroom_gb", 1.0))),
+            "--vram-offload-chunk-mb", str(int(cfg.get("vram_offload_chunk_mb", 512))),
+            "--vram-max-resident-weights-gb", str(float(cfg.get("vram_max_resident_weights_gb", 0.0))),
+            "--vram-block-check-interval", str(int(cfg.get("vram_block_check_interval", 1))),
+            "--vram-async-streams", str(int(cfg.get("vram_async_streams", 2))),
+            "--vram-video-vae-reserve-gb", str(float(cfg.get("vram_video_vae_reserve_gb", 2.0))),
+            "--vram-audio-vae-reserve-gb", str(float(cfg.get("vram_audio_vae_reserve_gb", 1.0))),
+            "--vram-residency-target-free-gb", str(float(cfg.get("vram_residency_target_free_gb", 0.5))),
+            "--vram-residency-warmup-blocks", str(int(cfg.get("vram_residency_warmup_blocks", 2))),
+            "--vram-residency-refill-interval", str(int(cfg.get("vram_residency_refill_interval", 1))),
+        ]
+        args += ["--vram-residency-fill" if bool(cfg.get("vram_residency_fill", False)) else "--no-vram-residency-fill"]
+
+    tile_size = int(cfg.get("vram_video_vae_tile_size", 256) or 256)
+    tile_overlap = int(cfg.get("vram_video_vae_tile_overlap", 64) or 64)
+    args += ["--video-vae-tile-size", str(tile_size), "--video-vae-tile-overlap", str(tile_overlap)]
+
+    if bool(cfg.get("spectrum_enabled", False)):
+        args += ["--spectrum"]
+    if bool(cfg.get("sage_attention_enabled", False)):
+        args += ["--sage-attention"]
+    if bool(cfg.get("sol_attention_enabled", False)):
+        args += ["--sol-attention"]
+    if bool(cfg.get("sla_attention_enabled", False)):
+        args += ["--sla-attention"]
+
+    for item in cfg.get("loras", []) or []:
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("path", "") or "").strip()
+        if not raw:
+            continue
+        strength = float(item.get("strength", 1.0))
+        if strength == 0.0:
+            continue
+        lp = Path(raw)
+        if not lp.is_file():
+            raise RuntimeError(f"Selected LoRA file was not found: {raw}")
+        args += ["--lora", str(lp.resolve()), "--lora-strength", str(strength)]
+    return cfg
+
+
 def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -> List[Dict[str, Any]]:
     global _ACTIVE_GENERATION_PROCESS
     _GENERATION_CANCEL.clear()
@@ -2156,51 +2318,22 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         generation_prompt = build_generation_prompt(project, shot, selected)
         shot.generation_prompt = generation_prompt
         (raw_dir / f"shot_{shot.index:03d}_prompt.txt").write_text(generation_prompt, encoding="utf-8")
+        gen_cfg = _effective_generation_settings(project)
         cmd = [
             str(MINIMAX_PY), "-u", str(GENERATE_REF),
             "--prompt", generation_prompt,
             "--width", str(width), "--height", str(height),
-            "--frames", str(shot.frames), "--steps", str(project.steps),
-            "--cfg", str(project.cfg), "--seed", str(shot.seed),
-            "--shift", str(project.shift), "--audio-shift", str(project.audio_shift),
-            "--ref-image-size", project.ref_image_size,
+            "--frames", str(shot.frames), "--steps", str(int(gen_cfg.get("steps", 15))),
+            "--cfg", str(float(gen_cfg.get("cfg", 1.0))), "--seed", str(shot.seed),
+            "--shift", str(float(gen_cfg.get("shift", 12.0))), "--audio-shift", str(float(gen_cfg.get("audio_shift", 3.0))),
+            "--sampler", str(gen_cfg.get("sampler", "euler") or "euler"),
+            "--scheduler", str(gen_cfg.get("scheduler", "beta") or "beta"),
+            "--ref-image-size", str(gen_cfg.get("ref_size", "match") or "match"),
             "--ref-audio", str(audio_chunk),
             "--lock-source-audio-index", "1",
             "--output", str(out_path),
         ]
-        if project.use_hybrid_model:
-            hybrid = Path(str(project.hybrid_model_path or "").strip())
-            if not hybrid.is_file():
-                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
-            cmd += ["--ref2va-checkpoint", str(hybrid.resolve())]
-        if project.vram_manager_enabled:
-            cmd += ["--vram-manager-auto" if project.vram_auto_bypass else "--vram-manager"]
-            cmd += [
-                "--vram-residency-engine", str(project.vram_residency_engine or "static"),
-                "--vram-runtime-free-gb", str(float(project.vram_runtime_free_gb)),
-                "--vram-text-headroom-gb", str(float(project.vram_text_headroom_gb)),
-                "--vram-diffusion-headroom-gb", str(float(project.vram_diffusion_headroom_gb)),
-                "--vram-offload-chunk-mb", str(int(project.vram_offload_chunk_mb)),
-                "--vram-max-resident-weights-gb", str(float(project.vram_max_resident_weights_gb)),
-                "--vram-block-check-interval", str(int(project.vram_block_check_interval)),
-                "--vram-async-streams", str(int(project.vram_async_streams)),
-                "--vram-video-vae-reserve-gb", str(float(project.vram_video_vae_reserve_gb)),
-                "--vram-audio-vae-reserve-gb", str(float(project.vram_audio_vae_reserve_gb)),
-                "--vram-residency-target-free-gb", str(float(project.vram_residency_target_free_gb)),
-                "--vram-residency-warmup-blocks", str(int(project.vram_residency_warmup_blocks)),
-                "--vram-residency-refill-interval", str(int(project.vram_residency_refill_interval)),
-            ]
-            cmd += ["--vram-residency-fill" if project.vram_residency_fill else "--no-vram-residency-fill"]
-        if project.sage_attention:
-            cmd += ["--sage-attention"]
-        if project.spectrum:
-            cmd += ["--spectrum"]
-        turbo_lora = str(project.turbo_lora_path or "").strip()
-        if turbo_lora:
-            turbo_path = Path(turbo_lora)
-            if not turbo_path.is_file():
-                raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
-            cmd += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(project.turbo_lora_strength))]
+        _append_main_gui_generation_args(cmd, project)
         for ref in selected:
             cmd += ["--ref-image", ref.path]
         # Ref2VA only requires at least one reference. The song chunk already fills that requirement.
@@ -2441,9 +2574,10 @@ def _assembly_task(progress, project: MusicProject) -> str:
 class MiniMaxMusicClipWidget(QWidget):
     """Embeddable MiniMax Music Clip Creator widget."""
 
-    def __init__(self, parent: Optional[QWidget] = None, queue_adapter=None):
+    def __init__(self, parent: Optional[QWidget] = None, queue_adapter=None, settings_provider=None):
         super().__init__(parent)
         self.queue_adapter = queue_adapter
+        self.settings_provider = settings_provider
         self.project = MusicProject(output_dir=str(OUTPUT_ROOT))
         self.project_path = ""
         self.worker: Optional[FunctionWorker] = None
@@ -2781,67 +2915,43 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _build_settings_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_settings)
-        gen = QGroupBox("MiniMax generation", body)
-        form = QFormLayout(gen)
-        self.combo_resolution = QComboBox(gen); self.combo_resolution.addItems(list(RESOLUTION_PRESETS.keys())); self.combo_resolution.setCurrentText("832 × 480")
-        self.combo_aspect = QComboBox(gen); self.combo_aspect.addItems(["16:9", "9:16", "1:1"])
+        clip = QGroupBox("Music Clip Creator", body)
+        form = QFormLayout(clip)
+        self.combo_resolution = QComboBox(clip); self.combo_resolution.addItems(list(RESOLUTION_PRESETS.keys())); self.combo_resolution.setCurrentText("832 × 480")
+        self.combo_aspect = QComboBox(clip); self.combo_aspect.addItems(["16:9", "9:16", "1:1"])
         form.addRow("Resolution:", self.combo_resolution); form.addRow("Aspect ratio:", self.combo_aspect)
 
         max_row = QHBoxLayout()
-        self.slider_frames = QSlider(Qt.Horizontal, gen); self.slider_frames.setRange(0, len(MUSIC_FRAME_GRID) - 1); self.slider_frames.setValue(len(MUSIC_FRAME_GRID) - 1)
-        self.label_frames = QLabel(gen)
+        self.slider_frames = QSlider(Qt.Horizontal, clip); self.slider_frames.setRange(0, len(MUSIC_FRAME_GRID) - 1); self.slider_frames.setValue(len(MUSIC_FRAME_GRID) - 1)
+        self.label_frames = QLabel(clip)
         max_row.addWidget(self.slider_frames, 1); max_row.addWidget(self.label_frames)
         form.addRow("Maximum generated shot length:", max_row)
         self.slider_frames.setToolTip(
             "Sets the maximum MiniMax Ref2VA generation length used by the planner. The director may use shorter valid frame counts. "
             "Generated clips can include extra material at the beginning/end and are trimmed during final assembly."
         )
-        self.spin_head = QDoubleSpinBox(gen); self.spin_head.setRange(0.0, 2.0); self.spin_head.setSingleStep(0.05); self.spin_head.setValue(0.35); self.spin_head.setSuffix(" s")
-        self.spin_tail = QDoubleSpinBox(gen); self.spin_tail.setRange(0.0, 2.0); self.spin_tail.setSingleStep(0.05); self.spin_tail.setValue(0.45); self.spin_tail.setSuffix(" s")
-        self.spin_snap = QDoubleSpinBox(gen); self.spin_snap.setRange(0.0, 3.0); self.spin_snap.setSingleStep(0.05); self.spin_snap.setValue(1.25); self.spin_snap.setSuffix(" s")
+        self.spin_head = QDoubleSpinBox(clip); self.spin_head.setRange(0.0, 2.0); self.spin_head.setSingleStep(0.05); self.spin_head.setValue(0.35); self.spin_head.setSuffix(" s")
+        self.spin_tail = QDoubleSpinBox(clip); self.spin_tail.setRange(0.0, 2.0); self.spin_tail.setSingleStep(0.05); self.spin_tail.setValue(0.45); self.spin_tail.setSuffix(" s")
+        self.spin_snap = QDoubleSpinBox(clip); self.spin_snap.setRange(0.0, 3.0); self.spin_snap.setSingleStep(0.05); self.spin_snap.setValue(1.25); self.spin_snap.setSuffix(" s")
         form.addRow("Extra context before edit:", self.spin_head)
         form.addRow("Extra context after edit:", self.spin_tail)
         form.addRow("Phrase-boundary snap tolerance:", self.spin_snap)
-        self.spin_steps = QSpinBox(gen); self.spin_steps.setRange(1, 100); self.spin_steps.setValue(15)
-        self.spin_cfg = QDoubleSpinBox(gen); self.spin_cfg.setRange(0.0, 20.0); self.spin_cfg.setValue(1.0); self.spin_cfg.setDecimals(2)
-        self.spin_shift = QDoubleSpinBox(gen); self.spin_shift.setRange(0.0, 30.0); self.spin_shift.setValue(12.0); self.spin_shift.setDecimals(2)
-        self.spin_audio_shift = QDoubleSpinBox(gen); self.spin_audio_shift.setRange(0.0, 20.0); self.spin_audio_shift.setValue(3.0); self.spin_audio_shift.setDecimals(2)
-        form.addRow("Steps:", self.spin_steps); form.addRow("CFG:", self.spin_cfg); form.addRow("Shift:", self.spin_shift); form.addRow("Audio shift:", self.spin_audio_shift)
-        self.combo_ref_size = QComboBox(gen); self.combo_ref_size.addItems(["match", "max"]); form.addRow("Reference image size:", self.combo_ref_size)
-        lora_row = QHBoxLayout()
-        self.edit_turbo_lora = QLineEdit(gen)
-        self.edit_turbo_lora.setPlaceholderText("Optional speed / Turbo LoRA (.safetensors)")
-        self.btn_turbo_lora = QPushButton("Browse...", gen)
-        self.spin_turbo_lora = QDoubleSpinBox(gen); self.spin_turbo_lora.setRange(-4.0, 4.0); self.spin_turbo_lora.setSingleStep(0.05); self.spin_turbo_lora.setDecimals(2); self.spin_turbo_lora.setValue(1.0)
-        self.spin_turbo_lora.setToolTip("Strength for the selected MiniMax LoRA. 1.0 = normal strength.")
-        lora_row.addWidget(self.edit_turbo_lora, 1); lora_row.addWidget(self.btn_turbo_lora); lora_row.addWidget(QLabel("Strength:", gen)); lora_row.addWidget(self.spin_turbo_lora)
-        form.addRow("Turbo / speed LoRA:", lora_row)
-        self.btn_turbo_lora.clicked.connect(self._browse_turbo_lora)
-        self.check_hybrid_model = QCheckBox("Use hybrid model", gen)
-        self.check_hybrid_model.setToolTip("Use one hybrid MiniMax H3 diffusion checkpoint for these Ref2VA music clips instead of the normal Ref2VA checkpoint. This choice is remembered after restart.")
-        hybrid_row = QHBoxLayout()
-        self.edit_hybrid_model = QLineEdit(gen); self.edit_hybrid_model.setPlaceholderText("Hybrid MiniMax H3 checkpoint (.safetensors)")
-        self.btn_hybrid_model = QPushButton("Browse...", gen)
-        hybrid_row.addWidget(self.edit_hybrid_model, 1); hybrid_row.addWidget(self.btn_hybrid_model)
-        form.addRow(self.check_hybrid_model)
-        form.addRow("Hybrid checkpoint:", hybrid_row)
-        self.btn_hybrid_model.clicked.connect(self._browse_hybrid_model)
-        self.check_hybrid_model.toggled.connect(self._sync_hybrid_model_controls)
-        self._sync_hybrid_model_controls(False)
-        self.check_vram_manager = QCheckBox("Enable VRAM Manager protection", gen); self.check_vram_manager.setChecked(True)
-        self.check_vram_manager.setToolTip("Master switch. Off = never use VRAM Manager. On = use the setting below to choose automatic bypass or always-on protection.")
-        self.check_vram_auto_bypass = QCheckBox("Automatic bypass when job fits", gen); self.check_vram_auto_bypass.setChecked(True)
-        self.check_vram_auto_bypass.setToolTip("On = MiniMax decides per stage/job whether native loading is safe. Off = VRAM Manager stays active for every job.")
-        self.check_sage = QCheckBox("SageAttention", gen)
-        self.check_spectrum = QCheckBox("Spectrum", gen)
-        flags = QHBoxLayout(); flags.addWidget(self.check_vram_manager); flags.addWidget(self.check_vram_auto_bypass); flags.addWidget(self.check_sage); flags.addWidget(self.check_spectrum); flags.addStretch(1)
-        form.addRow("Acceleration / VRAM:", flags)
-        lay.addWidget(gen)
+        lay.addWidget(clip)
+
+        inherited = QLabel(
+            "MiniMax generation settings are inherited from the main standalone Settings tab. "
+            "Model / hybrid checkpoint, LoRAs and strengths, steps, CFG, video/audio shift, sampler, scheduler, "
+            "Ref2VA/model paths, VRAM Manager, Spectrum and Sage/Sol/SLA Attention are not duplicated here.",
+            body,
+        )
+        inherited.setWordWrap(True)
+        lay.addWidget(inherited)
         explanation = QLabel(
             "Timing rule: the song timeline is authoritative. MiniMax valid frame counts determine how much source footage is generated, "
-            "then FFmpeg trims each source clip to its exact edit slot. Small timing mismatches are repaired during assembly instead of aborting.",
+            "then FFmpeg trims each source clip to its exact edit slot.",
             body,
-        ); explanation.setWordWrap(True); lay.addWidget(explanation); lay.addStretch(1)
+        )
+        explanation.setWordWrap(True); lay.addWidget(explanation); lay.addStretch(1)
         self.slider_frames.valueChanged.connect(self._update_frame_label)
         self._update_frame_label()
 
@@ -2864,6 +2974,55 @@ class MiniMaxMusicClipWidget(QWidget):
                 item.setText(text)
                 self.shot_table.blockSignals(False)
 
+    def _read_main_gui_generation_settings(self) -> Dict[str, Any]:
+        """Read one authoritative MiniMax generation configuration.
+
+        When embedded, the host callback first saves and returns the live main-GUI
+        settings. When launched independently, fall back to the same persisted file.
+        """
+        if callable(getattr(self, "settings_provider", None)):
+            try:
+                data = self.settings_provider()
+                if isinstance(data, dict):
+                    return dict(data)
+            except (AttributeError, RuntimeError):
+                # The Music Clip tab is constructed before the main Settings tab,
+                # so some host widgets do not exist yet during initial restore.
+                # Fall back to the already-saved main GUI settings for startup only.
+                pass
+        try:
+            if MAIN_GUI_SETTINGS_PATH.is_file():
+                data = json.loads(_read_text_tolerant(MAIN_GUI_SETTINGS_PATH))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return dict(getattr(self.project, "generation_settings_snapshot", {}) or {})
+
+    def _refresh_generation_settings_snapshot(self) -> Dict[str, Any]:
+        data = self._read_main_gui_generation_settings()
+        if data:
+            # Keep the complete main-GUI snapshot in the job manifest for review.
+            self.project.generation_settings_snapshot = data
+            # Populate legacy scalar fields too, only for backward compatibility with
+            # older manifests/tools that know these names. They are no longer UI-owned.
+            self.project.steps = int(data.get("steps", self.project.steps))
+            self.project.cfg = float(data.get("cfg", self.project.cfg))
+            self.project.shift = float(data.get("shift", self.project.shift))
+            self.project.audio_shift = float(data.get("audio_shift", self.project.audio_shift))
+            self.project.ref_image_size = str(data.get("ref_size", self.project.ref_image_size) or self.project.ref_image_size)
+            self.project.vram_manager_enabled = bool(data.get("vram_manager_enabled", self.project.vram_manager_enabled))
+            self.project.vram_auto_bypass = bool(data.get("vram_manager_auto_bypass", self.project.vram_auto_bypass))
+            self.project.sage_attention = bool(data.get("sage_attention_enabled", False))
+            self.project.spectrum = bool(data.get("spectrum_enabled", False))
+            self.project.use_hybrid_model = bool(data.get("use_hybrid_model", False))
+            self.project.hybrid_model_path = str(data.get("hybrid_model", "") or "")
+            loras = data.get("loras", []) or []
+            first = next((x for x in loras if isinstance(x, dict) and str(x.get("path", "") or "").strip()), None)
+            self.project.turbo_lora_path = str(first.get("path", "") or "") if first else ""
+            self.project.turbo_lora_strength = float(first.get("strength", 1.0)) if first else 1.0
+        return data
+
     def _pull_ui(self) -> None:
         # The Director prompt editor is authoritative. Commit it before ANY save,
         # queue, generation, restart autosave, or project-state snapshot.
@@ -2885,19 +3044,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.head_padding = self.spin_head.value()
         self.project.tail_padding = self.spin_tail.value()
         self.project.phrase_snap_tolerance = self.spin_snap.value()
-        self.project.steps = self.spin_steps.value()
-        self.project.cfg = self.spin_cfg.value()
-        self.project.shift = self.spin_shift.value()
-        self.project.audio_shift = self.spin_audio_shift.value()
-        self.project.ref_image_size = self.combo_ref_size.currentText()
-        self.project.turbo_lora_path = self.edit_turbo_lora.text().strip()
-        self.project.turbo_lora_strength = self.spin_turbo_lora.value()
-        self.project.use_hybrid_model = self.check_hybrid_model.isChecked()
-        self.project.hybrid_model_path = self.edit_hybrid_model.text().strip()
-        self.project.vram_manager_enabled = self.check_vram_manager.isChecked()
-        self.project.vram_auto_bypass = self.check_vram_auto_bypass.isChecked()
-        self.project.sage_attention = self.check_sage.isChecked()
-        self.project.spectrum = self.check_spectrum.isChecked()
+        # Generation/runtime options come from the main MiniMax GUI and are
+        # snapshotted only when a generation job is actually prepared. This keeps
+        # an old project's historical generation snapshot intact while merely reviewing it.
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.unlimited_random_references = bool(self.project.randomize_reference_characters and self.check_unlimited_random_refs.isChecked())
         self.project.references = self._refs_from_table()
@@ -2914,13 +3063,6 @@ class MiniMaxMusicClipWidget(QWidget):
         nearest_idx = min(range(len(MUSIC_FRAME_GRID)), key=lambda i: abs(MUSIC_FRAME_GRID[i] - int(p.max_frames or MUSIC_FRAME_DEFAULT_MAX)))
         self.slider_frames.setValue(nearest_idx)
         self.spin_head.setValue(p.head_padding); self.spin_tail.setValue(p.tail_padding); self.spin_snap.setValue(p.phrase_snap_tolerance)
-        self.spin_steps.setValue(p.steps); self.spin_cfg.setValue(p.cfg); self.spin_shift.setValue(p.shift); self.spin_audio_shift.setValue(p.audio_shift)
-        self.combo_ref_size.setCurrentText(p.ref_image_size if p.ref_image_size in ("match", "max") else "match")
-        self.edit_turbo_lora.setText(p.turbo_lora_path or "")
-        self.spin_turbo_lora.setValue(float(p.turbo_lora_strength or 1.0))
-        self.check_hybrid_model.setChecked(bool(getattr(p, "use_hybrid_model", False)))
-        self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
-        self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self.check_unlimited_random_refs.setChecked(bool(getattr(p, "unlimited_random_references", False)))
         self._update_unlimited_random_ref_controls()
@@ -3036,18 +3178,11 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project = MusicProject(output_dir=str(OUTPUT_ROOT))
         for name in (
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
-            "phrase_snap_tolerance", "steps", "cfg", "shift", "audio_shift",
-            "ref_image_size", "turbo_lora_path", "turbo_lora_strength",
-            "use_hybrid_model", "hybrid_model_path",
-            "vram_manager_enabled", "vram_auto_bypass", "vram_residency_engine",
-            "vram_runtime_free_gb", "vram_text_headroom_gb", "vram_diffusion_headroom_gb",
-            "vram_offload_chunk_mb", "vram_max_resident_weights_gb", "vram_block_check_interval",
-            "vram_async_streams", "vram_video_vae_reserve_gb", "vram_audio_vae_reserve_gb",
-            "vram_residency_fill", "vram_residency_target_free_gb", "vram_residency_warmup_blocks",
-            "vram_residency_refill_interval", "sage_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
+            "phrase_snap_tolerance", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
             "randomize_reference_characters", "unlimited_random_references",
         ):
             setattr(self.project, name, getattr(old, name))
+        self._refresh_generation_settings_snapshot()
         self.project.project_id = ""
         self.project.created_at = ""
         self.project.updated_at = ""
@@ -3396,6 +3531,7 @@ class MiniMaxMusicClipWidget(QWidget):
                         if shot.index == index:
                             shot.output_path = output_path; shot.status = "Generated"; break
                     self._populate_review(select_index=index)
+                    self._write_autosave(force=True)
                     self.status.setText(f"Shot {index} finished. Continuing with the remaining shots...")
                     return
                 except Exception:
@@ -3633,21 +3769,27 @@ class MiniMaxMusicClipWidget(QWidget):
         out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
         raw_dir = out_dir / "raw_clips"
         found = 0
+        changed = False
         for shot in self.project.shots:
-            expected = raw_dir / f"shot_{shot.index:03d}.mp4"
-            current = Path(shot.output_path) if shot.output_path else None
-            if current is not None and current.is_file():
-                if shot.status != "Generated":
+            active = _latest_shot_output(raw_dir, shot.index, shot.output_path)
+            if active is not None:
+                active_text = str(active)
+                if shot.output_path != active_text or shot.status != "Generated":
+                    shot.output_path = active_text
                     shot.status = "Generated"
+                    changed = True
                 found += 1
-                continue
-            if expected.is_file():
-                shot.output_path = str(expected)
-                shot.status = "Generated"
-                found += 1
-            elif shot.status == "Generated":
+            elif shot.status == "Generated" or shot.output_path:
                 shot.output_path = ""
                 shot.status = "Planned"
+                changed = True
+        # Persist a discovered retry immediately so preview, assembly and the next
+        # restart all agree on the same active file.
+        if changed:
+            try:
+                _persist_project_manifest(self.project, snapshot_assets=False)
+            except Exception:
+                pass
         return found
 
     def _populate_review(self, select_index: Optional[int] = None) -> None:
@@ -3760,51 +3902,22 @@ class MiniMaxMusicClipWidget(QWidget):
         prompt_sidecar.write_text(generation_prompt, encoding="utf-8")
 
         width, height = RESOLUTION_PRESETS[self.project.resolution][self.project.aspect]
+        gen_cfg = _effective_generation_settings(self.project)
         args = [
             "helpers/generate_ref.py",
             "--prompt", generation_prompt,
             "--width", str(width), "--height", str(height),
-            "--frames", str(shot.frames), "--steps", str(self.project.steps),
-            "--cfg", str(self.project.cfg), "--seed", str(shot.seed),
-            "--shift", str(self.project.shift), "--audio-shift", str(self.project.audio_shift),
-            "--ref-image-size", self.project.ref_image_size,
+            "--frames", str(shot.frames), "--steps", str(int(gen_cfg.get("steps", 15))),
+            "--cfg", str(float(gen_cfg.get("cfg", 1.0))), "--seed", str(shot.seed),
+            "--shift", str(float(gen_cfg.get("shift", 12.0))), "--audio-shift", str(float(gen_cfg.get("audio_shift", 3.0))),
+            "--sampler", str(gen_cfg.get("sampler", "euler") or "euler"),
+            "--scheduler", str(gen_cfg.get("scheduler", "beta") or "beta"),
+            "--ref-image-size", str(gen_cfg.get("ref_size", "match") or "match"),
             "--ref-audio", str(audio_chunk),
             "--lock-source-audio-index", "1",
             "--output", str(out_path),
         ]
-        if self.project.use_hybrid_model:
-            hybrid = Path(str(self.project.hybrid_model_path or "").strip())
-            if not hybrid.is_file():
-                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
-            args += ["--ref2va-checkpoint", str(hybrid.resolve())]
-        if self.project.vram_manager_enabled:
-            args += ["--vram-manager-auto" if self.project.vram_auto_bypass else "--vram-manager"]
-            args += [
-                "--vram-residency-engine", str(self.project.vram_residency_engine or "static"),
-                "--vram-runtime-free-gb", str(float(self.project.vram_runtime_free_gb)),
-                "--vram-text-headroom-gb", str(float(self.project.vram_text_headroom_gb)),
-                "--vram-diffusion-headroom-gb", str(float(self.project.vram_diffusion_headroom_gb)),
-                "--vram-offload-chunk-mb", str(int(self.project.vram_offload_chunk_mb)),
-                "--vram-max-resident-weights-gb", str(float(self.project.vram_max_resident_weights_gb)),
-                "--vram-block-check-interval", str(int(self.project.vram_block_check_interval)),
-                "--vram-async-streams", str(int(self.project.vram_async_streams)),
-                "--vram-video-vae-reserve-gb", str(float(self.project.vram_video_vae_reserve_gb)),
-                "--vram-audio-vae-reserve-gb", str(float(self.project.vram_audio_vae_reserve_gb)),
-                "--vram-residency-target-free-gb", str(float(self.project.vram_residency_target_free_gb)),
-                "--vram-residency-warmup-blocks", str(int(self.project.vram_residency_warmup_blocks)),
-                "--vram-residency-refill-interval", str(int(self.project.vram_residency_refill_interval)),
-            ]
-            args += ["--vram-residency-fill" if self.project.vram_residency_fill else "--no-vram-residency-fill"]
-        if self.project.sage_attention:
-            args += ["--sage-attention"]
-        if self.project.spectrum:
-            args += ["--spectrum"]
-        turbo_lora = str(self.project.turbo_lora_path or "").strip()
-        if turbo_lora:
-            turbo_path = Path(turbo_lora)
-            if not turbo_path.is_file():
-                raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
-            args += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(self.project.turbo_lora_strength))]
+        _append_main_gui_generation_args(args, self.project)
         for ref in selected:
             args += ["--ref-image", ref.path]
         shot.output_path = str(out_path)
@@ -3814,7 +3927,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "output": str(out_path),
             "label": f"Music Clip Shot {shot.index}: {(self.project.title or _safe_stem(self.project.audio_path))}",
             "frames": int(shot.frames),
-            "steps": int(self.project.steps),
+            "steps": int(gen_cfg.get("steps", 15)),
             "seed": int(shot.seed),
             "resolution": f"{width} × {height}",
             "prompt": generation_prompt,
@@ -3828,6 +3941,7 @@ class MiniMaxMusicClipWidget(QWidget):
         if not self._queue_mode_active():
             return
         self._pull_ui()
+        self._refresh_generation_settings_snapshot()
         self._prepare_generation_seeds(list(indices))
         by_index = {s.index: s for s in self.project.shots}
         queued = 0
@@ -3853,9 +3967,9 @@ class MiniMaxMusicClipWidget(QWidget):
         out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
         raw_dir = out_dir / "raw_clips"
         for shot in self.project.shots:
-            expected = raw_dir / f"shot_{shot.index:03d}.mp4"
-            if not shot.output_path:
-                shot.output_path = str(expected)
+            active = _latest_shot_output(raw_dir, shot.index, shot.output_path)
+            if active is not None:
+                shot.output_path = str(active)
         queue_dir = out_dir / "_queue"
         queue_dir.mkdir(parents=True, exist_ok=True)
         snapshot = queue_dir / f"assembly_project_{int(time.time() * 1000)}.json"
@@ -3906,6 +4020,7 @@ class MiniMaxMusicClipWidget(QWidget):
         _GENERATION_CANCEL.clear()
         self.btn_stop_generation.setEnabled(True)
         self._pull_ui()
+        self._refresh_generation_settings_snapshot()
         self._ensure_project_output_folder(reset_generated_state=True)
         base_seed = self._prepare_generation_seeds(indices)
         selected_index = indices[0] if len(indices) == 1 else None
@@ -3962,28 +4077,6 @@ class MiniMaxMusicClipWidget(QWidget):
         self._pull_ui()
         path = self._ensure_project_output_folder(reset_generated_state=False)
         path.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
-
-    def _sync_hybrid_model_controls(self, enabled: bool) -> None:
-        enabled = bool(enabled)
-        self.edit_hybrid_model.setEnabled(enabled)
-        self.btn_hybrid_model.setEnabled(enabled)
-
-    def _browse_hybrid_model(self) -> None:
-        start = self.edit_hybrid_model.text().strip() or str(ROOT / "models" / "minimax_h3")
-        path, _ = QFileDialog.getOpenFileName(self, "Select hybrid MiniMax H3 checkpoint", start, "SafeTensors (*.safetensors);;All files (*.*)")
-        if path:
-            self.edit_hybrid_model.setText(path)
-            self._pull_ui(); self._save_settings()
-
-    def _browse_turbo_lora(self) -> None:
-        start = self.edit_turbo_lora.text().strip()
-        if start and Path(start).is_file():
-            start = str(Path(start).parent)
-        if not start:
-            start = str(ROOT / "models" / "minimax_h3" / "loras")
-        path, _ = QFileDialog.getOpenFileName(self, "Select MiniMax Turbo / speed LoRA", start, "LoRA files (*.safetensors *.pt *.bin);;All files (*.*)")
-        if path:
-            self.edit_turbo_lora.setText(path)
 
     # ---- working-session autosave ----
     def _autosave_payload(self, pull_ui: bool = True) -> Dict[str, Any]:
@@ -4061,6 +4154,10 @@ class MiniMaxMusicClipWidget(QWidget):
         self.label_frames.setText(f"{frames} frames (~{frames / FPS:.2f} s)")
 
     def _load_settings(self) -> None:
+        """Load only Music Clip Creator-specific preferences.
+
+        Generation/model/runtime settings intentionally live only in the main MiniMax GUI.
+        """
         try:
             if SETTINGS_PATH.is_file():
                 data = json.loads(_read_text_tolerant(SETTINGS_PATH))
@@ -4068,59 +4165,26 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.resolution = str(data.get("resolution") or self.project.resolution)
                 self.project.aspect = str(data.get("aspect") or self.project.aspect)
                 self.project.max_frames = int(data.get("max_frames") or self.project.max_frames)
-                self.project.steps = int(data.get("steps") or self.project.steps)
-                self.project.turbo_lora_path = str(data.get("turbo_lora_path") or self.project.turbo_lora_path)
-                self.project.turbo_lora_strength = float(data.get("turbo_lora_strength", self.project.turbo_lora_strength))
-                # Migration: older Music Clip Creator builds stored one vram_auto flag.
-                if "vram_manager_enabled" in data:
-                    self.project.vram_manager_enabled = bool(data.get("vram_manager_enabled"))
-                    self.project.vram_auto_bypass = bool(data.get("vram_auto_bypass", True))
-                elif "vram_auto" in data:
-                    # Old checked state meant --vram-manager-auto; old unchecked state meant no manager.
-                    self.project.vram_manager_enabled = bool(data.get("vram_auto"))
-                    self.project.vram_auto_bypass = True
-                for key in (
-                    "vram_residency_engine", "vram_runtime_free_gb", "vram_text_headroom_gb",
-                    "vram_diffusion_headroom_gb", "vram_offload_chunk_mb", "vram_max_resident_weights_gb",
-                    "vram_block_check_interval", "vram_async_streams", "vram_video_vae_reserve_gb",
-                    "vram_audio_vae_reserve_gb", "vram_residency_fill", "vram_residency_target_free_gb",
-                    "vram_residency_warmup_blocks", "vram_residency_refill_interval",
-                ):
-                    if key in data:
-                        setattr(self.project, key, data[key])
-                self.project.use_hybrid_model = bool(data.get("use_hybrid_model", self.project.use_hybrid_model))
-                self.project.hybrid_model_path = str(data.get("hybrid_model_path") or self.project.hybrid_model_path)
-                self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
-                self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
+                self.project.head_padding = float(data.get("head_padding", self.project.head_padding))
+                self.project.tail_padding = float(data.get("tail_padding", self.project.tail_padding))
+                self.project.phrase_snap_tolerance = float(data.get("phrase_snap_tolerance", self.project.phrase_snap_tolerance))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
                 self.project.unlimited_random_references = bool(data.get("unlimited_random_references", self.project.unlimited_random_references))
         except Exception:
             pass
+        self._refresh_generation_settings_snapshot()
 
     def _save_settings(self) -> None:
         try:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             data = {
-                "output_dir": self.project.output_dir, "resolution": self.project.resolution, "aspect": self.project.aspect,
-                "max_frames": self.project.max_frames, "steps": self.project.steps,
-                "vram_manager_enabled": self.project.vram_manager_enabled, "vram_auto_bypass": self.project.vram_auto_bypass,
-                "vram_residency_engine": self.project.vram_residency_engine,
-                "vram_runtime_free_gb": self.project.vram_runtime_free_gb,
-                "vram_text_headroom_gb": self.project.vram_text_headroom_gb,
-                "vram_diffusion_headroom_gb": self.project.vram_diffusion_headroom_gb,
-                "vram_offload_chunk_mb": self.project.vram_offload_chunk_mb,
-                "vram_max_resident_weights_gb": self.project.vram_max_resident_weights_gb,
-                "vram_block_check_interval": self.project.vram_block_check_interval,
-                "vram_async_streams": self.project.vram_async_streams,
-                "vram_video_vae_reserve_gb": self.project.vram_video_vae_reserve_gb,
-                "vram_audio_vae_reserve_gb": self.project.vram_audio_vae_reserve_gb,
-                "vram_residency_fill": self.project.vram_residency_fill,
-                "vram_residency_target_free_gb": self.project.vram_residency_target_free_gb,
-                "vram_residency_warmup_blocks": self.project.vram_residency_warmup_blocks,
-                "vram_residency_refill_interval": self.project.vram_residency_refill_interval,
-                "turbo_lora_path": self.project.turbo_lora_path, "turbo_lora_strength": self.project.turbo_lora_strength,
-                "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
-                "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
+                "output_dir": self.project.output_dir,
+                "resolution": self.project.resolution,
+                "aspect": self.project.aspect,
+                "max_frames": self.project.max_frames,
+                "head_padding": self.project.head_padding,
+                "tail_padding": self.project.tail_padding,
+                "phrase_snap_tolerance": self.project.phrase_snap_tolerance,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
                 "unlimited_random_references": self.project.unlimited_random_references,
             }

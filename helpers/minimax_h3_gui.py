@@ -773,15 +773,38 @@ class MainWindow(QMainWindow):
         self.system_hud = SystemHud(self)
         outer.addWidget(self.system_hud, 0)
 
+        # One shared preview/player pane for the whole application.  The actual
+        # preview widget is created by the Queue builder below, then adopted into
+        # this outer splitter after all tabs exist.  Prompt Builder is the sole
+        # exception: it keeps its full-width embedded web workspace.
+        self.global_preview_splitter = QSplitter(Qt.Orientation.Horizontal, root)
+        self.global_preview_splitter.setChildrenCollapsible(False)
+        self.global_preview_splitter.setHandleWidth(6)
+        self.global_preview_host = QWidget(self.global_preview_splitter)
+        self.global_preview_host.setObjectName("GlobalPreviewHost")
+        self.global_preview_host.setMinimumWidth(360)
+        self.global_preview_layout = QVBoxLayout(self.global_preview_host)
+        self.global_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.global_preview_layout.setSpacing(0)
+        self.global_preview_host.hide()
+
         self.tabs = QTabWidget()
         self.tabs.setUsesScrollButtons(False)  # tab strip itself never scrolls
         self.tabs.setDocumentMode(True)
-        outer.addWidget(self.tabs, 1)
+        self.global_preview_splitter.addWidget(self.global_preview_host)
+        self.global_preview_splitter.addWidget(self.tabs)
+        self.global_preview_splitter.setStretchFactor(0, 5)
+        self.global_preview_splitter.setStretchFactor(1, 8)
+        self.global_preview_splitter.setSizes([0, 1200])
+        self.global_preview_splitter.splitterMoved.connect(self._remember_global_preview_width)
+        outer.addWidget(self.global_preview_splitter, 1)
+
         self._build_generation_tab()
         self._build_prompt_builder_tab()
         self._build_queue_tab()
         self._build_music_clip_tab()
         self._build_settings_tab()
+        self._adopt_global_preview_pane()
 
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.
         bar = QWidget(); bar.setObjectName("bottomBar")
@@ -795,7 +818,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self._add_tooltips()
         self.tabs.currentChanged.connect(self._sync_main_generate_button)
+        self.tabs.currentChanged.connect(self._sync_global_preview_for_tab)
         self._sync_main_generate_button(self.tabs.currentIndex())
+        self._sync_global_preview_for_tab(self.tabs.currentIndex())
 
         for cls in (QComboBox, QSpinBox, QDoubleSpinBox):
             for w in self.findChildren(cls):
@@ -2080,13 +2105,26 @@ class MainWindow(QMainWindow):
         preferred=[x for x in lines if any(k in x.lower() for k in ("error","failed","exception","traceback","not found","missing"))]
         return (preferred[-1] if preferred else (lines[-1] if lines else f"Process exited with code {code}"))[:1500]
 
+    def _music_clip_generation_settings(self):
+        """Single source of truth for Music Clip Creator generation jobs.
+
+        Return the live main-GUI configuration. The main GUI already persists this
+        state on normal save/generate/close paths, while Music Clip jobs consume the
+        exact same in-memory settings immediately.
+        """
+        return self.settings_dict()
+
     def _build_music_clip_tab(self):
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         try:
             from minimax_music_clip import MiniMaxMusicClipWidget
-            self.music_clip_widget = MiniMaxMusicClipWidget(page, queue_adapter=self._enqueue_music_clip_job)
+            self.music_clip_widget = MiniMaxMusicClipWidget(
+                page,
+                queue_adapter=self._enqueue_music_clip_job,
+                settings_provider=self._music_clip_generation_settings,
+            )
             lay.addWidget(self.music_clip_widget, 1)
             self.music_clip_tab_index = self.tabs.addTab(page, "Music Clip Creator")
         except Exception as exc:
@@ -2198,12 +2236,12 @@ class MainWindow(QMainWindow):
         self.system_hud_toggle.toggled.connect(self._set_system_hud_visible)
         v.addWidget(self.system_hud_toggle)
 
-        self.preview_in_main_toggle = QCheckBox("Show preview pane in main tab")
+        self.preview_in_main_toggle = QCheckBox("Show preview pane globally in the app")
         self.preview_in_main_toggle.setChecked(True)
         self.preview_in_main_toggle.setToolTip(
-            "Move the Queue video preview/player to the left side of the main Generation tab. "
-            "The Generation controls move to the right and a vertical splitter handle lets you resize both sides. "
-            "When enabled, the Queue tab uses its full width for the job lists."
+            "Show one shared preview/player pane on the left throughout the standalone app. "
+            "The same splitter position is kept while switching between Generation, Queue, Music Clip Creator and Settings. "
+            "Prompt Builder remains full width and temporarily hides the preview. Default: On."
         )
         self.preview_in_main_toggle.toggled.connect(self._set_preview_in_main_tab)
         v.addWidget(self.preview_in_main_toggle)
@@ -2421,41 +2459,84 @@ class MainWindow(QMainWindow):
         v.addStretch(1)
         self.tabs.addTab(self._scroll_page(body), "Settings")
 
-    def _set_preview_in_main_tab(self, enabled, persist=True):
-        """Move the single preview/player pane between Queue and Generation."""
+    def _adopt_global_preview_pane(self):
+        """Move the one real preview/player into the application-wide splitter."""
         if not all(hasattr(self, name) for name in (
-            "preview_pane", "queue_preview_host", "queue_preview_layout",
-            "generation_preview_host", "generation_preview_layout",
+            "preview_pane", "global_preview_host", "global_preview_layout",
+            "queue_preview_host", "generation_preview_host",
             "queue_splitter", "generation_splitter"
         )):
             return
-        enabled = bool(enabled)
         try:
-            # Remove from whichever host currently owns it before re-parenting.
             self.queue_preview_layout.removeWidget(self.preview_pane)
             self.generation_preview_layout.removeWidget(self.preview_pane)
-            if enabled:
-                self.preview_pane.setParent(self.generation_preview_host)
-                self.generation_preview_layout.addWidget(self.preview_pane, 1)
-                self.queue_preview_host.hide()
-                self.generation_preview_host.show()
-                self.queue_splitter.setSizes([0, max(900, self.queue_splitter.width())])
-                self.generation_splitter.setSizes([520, 650])
-            else:
-                self.preview_pane.setParent(self.queue_preview_host)
-                self.queue_preview_layout.addWidget(self.preview_pane, 1)
-                self.generation_preview_host.hide()
-                self.queue_preview_host.show()
-                self.queue_splitter.setSizes([520, 650])
-                self.generation_splitter.setSizes([0, max(900, self.generation_splitter.width())])
+            self.preview_pane.setParent(self.global_preview_host)
+            self.global_preview_layout.addWidget(self.preview_pane, 1)
+
+            # The old per-tab preview hosts are retained only as harmless
+            # compatibility shells.  Collapse them completely so each tab uses
+            # its full right-hand workspace inside the shared outer splitter.
+            self.queue_preview_host.hide()
+            self.generation_preview_host.hide()
+            self.queue_splitter.setSizes([0, max(900, self.queue_splitter.width())])
+            self.generation_splitter.setSizes([0, max(900, self.generation_splitter.width())])
             self.preview_pane.show()
-            self.queue_splitter.updateGeometry()
-            self.generation_splitter.updateGeometry()
+        except RuntimeError:
+            return
+
+    def _remember_global_preview_width(self, pos, _index):
+        """Remember the user's shared splitter position across tab changes."""
+        try:
+            if self.global_preview_host.isVisible() and int(pos) >= 360:
+                self._global_preview_width = int(pos)
+        except (RuntimeError, AttributeError, TypeError, ValueError):
+            pass
+
+    def _sync_global_preview_for_tab(self, index=None):
+        """Show the shared preview on every main tab except Prompt Builder."""
+        if not all(hasattr(self, name) for name in (
+            "global_preview_splitter", "global_preview_host", "preview_pane",
+            "preview_in_main_toggle", "tabs"
+        )):
+            return
+        if index is None:
+            index = self.tabs.currentIndex()
+        try:
+            tab_name = self.tabs.tabText(int(index)) if int(index) >= 0 else ""
+        except Exception:
+            tab_name = ""
+        enabled = bool(self.preview_in_main_toggle.isChecked())
+        show_preview = enabled and tab_name != "Prompt Builder"
+        try:
+            if show_preview:
+                self.global_preview_host.show()
+                self.preview_pane.show()
+                total = max(1000, self.global_preview_splitter.width())
+                remembered = int(getattr(self, "_global_preview_width", 520) or 520)
+                preview_w = max(360, min(remembered, max(360, total - 520)))
+                self.global_preview_splitter.setSizes([preview_w, max(520, total - preview_w)])
+            else:
+                sizes = self.global_preview_splitter.sizes()
+                if sizes and sizes[0] >= 360:
+                    self._global_preview_width = sizes[0]
+                self.global_preview_host.hide()
+                self.global_preview_splitter.setSizes([0, max(900, self.global_preview_splitter.width())])
+            self.global_preview_splitter.updateGeometry()
             self._schedule_layout_refresh()
         except RuntimeError:
             return
 
-        # Save this UI preference immediately, just like the HUD setting.
+    def _set_preview_in_main_tab(self, enabled, persist=True):
+        """Backward-compatible setter for the now global preview preference."""
+        enabled = bool(enabled)
+        if hasattr(self, "preview_in_main_toggle") and self.preview_in_main_toggle.isChecked() != enabled:
+            self.preview_in_main_toggle.blockSignals(True)
+            self.preview_in_main_toggle.setChecked(enabled)
+            self.preview_in_main_toggle.blockSignals(False)
+        self._sync_global_preview_for_tab()
+
+        # Save the new global key while also mirroring the legacy key so an older
+        # build can still understand the preference if the user rolls back.
         if persist:
             try:
                 PRESET_DIR.mkdir(parents=True, exist_ok=True)
@@ -2463,6 +2544,8 @@ class MainWindow(QMainWindow):
                 d = {}
                 if p.is_file():
                     d = json.loads(p.read_text(encoding="utf-8"))
+                d["preview_global"] = enabled
+                d["preview_global_width"] = int(getattr(self, "_global_preview_width", 520) or 520)
                 d["preview_in_main_tab"] = enabled
                 p.write_text(json.dumps(d, indent=2), encoding="utf-8")
             except Exception:
@@ -2773,6 +2856,8 @@ class MainWindow(QMainWindow):
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
+            "preview_global": self.preview_in_main_toggle.isChecked(),
+            "preview_global_width": int(getattr(self, "_global_preview_width", 520) or 520),
             "preview_in_main_tab": self.preview_in_main_toggle.isChecked(),
             "auto_update_enabled": self.auto_update_enabled.isChecked(),
             "font_size_pt": int(self.font_size_slider.value()) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
@@ -2820,7 +2905,8 @@ class MainWindow(QMainWindow):
             self.extended_logging.setChecked(bool(d.get("extended_logging", False)))
             self.tile_debugging.setChecked(bool(d.get("tile_debugging", False)))
             self.system_hud_toggle.setChecked(bool(d.get("system_hud", True)))
-            self.preview_in_main_toggle.setChecked(bool(d.get("preview_in_main_tab", False)))
+            self._global_preview_width = max(360, int(d.get("preview_global_width", 520) or 520))
+            self.preview_in_main_toggle.setChecked(bool(d.get("preview_global", d.get("preview_in_main_tab", True))))
             self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
             saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
             self.font_size_slider.blockSignals(True)
@@ -3386,7 +3472,11 @@ class MainWindow(QMainWindow):
         if not path.is_file():
             return
         if self.play_result_queue_player.isChecked():
-            self.tabs.setCurrentIndex(0 if self.preview_in_main_toggle.isChecked() else 2)
+            if self.preview_in_main_toggle.isChecked():
+                if self.tabs.tabText(self.tabs.currentIndex()) == "Prompt Builder":
+                    self.tabs.setCurrentIndex(0)
+            else:
+                self.tabs.setCurrentIndex(2)
             self._load_preview(job, autoplay=True)
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
