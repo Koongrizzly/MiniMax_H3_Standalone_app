@@ -31,16 +31,63 @@ def load_video_24(path, max_frames):
             if len(frames)>=max_frames: break
     if not frames: raise ValueError(f'No decodable video frames: {path}')
     return torch.stack(frames)
+def _load_pcm16_wav(path):
+    """Load a normalized PCM16 WAV without torchaudio's TorchCodec backend.
+
+    Newer torchaudio builds route ``torchaudio.load`` through TorchCodec.  That
+    makes Ref2VA input decoding depend on matching libtorchcodec/FFmpeg DLLs even
+    though MiniMax only needs ordinary PCM samples here.  The app already owns a
+    verified FFmpeg toolchain, so normalize with FFmpeg and read the resulting
+    PCM16 WAV directly with Python's stdlib instead.
+    """
+    import wave
+    with wave.open(str(path), 'rb') as wf:
+        channels = int(wf.getnchannels())
+        sample_width = int(wf.getsampwidth())
+        sample_rate = int(wf.getframerate())
+        frames = int(wf.getnframes())
+        if sample_width != 2:
+            raise RuntimeError(f'Expected PCM16 WAV, got sample width {sample_width} bytes: {path}')
+        raw = wf.readframes(frames)
+    pcm = np.frombuffer(raw, dtype='<i2')
+    if channels > 1:
+        pcm = pcm.reshape(-1, channels).T
+    else:
+        pcm = pcm.reshape(1, -1)
+    waveform = torch.from_numpy(pcm.astype(np.float32, copy=True) / 32768.0)
+    return waveform, sample_rate
+
+
+def _normalize_audio_to_pcm16(path, wav):
+    ok, msg = ensure_ffmpeg_tools(lambda x: print(x, flush=True))
+    if not ok:
+        raise RuntimeError('FFmpeg tools unavailable: ' + msg)
+    ff = str(tool_path('ffmpeg.exe'))
+    r = subprocess.run(
+        [ff, '-y', '-i', str(path), '-vn', '-ac', '2', '-ar', '32000', '-c:a', 'pcm_s16le', str(wav)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if r.returncode or not Path(wav).is_file():
+        raise RuntimeError(f'FFmpeg could not decode reference audio: {path}')
+
+
 def extract_audio(path,tmpdir):
     wav=Path(tmpdir)/('ref_'+Path(path).stem+'.wav')
-    ok, msg = ensure_ffmpeg_tools(lambda x: print(x, flush=True))
-    if not ok: raise RuntimeError('FFmpeg tools unavailable: ' + msg)
-    ff=str(tool_path('ffmpeg.exe'))
-    r=subprocess.run([ff,'-y','-i',str(path),'-vn','-ac','2','-ar','32000',str(wav)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    if r.returncode or not wav.is_file(): return None
-    waveform,sr=torchaudio.load(str(wav)); return {'waveform':waveform.unsqueeze(0),'sample_rate':sr}
+    _normalize_audio_to_pcm16(path, wav)
+    waveform,sr=_load_pcm16_wav(wav)
+    return {'waveform':waveform.unsqueeze(0),'sample_rate':sr}
+
+
 def load_audio(path):
-    waveform,sr=torchaudio.load(str(path)); return {'waveform':waveform.unsqueeze(0),'sample_rate':sr}
+    # Always normalize through the app-local FFmpeg first.  Besides accepting the
+    # same formats everywhere, this avoids torchaudio.load -> TorchCodec and its
+    # external libtorchcodec DLL dependency in the standalone environment.
+    with tempfile.TemporaryDirectory(prefix='minimax_ref_audio_') as td:
+        wav=Path(td)/'reference.wav'
+        _normalize_audio_to_pcm16(path, wav)
+        waveform,sr=_load_pcm16_wav(wav)
+    return {'waveform':waveform.unsqueeze(0),'sample_rate':sr}
 def encode_audio(vae,audio):
     w=audio['waveform']; sr=audio['sample_rate']; vsr=getattr(vae,'audio_sample_rate',32000)
     if sr!=vsr: w=torchaudio.functional.resample(w,sr,vsr)
