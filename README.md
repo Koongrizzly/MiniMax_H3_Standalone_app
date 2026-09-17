@@ -1,7 +1,7 @@
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026-08-16%2020_56_27-MiniMax%20H3%20INT4%20Standalone.jpg.jpg)
 
 
-# MiniMax H3 INT4 Standalone
+# MiniMax H3 Standalone
 ---
 ---
 - A Windows desktop application for running MiniMax H3 locally on NVIDIA RTX GPUs using pre-quantized INT4 / W4A8 ConvRot model weights.
