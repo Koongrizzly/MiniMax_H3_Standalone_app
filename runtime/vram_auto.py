@@ -191,41 +191,36 @@ def _stage_decision(required: float, usable, label: str, needed: bool = True):
     }
 
 
-def _is_large_int8_hybrid_checkpoint(path) -> bool:
-    """Return True for the large experimental/fused INT8 hybrid H3 checkpoints.
+def _is_int8_hybrid_checkpoint(path) -> bool:
+    """Return True for experimental INT8 hybrid/SparseRef H3 diffusion checkpoints.
 
-    These models are roughly 19-21 GiB on disk. On 24 GiB cards FL2VA/I2V can
-    look safe to the generic W4A8 estimator while its diffusion activations still
-    push CUDA to the physical limit and spill heavily into WDDM shared memory.
+    The generic automatic estimator is calibrated for the stock W4A8 checkpoints.
+    INT8 hybrid/SparseRef checkpoints have a materially different residency profile,
+    so their filename is a more reliable discriminator than an arbitrary file-size
+    cutoff (pruned/partial hybrids can be smaller on disk and still exceed 24 GiB
+    once diffusion activations are present).
     """
     if not path:
         return False
     try:
-        p = Path(path)
-        name = p.name.lower()
+        name = Path(path).name.lower()
         hybrid_name = any(token in name for token in ("hybrid", "sparseref", "fused"))
-        int8_name = "int8" in name
-        if not (hybrid_name and int8_name):
-            return False
-        # Keep the rule narrowly scoped to the large diffusion checkpoints, not
-        # unrelated INT8 assets that happen to contain the same words.
-        size_gib = _file_gib(p, 0.0)
-        return size_gib >= 17.0
+        return hybrid_name and "int8" in name
     except Exception:
         return False
 
 
-def _force_fl2va_hybrid_manager(stages, *, width: int, height: int, mode: str, diffusion_model_path=None):
-    """Force managed diffusion for large INT8 hybrids above the 480p class.
+def _force_int8_hybrid_manager(stages, *, total_gib=None, diffusion_model_path=None):
+    """Fail safe for INT8 hybrid checkpoints on 32 GiB-and-smaller GPUs.
 
-    832x480 and smaller keep the normal automatic decision. Ref2VA is deliberately
-    untouched because current 24 GiB tests show its automatic path behaves well.
+    Automatic bypass must not apply the stock-W4A8 diffusion estimate to these
+    checkpoints. On 24 GiB cards that can fill dedicated VRAM and spill several
+    GiB into WDDM shared memory before the runtime manager has been installed.
+    Larger cards keep the normal per-stage automatic decision.
     """
-    if str(mode).lower() != "fl2va":
+    if not _is_int8_hybrid_checkpoint(diffusion_model_path):
         return
-    if not _is_large_int8_hybrid_checkpoint(diffusion_model_path):
-        return
-    if int(width) * int(height) <= 832 * 480:
+    if total_gib is not None and float(total_gib) > 32.0:
         return
 
     d = stages.get("diffusion")
@@ -233,8 +228,9 @@ def _force_fl2va_hybrid_manager(stages, *, width: int, height: int, mode: str, d
         return
     d["use_manager"] = True
     d["reason"] = (
-        "large INT8 hybrid FL2VA/I2V above 832x480; forcing managed diffusion "
-        "to prevent 24 GiB CUDA saturation and WDDM shared-memory spill"
+        "INT8 hybrid/SparseRef checkpoint on <=32 GiB GPU; forcing managed diffusion "
+        "because the stock W4A8 auto estimate can understate hybrid residency and "
+        "cause dedicated-VRAM saturation/shared-memory spill"
     )
 
 
@@ -311,11 +307,9 @@ def decide_vram_stages(
             needed=True,
         ),
     }
-    _force_fl2va_hybrid_manager(
+    _force_int8_hybrid_manager(
         stages,
-        width=width,
-        height=height,
-        mode=mode,
+        total_gib=total,
         diffusion_model_path=diffusion_model_path,
     )
     return {
