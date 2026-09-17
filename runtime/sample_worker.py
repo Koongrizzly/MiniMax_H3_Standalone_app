@@ -202,7 +202,7 @@ def main():
             use_int8_pv=False,
             engine='comfy_kitchen',
         )
-        print('[SLA] enabled | tested preset | sparsity=0.85 | block=32 | min_seq_len=12288 | dense_last_steps=1 | dense_steps=1 | protect_audio=ON | ref_protection=Off | dense_backend=comfy_kitchen | engine=comfy_kitchen', flush=True)
+        print('[SLA] enabled | screenshot preset | sparsity=0.85 | block=32 | min_seq_len=12288 | dense_last_steps=1 | dense_steps=1 | protect_audio=ON | ref_protection=Off | dense_backend=comfy_kitchen | engine=comfy_kitchen', flush=True)
     spectrum_controller = None
     if ns.spectrum:
         from runtime.h3_spectrum import MiniMaxH3Spectrum, MIN_FIT_POINTS

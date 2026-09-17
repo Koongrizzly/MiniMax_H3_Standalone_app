@@ -9,6 +9,7 @@ def main() -> int:
         import requests
         import triton
         import sageattention
+        import comfy_kitchen
         from sageattention import sageattn_qk_int8_pv_fp16_cuda
         from PySide6 import QtCore
     except Exception as e:
@@ -36,6 +37,12 @@ def main() -> int:
     print("Triton-Windows:", triton_version)
     print("SageAttention:", sage_version)
     print("Sage H3-safe kernel: sageattn_qk_int8_pv_fp16_cuda = OK")
+    try:
+        ck_ver = package_version("comfy-kitchen")
+    except Exception:
+        ck_ver = getattr(comfy_kitchen, "__version__", "unknown")
+    print("Comfy Kitchen:", ck_ver)
+    print("Comfy Kitchen SLA kernel: sol_attn =", "OK" if hasattr(comfy_kitchen, "sol_attn") else "MISSING (SLA requires >=0.2.32)")
     print("Runtime smoke test OK")
     return 0
 
