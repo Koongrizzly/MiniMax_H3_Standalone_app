@@ -819,7 +819,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MiniMax H3 INT4 Standalone")
+        self.setWindowTitle("minimax H3 Standalone")
         # 1180x900 is only the fallback geometry used after the user explicitly
         # restores the window.  Normal application startup is maximized.
         self.resize(1180, 900)
@@ -930,7 +930,7 @@ class MainWindow(QMainWindow):
 
     def _build(self):
         root = QWidget(); outer = QVBoxLayout(root); outer.setContentsMargins(10, 10, 10, 10); outer.setSpacing(8)
-        hdr = QHBoxLayout(); title = QLabel("MiniMax H3 INT4"); title.setObjectName("title")
+        hdr = QHBoxLayout(); title = QLabel("minimax H3"); title.setObjectName("title")
         self.status = QLabel("Checking install…"); self.status.setObjectName("status")
         hdr.addWidget(title); hdr.addStretch(); hdr.addWidget(self.status); outer.addLayout(hdr)
 
@@ -1510,14 +1510,22 @@ class MainWindow(QMainWindow):
         left_layout.addStretch(0)
         self.queue_preview_layout.addWidget(self.preview_pane, 1)
 
-        # ---- RIGHT: queue lists, this side alone scrolls -------------------------
-        right_scroll = QScrollArea(splitter)
+        # ---- RIGHT: scrolling queue lists + fixed action footer ------------------
+        # Keep the action buttons outside the scroll area so queue maintenance is
+        # always reachable even when Finished contains a very long history.
+        right_host = QWidget(splitter)
+        right_host.setObjectName("QueueRightHost")
+        right_host.setMinimumWidth(520)
+        right_host_layout = QVBoxLayout(right_host)
+        right_host_layout.setContentsMargins(0,0,0,0)
+        right_host_layout.setSpacing(8)
+
+        right_scroll = QScrollArea(right_host)
         right_scroll.setObjectName("QueueJobsScrollArea")
         right_scroll.setWidgetResizable(True)
         right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         right_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        right_scroll.setMinimumWidth(520)
 
         right_content = QWidget()
         right_content.setObjectName("QueueJobsScrollContent")
@@ -1542,15 +1550,17 @@ class MainWindow(QMainWindow):
         self.pending_tree.setMinimumHeight(190)
         self.finished_tree.setMinimumHeight(190)
 
+        # Keep the newest results where they are visible immediately when opening
+        # Queue: Finished first, then currently Running, then Pending work.
+        self.finished_group = QGroupBox("Finished / failed (0)")
+        fg = QVBoxLayout(self.finished_group); fg.addWidget(self.finished_tree)
+        right_layout.addWidget(self.finished_group)
         self.running_group = QGroupBox("Running jobs (0)")
         rg = QVBoxLayout(self.running_group); rg.addWidget(self.running_tree)
         right_layout.addWidget(self.running_group)
         self.pending_group = QGroupBox("Pending jobs (0)")
         pg = QVBoxLayout(self.pending_group); pg.addWidget(self.pending_tree)
         right_layout.addWidget(self.pending_group)
-        self.finished_group = QGroupBox("Finished / failed (0)")
-        fg = QVBoxLayout(self.finished_group); fg.addWidget(self.finished_tree)
-        right_layout.addWidget(self.finished_group)
 
         self.running_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.running_tree.customContextMenuRequested.connect(lambda pos:self._queue_context_menu(self.running_tree,pos,"running"))
@@ -1560,12 +1570,32 @@ class MainWindow(QMainWindow):
         self.finished_tree.customContextMenuRequested.connect(lambda pos:self._queue_context_menu(self.finished_tree,pos,"finished"))
         self.finished_tree.itemDoubleClicked.connect(lambda item,col:self._play_job_item(item))
 
-        clearrow = QHBoxLayout()
-        clearrow.addStretch(1)
+        right_layout.addStretch(1)
+        right_scroll.setWidget(right_content)
+        right_host_layout.addWidget(right_scroll, 1)
+
+        # Fixed queue action footer. Two compact rows prevent the controls from
+        # disappearing off-screen on narrower window sizes.
+        footer = QWidget(right_host)
+        footer.setObjectName("QueueActionFooter")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0,0,4,0)
+        footer_layout.setSpacing(6)
+
+        actionrow = QHBoxLayout()
+        actionrow.addStretch(1)
         self.cancel_all_btn = QPushButton("Cancel all")
         self.cancel_all_btn.setToolTip("Cancel the current run and remove all pending jobs from the queue.")
         self.cancel_all_btn.clicked.connect(self._cancel_all_jobs)
-        clearrow.addWidget(self.cancel_all_btn)
+        actionrow.addWidget(self.cancel_all_btn)
+        self.reset_counter_btn = QPushButton("Reset counter")
+        self.reset_counter_btn.setToolTip("Reset the internal queue job counter so the next queued job starts again at Job #1.")
+        self.reset_counter_btn.clicked.connect(self._reset_queue_counter)
+        actionrow.addWidget(self.reset_counter_btn)
+        footer_layout.addLayout(actionrow)
+
+        clearrow = QHBoxLayout()
+        clearrow.addStretch(1)
         self.clear_cancelled_btn = QPushButton("Clear cancelled")
         self.clear_cancelled_btn.setToolTip("Remove cancelled jobs from this queue history only. Files on disk are not deleted.")
         self.clear_cancelled_btn.clicked.connect(self._clear_cancelled_jobs)
@@ -1578,12 +1608,11 @@ class MainWindow(QMainWindow):
         self.clear_finished_btn.setToolTip("Remove finished and failed jobs from this queue history only. Output files on disk are not deleted.")
         self.clear_finished_btn.clicked.connect(self._clear_finished_jobs)
         clearrow.addWidget(self.clear_finished_btn)
-        right_layout.addLayout(clearrow)
-        right_layout.addStretch(1)
+        footer_layout.addLayout(clearrow)
+        right_host_layout.addWidget(footer, 0)
 
-        right_scroll.setWidget(right_content)
         splitter.addWidget(self.queue_preview_host)
-        splitter.addWidget(right_scroll)
+        splitter.addWidget(right_host)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 6)
         splitter.setSizes([520, 650])
@@ -1618,30 +1647,34 @@ class MainWindow(QMainWindow):
         return next((j for j in self.queue_jobs if j.get("id")==jid),None)
 
     def _ensure_queue_job_numbers(self):
-        """Give every persisted queue entry a stable human-readable Job #."""
-        used=set()
-        for job in self.queue_jobs:
+        """Ensure persisted entries have a display number without defeating a manual counter reset."""
+        missing=[]
+        used=[]
+        for i, job in enumerate(self.queue_jobs):
             try:
                 n=int(job.get("job_number") or 0)
             except Exception:
                 n=0
-            if n > 0 and n not in used:
+            if n > 0:
                 job["job_number"]=n
-                used.add(n)
+                used.append(n)
             else:
                 job.pop("job_number", None)
+                missing.append((i, job))
 
-        # Old queue files had UUIDs only. Assign their numbers chronologically,
-        # without changing the queue's actual list/order semantics.
-        missing=[(i,j) for i,j in enumerate(self.queue_jobs) if not j.get("job_number")]
-        missing.sort(key=lambda pair:(float(pair[1].get("created_at") or 0), pair[0]))
-        next_number=max(used, default=0)+1
-        for _, job in missing:
-            while next_number in used:
+        # Migration for genuinely old queue files that had UUIDs only. Existing
+        # numbered rows are deliberately left untouched, including duplicates after
+        # a user-requested counter reset. Dependencies are keyed by UUID, not number.
+        if missing:
+            missing.sort(key=lambda pair:(float(pair[1].get("created_at") or 0), pair[0]))
+            next_number=max(used, default=0)+1
+            for _, job in missing:
+                job["job_number"]=next_number
+                used.append(next_number)
                 next_number += 1
-            job["job_number"]=next_number
-            used.add(next_number)
-            next_number += 1
+            self._next_job_number_value=max(int(getattr(self,"_next_job_number_value",1) or 1), next_number)
+        else:
+            self._next_job_number_value=max(1, int(getattr(self,"_next_job_number_value",1) or 1))
 
         # Cache the dependency's display number in the child too, so a historical
         # source can still be identified after its queue-history row is removed.
@@ -1652,8 +1685,6 @@ class MainWindow(QMainWindow):
                 dep=by_id.get(dep_id)
                 if dep and dep.get("job_number"):
                     job["continue_from_job_number"]=int(dep["job_number"])
-
-        self._next_job_number_value=max(int(getattr(self,"_next_job_number_value",1) or 1), max(used, default=0)+1)
 
     def _take_next_job_number(self):
         self._ensure_queue_job_numbers()
@@ -1771,7 +1802,13 @@ class MainWindow(QMainWindow):
             now=time.time(); spin=("◐","◓","◑","◒")[self._spinner_index%4]
             counts={"running":0,"pending":0,"finished":0}
             normal_brush=QBrush(QColor("#e8eef6")); failed_brush=QBrush(QColor("#ff8f8f")); done_brush=QBrush(QColor("#9be7b0"))
-            for j in self.queue_jobs:
+            # Render terminal jobs newest-first while preserving the existing
+            # order semantics of Running/Pending jobs.  queue_jobs itself is not
+            # reordered because dependency and pending scheduling logic use it.
+            active_jobs = [j for j in self.queue_jobs if j.get("state") not in ("finished", "failed", "cancelled")]
+            terminal_jobs = [j for j in self.queue_jobs if j.get("state") in ("finished", "failed", "cancelled")]
+            terminal_jobs.sort(key=lambda j: float(j.get("finished_at") or j.get("created_at") or 0), reverse=True)
+            for j in active_jobs + terminal_jobs:
                 state=j.get("state")
                 job_label=self._job_number_text(j)
                 dependency=self._dependency_display(j)
@@ -2016,6 +2053,22 @@ class MainWindow(QMainWindow):
             self._stop_running_job("cancel")
         else:
             self.status.setText("Queue ready")
+
+    def _reset_queue_counter(self):
+        ans = QMessageBox.warning(
+            self,
+            "Reset queue counter",
+            "This will reset the internal queue counter. Do not use this while a 'continue last result' job is running to avoid mismatch assembly with the previous result(s).",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if ans != QMessageBox.StandardButton.Ok:
+            return
+        # Counter value 1 means the next newly queued item is displayed as Job #1.
+        # Existing history is intentionally kept as-is. Queue dependencies use UUIDs.
+        self._next_job_number_value = 1
+        self._save_queue_state()
+        self.status.setText("Queue counter reset; next job will be Job #1")
 
     def _clear_finished_jobs(self):
         # Queue-history cleanup only; generated files remain untouched.
@@ -2412,15 +2465,12 @@ class MainWindow(QMainWindow):
         self.system_hud_toggle.toggled.connect(self._set_system_hud_visible)
         v.addWidget(self.system_hud_toggle)
 
+        # Preview pane is now a permanent application-wide feature.  Keep the
+        # compatibility checkbox object because older settings/utility code still
+        # references it, but do not expose an option that can turn the pane off.
         self.preview_in_main_toggle = QCheckBox("Show preview pane globally in the app")
         self.preview_in_main_toggle.setChecked(True)
-        self.preview_in_main_toggle.setToolTip(
-            "Show one shared preview/player pane on the left throughout the standalone app. "
-            "The same splitter position is kept while switching between Generation, Queue, Music Clip Creator and Settings. "
-            "Prompt Builder remains full width and temporarily hides the preview. Default: On."
-        )
-        self.preview_in_main_toggle.toggled.connect(self._set_preview_in_main_tab)
-        v.addWidget(self.preview_in_main_toggle)
+        self.preview_in_main_toggle.setVisible(False)
 
         self.sage_attention_enabled = QCheckBox("Enable SageAttention")
         self.sage_attention_enabled.setChecked(False)
@@ -2449,11 +2499,11 @@ class MainWindow(QMainWindow):
         self.play_result_finished.setChecked(True)
         v.addWidget(self.play_result_finished)
 
+        # Finished results always use the embedded preview pane.  Retain the old
+        # checkbox as an internal compatibility flag, permanently enabled/hidden.
         self.play_result_queue_player = QCheckBox("Use player in Queue (Off = Windows default player)")
         self.play_result_queue_player.setChecked(True)
-        self.play_result_queue_player.setVisible(True)
-        self.play_result_finished.toggled.connect(self.play_result_queue_player.setVisible)
-        v.addWidget(self.play_result_queue_player)
+        self.play_result_queue_player.setVisible(False)
 
         self.auto_update_enabled = QCheckBox("Auto update app")
         self.auto_update_enabled.setChecked(True)
@@ -2669,34 +2719,24 @@ class MainWindow(QMainWindow):
             pass
 
     def _sync_global_preview_for_tab(self, index=None):
-        """Show the shared preview on every main tab except Prompt Builder."""
+        """Keep the shared preview visible on the left on every application tab."""
         if not all(hasattr(self, name) for name in (
-            "global_preview_splitter", "global_preview_host", "preview_pane",
-            "preview_in_main_toggle", "tabs"
+            "global_preview_splitter", "global_preview_host", "preview_pane", "tabs"
         )):
             return
-        if index is None:
-            index = self.tabs.currentIndex()
         try:
-            tab_name = self.tabs.tabText(int(index)) if int(index) >= 0 else ""
-        except Exception:
-            tab_name = ""
-        enabled = bool(self.preview_in_main_toggle.isChecked())
-        show_preview = enabled and tab_name != "Prompt Builder"
-        try:
-            if show_preview:
-                self.global_preview_host.show()
-                self.preview_pane.show()
-                total = max(1000, self.global_preview_splitter.width())
-                remembered = int(getattr(self, "_global_preview_width", 520) or 520)
-                preview_w = max(360, min(remembered, max(360, total - 520)))
-                self.global_preview_splitter.setSizes([preview_w, max(520, total - preview_w)])
-            else:
-                sizes = self.global_preview_splitter.sizes()
-                if sizes and sizes[0] >= 360:
-                    self._global_preview_width = sizes[0]
-                self.global_preview_host.hide()
-                self.global_preview_splitter.setSizes([0, max(900, self.global_preview_splitter.width())])
+            # This is intentionally forced on.  Old saved settings that had the
+            # former toggle disabled must not hide the global preview anymore.
+            if hasattr(self, "preview_in_main_toggle"):
+                self.preview_in_main_toggle.blockSignals(True)
+                self.preview_in_main_toggle.setChecked(True)
+                self.preview_in_main_toggle.blockSignals(False)
+            self.global_preview_host.show()
+            self.preview_pane.show()
+            total = max(1000, self.global_preview_splitter.width())
+            remembered = int(getattr(self, "_global_preview_width", 520) or 520)
+            preview_w = max(360, min(remembered, max(360, total - 520)))
+            self.global_preview_splitter.setSizes([preview_w, max(520, total - preview_w)])
             self.global_preview_splitter.updateGeometry()
             self._schedule_layout_refresh()
         except RuntimeError:
@@ -3040,13 +3080,13 @@ class MainWindow(QMainWindow):
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
-            "preview_global": self.preview_in_main_toggle.isChecked(),
+            "preview_global": True,
             "preview_global_width": int(getattr(self, "_global_preview_width", 520) or 520),
-            "preview_in_main_tab": self.preview_in_main_toggle.isChecked(),
+            "preview_in_main_tab": True,
             "auto_update_enabled": self.auto_update_enabled.isChecked(),
             "font_size_pt": int(self.font_size_slider.value()) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
             "play_result_finished": self.play_result_finished.isChecked(),
-            "play_result_queue_player": self.play_result_queue_player.isChecked(),
+            "play_result_queue_player": True,
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
             "sage_attention_enabled": self.sage_attention_enabled.isChecked(),
             "sol_attention_enabled": self.sol_attention_enabled.isChecked(),
@@ -3090,7 +3130,7 @@ class MainWindow(QMainWindow):
             self.tile_debugging.setChecked(bool(d.get("tile_debugging", False)))
             self.system_hud_toggle.setChecked(bool(d.get("system_hud", True)))
             self._global_preview_width = max(360, int(d.get("preview_global_width", 520) or 520))
-            self.preview_in_main_toggle.setChecked(bool(d.get("preview_global", d.get("preview_in_main_tab", True))))
+            self.preview_in_main_toggle.setChecked(True)
             self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
             saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
             self.font_size_slider.blockSignals(True)
@@ -3100,14 +3140,14 @@ class MainWindow(QMainWindow):
             self._update_font_size_label(saved_font)
             self._apply_style()
             self.play_result_finished.setChecked(bool(d.get("play_result_finished", False)))
-            self.play_result_queue_player.setChecked(bool(d.get("play_result_queue_player", False)))
-            self.play_result_queue_player.setVisible(self.play_result_finished.isChecked())
+            self.play_result_queue_player.setChecked(True)
+            self.play_result_queue_player.setVisible(False)
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
             self.sol_attention_enabled.setChecked(bool(d.get("sol_attention_enabled", False)))
             self.sla_attention_enabled.setChecked(bool(d.get("sla_attention_enabled", False)))
             self._set_system_hud_visible(self.system_hud_toggle.isChecked())
-            self._set_preview_in_main_tab(self.preview_in_main_toggle.isChecked())
+            self._set_preview_in_main_tab(True)
             self.vram_manager_enabled.setChecked(bool(d.get("vram_manager_enabled", True)))
             self.vram_manager_auto_bypass.setChecked(bool(d.get("vram_manager_auto_bypass", True)))
             engine = str(d.get("vram_residency_engine", "static")).lower()
@@ -3168,7 +3208,7 @@ class MainWindow(QMainWindow):
         self._set_preview_in_main_tab(True, persist=False)
         self.play_result_finished.setChecked(True)
         self.play_result_queue_player.setChecked(True)
-        self.play_result_queue_player.setVisible(True)
+        self.play_result_queue_player.setVisible(False)
         self.steps.setValue(15)
         self.scheduler.setCurrentText("simple")
 
@@ -3657,15 +3697,10 @@ class MainWindow(QMainWindow):
         path = Path(job.get("output", ""))
         if not path.is_file():
             return
-        if self.play_result_queue_player.isChecked():
-            if self.preview_in_main_toggle.isChecked():
-                if self.tabs.tabText(self.tabs.currentIndex()) == "Prompt Builder":
-                    self.tabs.setCurrentIndex(0)
-            else:
-                self.tabs.setCurrentIndex(2)
-            self._load_preview(job, autoplay=True)
-        else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+        # Results now always use the permanent global preview pane.  The separate
+        # Play result when finished toggle still controls whether this happens
+        # automatically; it no longer switches between embedded/system players.
+        self._load_preview(job, autoplay=True)
 
     def _finished(self, code, status):
         self._process_output()
@@ -3774,7 +3809,7 @@ def main():
             pass
 
     app = QApplication(sys.argv)
-    app.setApplicationName("MiniMax H3 INT4 Standalone")
+    app.setApplicationName("minimax H3 Standalone")
 
     app_icon = QIcon(str(APP_ICON)) if APP_ICON.is_file() else QIcon()
     if not app_icon.isNull():
