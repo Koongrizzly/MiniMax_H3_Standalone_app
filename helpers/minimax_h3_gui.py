@@ -926,6 +926,11 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             # A late queued refresh can race with application shutdown.
             pass
+        # WebEngine/native layout updates can occur after the tab change and
+        # splitter update.  Re-assert the Prompt Builder exception after each
+        # queued layout refresh so it cannot regress a moment later.
+        if hasattr(self, "tabs") and hasattr(self, "global_preview_host"):
+            self._enforce_prompt_builder_full_width()
 
     def _build(self):
         root = QWidget(); outer = QVBoxLayout(root); outer.setContentsMargins(10, 10, 10, 10); outer.setSpacing(8)
@@ -953,12 +958,23 @@ class MainWindow(QMainWindow):
         self.global_preview_host.hide()
 
         self.tabs = QTabWidget()
-        self.tabs.setUsesScrollButtons(False)  # tab strip itself never scrolls
+        # When the global preview pane is widened the right-hand workspace can
+        # become narrower than the complete tab strip.  Keep all tabs at their
+        # normal readable width and let Qt expose its native left/right tab
+        # navigation buttons only while there is an overflow.
+        self.tabs.setUsesScrollButtons(True)
         self.tabs.setDocumentMode(True)
+        # Do not let the largest tab's sizeHint impose an artificial minimum on
+        # the right side of the global splitter.  Several tabs contain wide
+        # controls, but they are already scrollable; the preview must still be
+        # able to grow to about half of the application window.
+        self.tabs.setMinimumWidth(0)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self.global_preview_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.global_preview_splitter.addWidget(self.global_preview_host)
         self.global_preview_splitter.addWidget(self.tabs)
-        self.global_preview_splitter.setStretchFactor(0, 5)
-        self.global_preview_splitter.setStretchFactor(1, 8)
+        self.global_preview_splitter.setStretchFactor(0, 1)
+        self.global_preview_splitter.setStretchFactor(1, 1)
         self.global_preview_splitter.setSizes([0, 1200])
         self.global_preview_splitter.splitterMoved.connect(self._remember_global_preview_width)
         outer.addWidget(self.global_preview_splitter, 1)
@@ -1155,7 +1171,23 @@ class MainWindow(QMainWindow):
             fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(fallback, 1)
 
-        self.tabs.addTab(page, "Prompt Builder")
+        # Keep a direct reference to the Prompt Builder page.  Tab indexes can
+        # become stale if tabs/layouts are rebuilt or restored later, while the
+        # widget identity is stable for the lifetime of this window.
+        self.prompt_builder_page = page
+        self.prompt_builder_tab_index = self.tabs.addTab(page, "Prompt Builder")
+
+        # The embedded page starts asynchronously and can perform a visible
+        # reload shortly after the user opens this tab.  Re-assert the Prompt
+        # Builder's full-width layout around those loads so the global preview
+        # can never pop back in during WebEngine startup/reload.
+        if self.prompt_webview is not None:
+            try:
+                self.prompt_webview.loadStarted.connect(self._enforce_prompt_builder_full_width)
+                self.prompt_webview.loadFinished.connect(lambda _ok=True: self._enforce_prompt_builder_full_width())
+            except Exception:
+                pass
+
         self.builder_timer = QTimer(self)
         self.builder_timer.setInterval(1500)
         self.builder_timer.timeout.connect(self._poll_prompt_builder_status)
@@ -2715,28 +2747,63 @@ class MainWindow(QMainWindow):
         except (RuntimeError, AttributeError, TypeError, ValueError):
             pass
 
+    def _prompt_builder_is_active(self):
+        """Return True only when the actual Prompt Builder page is selected."""
+        try:
+            page = getattr(self, "prompt_builder_page", None)
+            if page is not None:
+                return self.tabs.currentWidget() is page
+            # Compatibility fallback for builds/settings created before the
+            # direct page reference existed.
+            return self.tabs.currentIndex() == int(getattr(self, "prompt_builder_tab_index", -1))
+        except (RuntimeError, AttributeError, TypeError, ValueError):
+            return False
+
+    def _enforce_prompt_builder_full_width(self, *_args):
+        """Keep Prompt Builder full width through delayed WebEngine reloads."""
+        if not self._prompt_builder_is_active():
+            return
+        try:
+            self.global_preview_host.hide()
+            total = max(1000, self.global_preview_splitter.width())
+            self.global_preview_splitter.setSizes([0, total])
+            self.global_preview_splitter.updateGeometry()
+        except (RuntimeError, AttributeError, TypeError, ValueError):
+            return
+
     def _sync_global_preview_for_tab(self, index=None):
-        """Keep the shared preview visible on the left on every application tab."""
+        """Show the shared preview globally except on the full-width Prompt Builder tab."""
         if not all(hasattr(self, name) for name in (
             "global_preview_splitter", "global_preview_host", "preview_pane", "tabs"
         )):
             return
         try:
-            # This is intentionally forced on.  Old saved settings that had the
-            # former toggle disabled must not hide the global preview anymore.
+            # Keep the old setting permanently enabled for every normal app tab.
             if hasattr(self, "preview_in_main_toggle"):
                 self.preview_in_main_toggle.blockSignals(True)
                 self.preview_in_main_toggle.setChecked(True)
                 self.preview_in_main_toggle.blockSignals(False)
+
+            # Use the selected page itself rather than relying on a cached tab
+            # index. This remains correct through delayed builder startup/reload.
+            if self._prompt_builder_is_active():
+                self._enforce_prompt_builder_full_width()
+                self._schedule_layout_refresh()
+                return
+
             self.global_preview_host.show()
             self.preview_pane.show()
             total = max(1000, self.global_preview_splitter.width())
             remembered = int(getattr(self, "_global_preview_width", 520) or 520)
-            preview_w = max(360, min(remembered, max(360, total - 520)))
-            self.global_preview_splitter.setSizes([preview_w, max(520, total - preview_w)])
+            # The shared preview is intentionally allowed to occupy up to half
+            # of the available width.  The tab side can shrink below its size
+            # hint because its actual content is scrollable where necessary.
+            max_preview = max(360, total // 2)
+            preview_w = max(360, min(remembered, max_preview))
+            self.global_preview_splitter.setSizes([preview_w, max(1, total - preview_w)])
             self.global_preview_splitter.updateGeometry()
             self._schedule_layout_refresh()
-        except RuntimeError:
+        except (RuntimeError, TypeError, ValueError):
             return
 
     def _set_preview_in_main_tab(self, enabled, persist=True):
