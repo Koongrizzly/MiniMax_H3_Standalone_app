@@ -12,7 +12,7 @@ It supports :
 
 - 09/13/26 :
 
-  Added support for several int8 models, including the MiniMax H3_SparseRef15_Hybrid model or convrot int8 models.
+  Added support for several int8 models, including the singularity & SparseRef15_Hybrid checkpoints.
   Slower but better quality, More choice between speed and quality while still trying to make it work on most RTX gpu cards.
   download them wherever you want and load them in the app. 
 
