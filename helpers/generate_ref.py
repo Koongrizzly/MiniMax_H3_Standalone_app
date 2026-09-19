@@ -152,7 +152,7 @@ def main():
     # Backend fail-safe: older presets/CLI jobs can still carry the old 0.50 GB
     # runtime floor.  Hybrid/SparseRef/Fused checkpoints get at least 1.50 GB
     # before the worker starts so Comfy's initial reserve is safe too.
-    _diff_name = Path(diff).name.lower()
+    _diff_name = Path(ref).name.lower() if ref else ""
     _hybrid_checkpoint = any(token in _diff_name for token in ("hybrid", "sparseref", "fused"))
     if bool(ns.vram_manager or ns.vram_manager_auto) and _hybrid_checkpoint and float(ns.vram_runtime_free_gb) < 1.50:
         print(f"[VRAM-MGR] Hybrid checkpoint detected; raising runtime minimum free {ns.vram_runtime_free_gb:g} -> 1.5 GB", flush=True)

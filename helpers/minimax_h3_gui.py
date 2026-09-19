@@ -554,8 +554,8 @@ RESOLUTION_PRESETS = {
 DEFAULT_RESOLUTION = "832 × 448"
 NORMAL_FRAME_MAX = 719   # last H3 native-grid value below 30 seconds (29.958 s at 24 FPS)
 EXPERIMENTAL_FRAME_MAX = 2385  # last H3 native-grid value at/below 100 seconds (99.375 s at 24 FPS)
-FRAME_PRESETS = sorted(set(list(range(124, NORMAL_FRAME_MAX + 1, 17)) + [480]))
-EXPERIMENTAL_FRAME_PRESETS = sorted(set(list(range(124, EXPERIMENTAL_FRAME_MAX + 1, 17)) + [480]))
+FRAME_PRESETS = list(range(124, NORMAL_FRAME_MAX + 1, 17))
+EXPERIMENTAL_FRAME_PRESETS = list(range(124, EXPERIMENTAL_FRAME_MAX + 1, 17))
 SAMPLERS = [
     "euler", "euler_cfg_pp", "euler_ancestral", "euler_ancestral_cfg_pp",
     "heun", "heunpp2", "dpm_2", "dpm_2_ancestral", "dpmpp_2m",
