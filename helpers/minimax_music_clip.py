@@ -94,6 +94,68 @@ OUTPUT_ROOT = ROOT / "output" / "minimax_music_clips"
 SETTINGS_PATH = ROOT / "presets" / "minimax_music_clip_settings.json"
 MAIN_GUI_SETTINGS_PATH = ROOT / "presets" / "setsave" / "minimax_h3_gui_last.json"
 AUTOSAVE_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip.json"
+FILE_DIALOG_HISTORY = ROOT / "presets" / "setsave" / "minimax_file_dialog_history.json"
+
+
+def _dialog_start_dir(key: str, preferred: str | Path | None = None, fallback: str | Path | None = None) -> str:
+    for candidate in (preferred,):
+        if candidate:
+            try:
+                q = Path(str(candidate)).expanduser()
+                if q.is_file():
+                    q = q.parent
+                if q.is_dir():
+                    return str(q)
+            except Exception:
+                pass
+    try:
+        if FILE_DIALOG_HISTORY.is_file():
+            data = json.loads(_read_text_tolerant(FILE_DIALOG_HISTORY))
+            folders = data.get("folders", {}) if isinstance(data, dict) else {}
+            for candidate in (folders.get(key), data.get("last_folder")):
+                if candidate and Path(candidate).is_dir():
+                    return str(Path(candidate))
+    except Exception:
+        pass
+    try:
+        q = Path(str(fallback or ROOT)).expanduser()
+        if q.is_file():
+            q = q.parent
+        if q.is_dir():
+            return str(q)
+    except Exception:
+        pass
+    return str(ROOT)
+
+
+def _remember_dialog_folder(key: str, selected: str | Path) -> None:
+    if not selected:
+        return
+    try:
+        q = Path(str(selected)).expanduser()
+        folder = q if q.is_dir() else q.parent
+        if not folder.is_dir():
+            return
+        data = {}
+        if FILE_DIALOG_HISTORY.is_file():
+            try:
+                data = json.loads(_read_text_tolerant(FILE_DIALOG_HISTORY))
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        folders = data.get("folders")
+        if not isinstance(folders, dict):
+            folders = {}
+        folders[key] = str(folder)
+        data["folders"] = folders
+        data["last_folder"] = str(folder)
+        FILE_DIALOG_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FILE_DIALOG_HISTORY.with_suffix(FILE_DIALOG_HISTORY.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(FILE_DIALOG_HISTORY)
+    except Exception:
+        pass
 PROJECT_MANIFEST_NAME = "minimax_music_project.json"
 PROJECT_MARKER_NAME = ".minimax_music_project.json"
 PROJECT_ASSETS_DIRNAME = "project_assets"
@@ -3194,8 +3256,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self._write_autosave(force=True)
 
     def _browse_audio(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select master song", "", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All files (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select master song", _dialog_start_dir("music_audio", fallback=ROOT), "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All files (*.*)")
         if path:
+            _remember_dialog_folder("music_audio", path)
             self.edit_audio.setText(path)
             if not self.edit_title.text().strip(): self.edit_title.setText(Path(path).stem)
             # A newly selected track invalidates the old project's output binding.
@@ -3218,8 +3281,12 @@ class MiniMaxMusicClipWidget(QWidget):
             self.label_duration.setText(f"Duration: {_fmt_time(dur)} ({dur:.2f} s)" if dur else "Duration: unknown")
 
     def _browse_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select project output folder", self.edit_output.text().strip() or str(OUTPUT_ROOT))
-        if path: self.edit_output.setText(path)
+        current_output = self.edit_output.text().strip()
+        preferred_output = current_output if current_output and Path(current_output) != OUTPUT_ROOT else None
+        path = QFileDialog.getExistingDirectory(self, "Select project output folder", _dialog_start_dir("music_output", preferred_output, OUTPUT_ROOT))
+        if path:
+            _remember_dialog_folder("music_output", path)
+            self.edit_output.setText(path)
 
     def _save_project(self, force_as: bool = False) -> None:
         """Compatibility entry point: project saving is automatic and job-folder scoped."""
@@ -3233,10 +3300,11 @@ class MiniMaxMusicClipWidget(QWidget):
         self._write_autosave(force=True)
 
     def _open_project(self) -> None:
-        start_dir = self.project.output_dir if self.project.output_dir and Path(self.project.output_dir).is_dir() else str(OUTPUT_ROOT)
-        folder = QFileDialog.getExistingDirectory(self, "Load MiniMax music job folder", start_dir)
+        preferred = self.project.output_dir if self.project.output_dir and Path(self.project.output_dir).is_dir() else None
+        folder = QFileDialog.getExistingDirectory(self, "Load MiniMax music job folder", _dialog_start_dir("music_projects", preferred, OUTPUT_ROOT))
         if not folder:
             return
+        _remember_dialog_folder("music_projects", folder)
         try:
             project, manifest = _load_project_manifest(Path(folder))
             self.project = project
@@ -3293,17 +3361,19 @@ class MiniMaxMusicClipWidget(QWidget):
             self.status.setText(f"Added {added} reference image{'s' if added != 1 else ''}.")
 
     def _add_reference(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add MiniMax reference images", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add MiniMax reference images", _dialog_start_dir("music_ref_images", fallback=ROOT), "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
         if not paths:
             return
+        _remember_dialog_folder("music_ref_images", paths[0])
         self._append_reference_paths(paths)
 
     def _add_reference_folder(self) -> None:
         if not self._unlimited_random_refs_enabled():
             return
-        folder = QFileDialog.getExistingDirectory(self, "Add random reference folder", "")
+        folder = QFileDialog.getExistingDirectory(self, "Add random reference folder", _dialog_start_dir("music_ref_images", fallback=ROOT))
         if not folder:
             return
+        _remember_dialog_folder("music_ref_images", folder)
         root = Path(folder)
         paths = [str(p) for p in sorted(root.iterdir(), key=lambda x: x.name.lower()) if p.is_file() and self._supported_reference_image(p)]
         if not paths:
@@ -3378,11 +3448,12 @@ class MiniMaxMusicClipWidget(QWidget):
         audio = self.edit_audio.text().strip()
         if not audio or not Path(audio).is_file():
             path, _ = QFileDialog.getOpenFileName(
-                self, "Select master song for the video clip", "",
+                self, "Select master song for the video clip", _dialog_start_dir("music_audio", fallback=ROOT),
                 "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All files (*.*)"
             )
             if not path:
                 return
+            _remember_dialog_folder("music_audio", path)
             self.edit_audio.setText(path)
             if not self.edit_title.text().strip():
                 self.edit_title.setText(Path(path).stem)

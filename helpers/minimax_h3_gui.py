@@ -35,6 +35,69 @@ APP_UPDATE_ZIP = f"https://api.github.com/repos/{APP_UPDATE_REPO}/zipball"
 APP_UPDATE_STATE = PRESET_DIR / "minimax_h3_update_state.json"
 APP_UPDATE_EXCLUDED_TOP = {"environments", "models", "output", "logs", "jobs", ".git"}
 APP_UPDATE_EXCLUDED_PREFIXES = {"presets/setsave", "h3_prompt_builder/.runtime"}
+FILE_DIALOG_HISTORY = PRESET_DIR / "minimax_file_dialog_history.json"
+
+
+def _dialog_start_dir(key: str, preferred: str | Path | None = None, fallback: str | Path | None = None) -> str:
+    """Return a useful persistent start folder for QFileDialog."""
+    for candidate in (preferred,):
+        if candidate:
+            try:
+                q = Path(str(candidate)).expanduser()
+                if q.is_file():
+                    q = q.parent
+                if q.is_dir():
+                    return str(q)
+            except Exception:
+                pass
+    try:
+        if FILE_DIALOG_HISTORY.is_file():
+            data = json.loads(FILE_DIALOG_HISTORY.read_text(encoding="utf-8"))
+            folders = data.get("folders", {}) if isinstance(data, dict) else {}
+            for candidate in (folders.get(key), data.get("last_folder")):
+                if candidate and Path(candidate).is_dir():
+                    return str(Path(candidate))
+    except Exception:
+        pass
+    try:
+        q = Path(str(fallback or ROOT)).expanduser()
+        if q.is_file():
+            q = q.parent
+        if q.is_dir():
+            return str(q)
+    except Exception:
+        pass
+    return str(ROOT)
+
+
+def _remember_dialog_folder(key: str, selected: str | Path) -> None:
+    if not selected:
+        return
+    try:
+        q = Path(str(selected)).expanduser()
+        folder = q if q.is_dir() else q.parent
+        if not folder.is_dir():
+            return
+        data = {}
+        if FILE_DIALOG_HISTORY.is_file():
+            try:
+                data = json.loads(FILE_DIALOG_HISTORY.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        folders = data.get("folders")
+        if not isinstance(folders, dict):
+            folders = {}
+        folders[key] = str(folder)
+        data["folders"] = folders
+        data["last_folder"] = str(folder)
+        PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = FILE_DIALOG_HISTORY.with_suffix(FILE_DIALOG_HISTORY.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(FILE_DIALOG_HISTORY)
+    except Exception:
+        pass
 
 
 try:
@@ -472,9 +535,11 @@ class FileRow(QWidget):
         self.thumb.setToolTip(path)
 
     def browse(self):
-        start = self.path() or str(ROOT)
+        start = _dialog_start_dir("images", self.path(), ROOT)
         p, _ = QFileDialog.getOpenFileName(self, "Select file", start, self.filter)
-        if p: self.edit.setText(p)
+        if p:
+            _remember_dialog_folder("images", p)
+            self.edit.setText(p)
 
     def _ensure_preview_dialog(self):
         if self.preview_dialog is None:
@@ -511,10 +576,11 @@ class VideoPathRow(QWidget):
         c = QPushButton("Clear"); c.clicked.connect(self.edit.clear)
         lay.addWidget(self.edit, 1); lay.addWidget(b); lay.addWidget(c)
     def browse(self):
-        start = self.edit.text().strip() or str(ROOT)
-        if Path(start).is_file(): start = str(Path(start).parent)
+        start = _dialog_start_dir("videos", self.edit.text().strip(), ROOT)
         p, _ = QFileDialog.getOpenFileName(self, "Select source video to continue", start, "Video (*.mp4 *.mov *.mkv *.webm *.avi)")
-        if p: self.edit.setText(p)
+        if p:
+            _remember_dialog_folder("videos", p)
+            self.edit.setText(p)
     def path(self): return self.edit.text().strip()
 
 
@@ -528,11 +594,11 @@ class LoraPathRow(QWidget):
         lay.addWidget(self.edit, 1); lay.addWidget(b); lay.addWidget(c)
     def browse(self):
         DEFAULT_LORA_DIR.mkdir(parents=True, exist_ok=True)
-        start = self.edit.text().strip()
-        if start and Path(start).is_file(): start = str(Path(start).parent)
-        elif not start: start = str(DEFAULT_LORA_DIR)
+        start = _dialog_start_dir("loras", self.edit.text().strip(), DEFAULT_LORA_DIR)
         p, _ = QFileDialog.getOpenFileName(self, "Select MiniMax H3 LoRA", start, MODEL_FILTER)
-        if p: self.edit.setText(p)
+        if p:
+            _remember_dialog_folder("loras", p)
+            self.edit.setText(p)
     def path(self): return self.edit.text().strip()
 
 
@@ -547,11 +613,15 @@ class ModelPathRow(QWidget):
         bc = QPushButton("Clear"); bc.clicked.connect(self.edit.clear)
         lay.addWidget(self.edit, 1); lay.addWidget(bf); lay.addWidget(bd); lay.addWidget(bc)
     def browse_file(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Select checkpoint", str(ROOT), MODEL_FILTER)
-        if p: self.edit.setText(p)
+        p, _ = QFileDialog.getOpenFileName(self, "Select checkpoint", _dialog_start_dir("models", self.edit.text().strip(), ROOT), MODEL_FILTER)
+        if p:
+            _remember_dialog_folder("models", p)
+            self.edit.setText(p)
     def browse_folder(self):
-        p = QFileDialog.getExistingDirectory(self, "Select model folder", str(ROOT))
-        if p: self.edit.setText(p)
+        p = QFileDialog.getExistingDirectory(self, "Select model folder", _dialog_start_dir("models", self.edit.text().strip(), ROOT))
+        if p:
+            _remember_dialog_folder("models", p)
+            self.edit.setText(p)
     def path(self): return self.edit.text().strip()
 
 
@@ -564,8 +634,10 @@ class FolderRow(QWidget):
         c = QPushButton("Clear"); c.clicked.connect(self.edit.clear)
         lay.addWidget(self.edit, 1); lay.addWidget(b); lay.addWidget(c)
     def browse(self):
-        p = QFileDialog.getExistingDirectory(self, "Select folder", self.edit.text().strip() or str(ROOT))
-        if p: self.edit.setText(p)
+        p = QFileDialog.getExistingDirectory(self, "Select folder", _dialog_start_dir("folders", self.edit.text().strip(), ROOT))
+        if p:
+            _remember_dialog_folder("folders", p)
+            self.edit.setText(p)
     def path(self): return self.edit.text().strip()
 
 
@@ -607,7 +679,11 @@ class RefList(QWidget):
     def add(self):
         if self.list.count() >= self.max_items:
             QMessageBox.information(self, "Reference limit", f"Maximum {self.max_items} items in this group."); return
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add references", str(ROOT), self.filt)
+        low_filter = self.filt.lower()
+        history_key = "ref_audio" if "audio" in low_filter else ("ref_videos" if "video" in low_filter else "ref_images")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add references", _dialog_start_dir(history_key, fallback=ROOT), self.filt)
+        if paths:
+            _remember_dialog_folder(history_key, paths[0])
         existing = {self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count())}
         for p in paths:
             if self.list.count() >= self.max_items: break
@@ -3062,8 +3138,10 @@ class MainWindow(QMainWindow):
         safe = ''.join(c if c.isalnum() or c in '-_ .' else '_' for c in name).strip().replace(' ', '_')
         PRESET_DIR.mkdir(parents=True, exist_ok=True); p = PRESET_DIR / f"minimax_h3_{safe}.json"; p.write_text(json.dumps(self.settings_dict(), indent=2), encoding="utf-8"); self.status.setText(f"Saved {p.name}")
     def load_named(self):
-        PRESET_DIR.mkdir(parents=True, exist_ok=True); p, _ = QFileDialog.getOpenFileName(self, "Load preset", str(PRESET_DIR), "JSON (*.json)")
-        if p: self.apply_settings(json.loads(Path(p).read_text(encoding="utf-8")))
+        PRESET_DIR.mkdir(parents=True, exist_ok=True); p, _ = QFileDialog.getOpenFileName(self, "Load preset", _dialog_start_dir("presets", fallback=PRESET_DIR), "JSON (*.json)")
+        if p:
+            _remember_dialog_folder("presets", p)
+            self.apply_settings(json.loads(Path(p).read_text(encoding="utf-8")))
     def safe_preset(self):
         self.mode.setCurrentIndex(0); self.res_class.setCurrentText("576 × 320"); self.aspect.setCurrentText("16:9"); self._set_frame_count(124); self.steps.setValue(10); self.cfg.setValue(1.0); self.shift.setValue(12); self.audio_shift.setValue(3); self.sampler.setCurrentText("euler"); self.scheduler.setCurrentText("simple")
 
