@@ -4,7 +4,7 @@
 # MiniMax H3 Standalone
 ---
 ---
-- A Windows desktop application for running MiniMax H3 locally on NVIDIA RTX GPUs using pre-quantized INT4 / W4A8 ConvRot model weights.
+- A Windows desktop application for running MiniMax H3 locally on NVIDIA RTX GPUs for using pre-quantized INT4 / W4A8 / INT8 model weights.
 - This project provides a standalone PySide6 GUI for MiniMax H3 video generation without requiring the user to install or launch ComfyUI. A minimal comfyui backend to load the models runs in the background
 ---
 
