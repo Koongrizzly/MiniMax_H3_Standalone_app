@@ -547,9 +547,17 @@ RESOLUTION_PRESETS = {
     "736 × 384":  {"16:9": (736, 384),  "9:16": (384, 736),  "1:1": (384, 384)},
     "832 × 448":  {"16:9": (832, 448),  "9:16": (448, 832),  "1:1": (448, 448)},
     "960 × 544":  {"16:9": (960, 544),  "9:16": (544, 960),  "1:1": (544, 544)},
+    "1024 × 576": {"16:9": (1024, 576), "9:16": (576, 1024), "1:1": (576, 576)},
+    "1152 × 640": {"16:9": (1152, 640), "9:16": (640, 1152), "1:1": (640, 640)},
     "1280 × 720": {"16:9": (1280, 704), "9:16": (704, 1280), "1:1": (704, 704)},
     "1344 × 768": {"16:9": (1344, 768), "9:16": (768, 1344), "1:1": (768, 768)},
     "1920 × 1088":{"16:9": (1920, 1088),"9:16": (1088, 1920),"1:1": (1088, 1088)},
+}
+# Exact 21:9 (7:3) presets. All dimensions stay on MiniMax's 32-pixel grid.
+WIDESCREEN_21_9_PRESETS = {
+    "Low — 896 × 384": (896, 384),
+    "Medium — 1344 × 576": (1344, 576),
+    "High — 1792 × 768": (1792, 768),
 }
 DEFAULT_RESOLUTION = "832 × 448"
 NORMAL_FRAME_MAX = 719   # last H3 native-grid value below 30 seconds (29.958 s at 24 FPS)
@@ -1011,8 +1019,10 @@ class MainWindow(QMainWindow):
         body = QWidget(); v = QVBoxLayout(body); v.setContentsMargins(8, 8, 8, 8); v.setSpacing(10)
         basic = QGroupBox("Generation"); form = QFormLayout(basic)
         self.mode = QComboBox(); self.mode.addItems(["Text to video (T2VA)", "Image / Continue Video (FL2VA)", "Reference to video (Ref2VA)"]); self.mode.currentIndexChanged.connect(self._sync_mode)
-        self.aspect = QComboBox(); self.aspect.addItems(["16:9", "9:16", "1:1"]); self.aspect.currentTextChanged.connect(self._sync_resolution)
+        self.aspect = QComboBox(); self.aspect.addItems(["16:9", "9:16", "1:1", "21:9"]); self.aspect.currentTextChanged.connect(self._sync_resolution)
         self.res_class = QComboBox(); self.res_class.addItems(list(RESOLUTION_PRESETS)); self.res_class.setCurrentText(DEFAULT_RESOLUTION); self.res_class.currentTextChanged.connect(self._sync_resolution)
+        self.widescreen_quality = QComboBox(); self.widescreen_quality.addItems(list(WIDESCREEN_21_9_PRESETS)); self.widescreen_quality.setCurrentText("Medium — 1344 × 576"); self.widescreen_quality.currentTextChanged.connect(self._sync_resolution)
+        self.widescreen_quality.setVisible(False)
         self.resolved = QLabel()
         self.frames = QComboBox()
         for x in FRAME_PRESETS:
@@ -1024,7 +1034,7 @@ class MainWindow(QMainWindow):
         self.steps = QSpinBox(); self.steps.setRange(1, 100); self.steps.setValue(15)
         self.seed = QSpinBox(); self.seed.setRange(-1, 98_999_999); self.seed.setValue(-1); self.seed.setSpecialValueText("-1 (random)")
         form.addRow("Mode", self.mode)
-        rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
+        rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.widescreen_quality); rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
         form.addRow("Frames", self.frames); form.addRow("", self.experimental_long_duration); form.addRow("Steps", self.steps); form.addRow("Seed", self.seed)
         v.addWidget(basic)
 
@@ -3000,10 +3010,19 @@ class MainWindow(QMainWindow):
         style = style.replace("__BASE__", str(base)).replace("__TITLE__", str(title)).replace("__HUD__", str(hud))
         self.setStyleSheet(style)
 
+    def _current_resolution(self):
+        aspect = self.aspect.currentText()
+        if aspect == "21:9":
+            return WIDESCREEN_21_9_PRESETS[self.widescreen_quality.currentText()]
+        return RESOLUTION_PRESETS[self.res_class.currentText()][aspect]
+
     def _sync_resolution(self):
-        label = self.res_class.currentText()
-        w, h = RESOLUTION_PRESETS[label][self.aspect.currentText()]
-        if label == "1280 × 720":
+        aspect = self.aspect.currentText()
+        is_widescreen = aspect == "21:9"
+        self.res_class.setVisible(not is_widescreen)
+        self.widescreen_quality.setVisible(is_widescreen)
+        w, h = self._current_resolution()
+        if not is_widescreen and self.res_class.currentText() == "1280 × 720":
             self.resolved.setText(f"Generation: {w} × {h} (704p)")
         else:
             self.resolved.setText(f"{w} × {h}")
@@ -3016,6 +3035,12 @@ class MainWindow(QMainWindow):
         chain = bool(getattr(self, "continue_last_result", None) and self.continue_last_result.isChecked())
         if hasattr(self, "continue_video"):
             self.continue_video.setEnabled(not chain)
+            # When Continue last result is active, the queued dependency is the only
+            # valid source. Clear any manually selected start video immediately so it
+            # cannot linger in the disabled field, be mistaken as still active, or be
+            # persisted back into saved settings.
+            if chain and getattr(self.continue_video, "edit", None) is not None and self.continue_video.edit.text().strip():
+                self.continue_video.edit.clear()
         # A queued-result continuation supplies its own first-frame boundary just like
         # a manually selected Continue Video source. Keep Last frame available as a destination.
         if hasattr(self, "first"):
@@ -3144,9 +3169,9 @@ class MainWindow(QMainWindow):
 
     def settings_dict(self):
         return {
-            "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
+            "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "widescreen_quality": self.widescreen_quality.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
-            "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
+            "continue_video": "" if self.continue_last_result.isChecked() else self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(), "latent_continuation": self.latent_continuation.isChecked(),
             "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "lock_source_audio": self.lock_source_audio.isChecked(),
@@ -3185,12 +3210,17 @@ class MainWindow(QMainWindow):
             saved_res = {"Low / test": "576 × 320", "480p": "832 × 448", "832 × 480": "832 × 448", "768p": "1344 × 768", "1080p": "1920 × 1088"}.get(saved_res, saved_res)
             if saved_res in RESOLUTION_PRESETS: self.res_class.setCurrentText(saved_res)
             else: self.res_class.setCurrentText(DEFAULT_RESOLUTION)
+            saved_wide = str(d.get("widescreen_quality", "Medium — 1344 × 576"))
+            if saved_wide in WIDESCREEN_21_9_PRESETS: self.widescreen_quality.setCurrentText(saved_wide)
+            else: self.widescreen_quality.setCurrentText("Medium — 1344 × 576")
             self.experimental_long_duration.setChecked(bool(d.get("experimental_long_duration", False)))
             self._sync_long_duration_mode(self.experimental_long_duration.isChecked())
             self._set_frame_count(d.get("frames", 362))
-            self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", "")); self.continue_video.edit.setText(d.get("continue_video", ""))
+            self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", ""))
+            continue_last_setting = bool(d.get("continue_last_result", False))
+            self.continue_video.edit.setText("" if continue_last_setting else d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
-            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self._sync_continue_video_options()
+            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(continue_last_setting); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
@@ -3668,7 +3698,7 @@ class MainWindow(QMainWindow):
         prompt=self.prompt.toPlainText().strip()
         if not prompt: QMessageBox.warning(self,"Prompt required","Enter a prompt before adding the job to the queue."); return
         if not PYTHON.is_file(): QMessageBox.critical(self,"Environment missing",f"Missing {PYTHON}"); return
-        mode=self.mode.currentIndex(); w,h=RESOLUTION_PRESETS[self.res_class.currentText()][self.aspect.currentText()]; frames=self._frame_count()
+        mode=self.mode.currentIndex(); w,h=self._current_resolution(); frames=self._frame_count()
         long_mode = self.experimental_long_duration.isChecked()
         max_frames = EXPERIMENTAL_FRAME_MAX if long_mode else NORMAL_FRAME_MAX
         if frames > max_frames:
