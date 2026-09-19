@@ -757,6 +757,7 @@ class MusicProject:
     turbo_lora_strength: float = 1.0
     randomize_reference_characters: bool = False
     unlimited_random_references: bool = False
+    single_character_reference_per_clip: bool = False
     reference_random_seed: int = -1
     # Snapshot of the authoritative main MiniMax GUI generation settings used for
     # this project/job. The Music Clip Creator no longer owns a second copy of
@@ -1262,7 +1263,8 @@ def build_shot_plan(project: MusicProject) -> List[MusicShot]:
 
 def _selected_refs_for_shot(project: MusicProject, shot: MusicShot) -> List[ReferenceAsset]:
     by_name = {r.name: r for r in project.references if r.enabled and Path(r.path).is_file()}
-    return [by_name[name] for name in shot.reference_names if name in by_name][:9]
+    names = _limit_character_reference_names(project, [name for name in shot.reference_names if name in by_name], list(by_name.values()))
+    return [by_name[name] for name in names if name in by_name][:9]
 
 
 def _h3_ref_subject_definitions(project: MusicProject, refs: Sequence[ReferenceAsset], *, has_lyrics: bool = True) -> List[str]:
@@ -1735,7 +1737,8 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
     chars = [r for r in enabled if _normalise_reference_kind(r.kind) == "Character" and r.name]
     if not chars:
         return []
-    max_count = min(2, len(chars))
+    single_character = bool(getattr(project, "single_character_reference_per_clip", False))
+    max_count = 1 if single_character else min(2, len(chars))
     try:
         base_seed = int(getattr(project, "reference_random_seed", -1))
     except Exception:
@@ -1767,7 +1770,7 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
     # Determine how many cards all earlier clips consumed. Counts are generated from
     # per-shot deterministic RNGs so requesting shot N never depends on call order.
     def count_for(index: int) -> int:
-        if len(names) <= 1:
+        if single_character or len(names) <= 1:
             return 1
         return random.Random(f"{base_seed}:count:{index}:{len(names)}").randint(1, 2)
 
@@ -1784,6 +1787,26 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
         stream.extend(deck)
         round_no += 1
     return stream[offset:offset + count]
+
+
+def _limit_character_reference_names(project: MusicProject, names: Sequence[str], enabled: Sequence[ReferenceAsset]) -> List[str]:
+    """Keep all non-character refs but cap Character refs to one when requested."""
+    ordered = list(names)
+    if not bool(getattr(project, "single_character_reference_per_clip", False)):
+        return ordered[:9]
+    kind_by_name = {r.name: _normalise_reference_kind(r.kind) for r in enabled if r.name}
+    result: List[str] = []
+    character_used = False
+    for name in ordered:
+        if kind_by_name.get(name) == "Character":
+            if character_used:
+                continue
+            character_used = True
+        if name not in result:
+            result.append(name)
+        if len(result) >= 9:
+            break
+    return result
 
 
 def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
@@ -1815,7 +1838,7 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
     elif not any(_normalise_reference_kind(r.kind) == "Character" and r.name in chosen for r in enabled):
         chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character"]
         chosen.extend(x for x in chars[:2] if x not in chosen)
-    return chosen[:9]
+    return _limit_character_reference_names(project, chosen, enabled)
 
 
 # ----------------------------- worker threads ------------------------------
@@ -2379,6 +2402,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         if not selected_names and refs_by_name:
             # Last-resort safety: Ref2VA music shots should not silently ignore all images.
             selected_names = [next(iter(refs_by_name))]
+        selected_names = _limit_character_reference_names(project, selected_names, list(refs_by_name.values()))
         selected = [refs_by_name[n] for n in selected_names[:9]]
         generation_prompt = build_generation_prompt(project, shot, selected)
         shot.generation_prompt = generation_prompt
@@ -2785,12 +2809,21 @@ class MiniMaxMusicClipWidget(QWidget):
             body,
         )
         info.setWordWrap(True); lay.addWidget(info)
+        ref_toggle_row = QHBoxLayout()
         self.check_randomize_ref_characters = QCheckBox("Randomize reference characters per clip", body)
         self.check_randomize_ref_characters.setToolTip(
             "When enabled, each shot automatically picks one or two enabled Character references. "
             "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh the random combinations."
         )
-        lay.addWidget(self.check_randomize_ref_characters)
+        self.check_single_character_ref = QCheckBox("Use only 1 ref per clip", body)
+        self.check_single_character_ref.setToolTip(
+            "Limit each clip to one Character reference, even when the project contains many Character images. "
+            "Background / Location, Object / Prop, Style / Mood, Picture / Composition anchor and other non-character references can still be used in the same clip."
+        )
+        ref_toggle_row.addWidget(self.check_randomize_ref_characters)
+        ref_toggle_row.addWidget(self.check_single_character_ref)
+        ref_toggle_row.addStretch(1)
+        lay.addLayout(ref_toggle_row)
         self.check_unlimited_random_refs = QCheckBox("Unlimited random refs", body)
         self.check_unlimited_random_refs.setToolTip(
             "Only available while random reference characters are enabled. Removes the 9-image project-pool limit, "
@@ -3114,6 +3147,7 @@ class MiniMaxMusicClipWidget(QWidget):
         # an old project's historical generation snapshot intact while merely reviewing it.
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.unlimited_random_references = bool(self.project.randomize_reference_characters and self.check_unlimited_random_refs.isChecked())
+        self.project.single_character_reference_per_clip = bool(self.check_single_character_ref.isChecked())
         self.project.references = self._refs_from_table()
 
     def _sync_ui_from_project(self) -> None:
@@ -3130,6 +3164,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.spin_head.setValue(p.head_padding); self.spin_tail.setValue(p.tail_padding); self.spin_snap.setValue(p.phrase_snap_tolerance)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self.check_unlimited_random_refs.setChecked(bool(getattr(p, "unlimited_random_references", False)))
+        self.check_single_character_ref.setChecked(bool(getattr(p, "single_character_reference_per_clip", False)))
         self._update_unlimited_random_ref_controls()
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
 
@@ -3244,7 +3279,7 @@ class MiniMaxMusicClipWidget(QWidget):
         for name in (
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
             "phrase_snap_tolerance", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
-            "randomize_reference_characters", "unlimited_random_references",
+            "randomize_reference_characters", "unlimited_random_references", "single_character_reference_per_clip",
         ):
             setattr(self.project, name, getattr(old, name))
         self._refresh_generation_settings_snapshot()
@@ -3966,6 +4001,7 @@ class MiniMaxMusicClipWidget(QWidget):
             selected_names = [n for n in auto_assign_references(self.project, shot) if n in refs_by_name]
         if not selected_names and refs_by_name:
             selected_names = [next(iter(refs_by_name))]
+        selected_names = _limit_character_reference_names(self.project, selected_names, list(refs_by_name.values()))
         selected = [refs_by_name[n] for n in selected_names[:9]]
         generation_prompt = build_generation_prompt(self.project, shot, selected)
         shot.generation_prompt = generation_prompt
@@ -4244,6 +4280,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.phrase_snap_tolerance = float(data.get("phrase_snap_tolerance", self.project.phrase_snap_tolerance))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
                 self.project.unlimited_random_references = bool(data.get("unlimited_random_references", self.project.unlimited_random_references))
+                self.project.single_character_reference_per_clip = bool(data.get("single_character_reference_per_clip", self.project.single_character_reference_per_clip))
         except Exception:
             pass
         self._refresh_generation_settings_snapshot()
@@ -4261,6 +4298,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "phrase_snap_tolerance": self.project.phrase_snap_tolerance,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
                 "unlimited_random_references": self.project.unlimited_random_references,
+                "single_character_reference_per_clip": self.project.single_character_reference_per_clip,
             }
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
