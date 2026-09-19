@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 import torch
 
 _GIB = 1024 ** 3
@@ -29,6 +30,17 @@ class VRAMManagerConfig:
     cache_trim_slack_gb: float = 2.0
     disable_comfy_pinned_offload: bool = True
     managed_stages: tuple[str, ...] | None = None
+    diffusion_model_path: str | None = None
+
+
+def _looks_like_hybrid_checkpoint(path) -> bool:
+    if not path:
+        return False
+    try:
+        name = Path(path).name.lower()
+    except Exception:
+        name = str(path).lower()
+    return any(token in name for token in ("hybrid", "sparseref", "fused"))
 
 
 class VRAMManager:
@@ -57,6 +69,15 @@ class VRAMManager:
         self.mm = comfy.model_management
         self.cfg = config
         self.verbose = bool(verbose)
+        self._hybrid_checkpoint = _looks_like_hybrid_checkpoint(getattr(config, "diffusion_model_path", None))
+        if self._hybrid_checkpoint and float(self.cfg.runtime_free_gb) < 1.50:
+            old_floor = float(self.cfg.runtime_free_gb)
+            self.cfg.runtime_free_gb = 1.50
+            self.cfg.residency_target_free_gb = max(float(self.cfg.residency_target_free_gb), 1.50)
+            print(
+                f"[VRAM-MGR] Hybrid checkpoint safety floor active | runtime minimum free {old_floor:g} -> 1.5 GiB",
+                flush=True,
+            )
         self.stage = "text"
         self._orig_load_models_gpu = None
         self._seen = set()
@@ -146,6 +167,16 @@ class VRAMManager:
             return
         frac = float(getattr(self.cfg, "allocator_memory_fraction", 0.94) or 0.94)
         frac = min(0.99, max(0.50, frac))
+        # The allocator ceiling must respect the same runtime-free floor.  On a
+        # 24 GiB card, the historical 0.94 ceiling leaves ~1.44 GiB; a 1.50 GiB
+        # hybrid floor therefore tightens it slightly instead of waiting for spill.
+        try:
+            _, detected_total = self._cuda_free()
+            if detected_total:
+                floor_frac = max(0.50, min(0.99, (float(detected_total) - self.runtime_floor_bytes()) / float(detected_total)))
+                frac = min(frac, floor_frac)
+        except Exception:
+            pass
         try:
             if hasattr(torch.cuda, "get_per_process_memory_fraction"):
                 self._orig_memory_fraction = float(torch.cuda.get_per_process_memory_fraction())

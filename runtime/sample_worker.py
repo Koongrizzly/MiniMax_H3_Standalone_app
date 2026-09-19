@@ -91,6 +91,7 @@ def main():
             allocator_memory_fraction=min(0.99, max(0.50, ns.vram_allocator_fraction)),
             cache_trim_slack_gb=max(0.25, ns.vram_cache_trim_slack_gb),
             managed_stages=tuple(ns.vram_managed_stage) or None,
+            diffusion_model_path=str(ns.diffusion),
         ), verbose=ns.extended_logging)
         manager.install(); manager.set_stage('text')
     load_trace_cleanup=(install_comfy_load_trace(comfy) if ns.extended_logging else (lambda: None))

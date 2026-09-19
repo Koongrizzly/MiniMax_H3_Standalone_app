@@ -191,34 +191,32 @@ def _stage_decision(required: float, usable, label: str, needed: bool = True):
     }
 
 
-def _is_int8_hybrid_checkpoint(path) -> bool:
-    """Return True for experimental INT8 hybrid/SparseRef H3 diffusion checkpoints.
+def _is_hybrid_checkpoint(path) -> bool:
+    """Return True for experimental hybrid/SparseRef/Fused H3 checkpoints.
 
     The generic automatic estimator is calibrated for the stock W4A8 checkpoints.
-    INT8 hybrid/SparseRef checkpoints have a materially different residency profile,
-    so their filename is a more reliable discriminator than an arbitrary file-size
-    cutoff (pruned/partial hybrids can be smaller on disk and still exceed 24 GiB
-    once diffusion activations are present).
+    Hybrid checkpoints can have a materially different residency/workspace profile,
+    including pruned or partial files whose on-disk size does not predict the real
+    sampling peak.  Use the checkpoint family marker instead of a size cutoff.
     """
     if not path:
         return False
     try:
         name = Path(path).name.lower()
-        hybrid_name = any(token in name for token in ("hybrid", "sparseref", "fused"))
-        return hybrid_name and "int8" in name
+        return any(token in name for token in ("hybrid", "sparseref", "fused"))
     except Exception:
         return False
 
 
-def _force_int8_hybrid_manager(stages, *, total_gib=None, diffusion_model_path=None):
-    """Fail safe for INT8 hybrid checkpoints on 32 GiB-and-smaller GPUs.
+def _force_hybrid_manager(stages, *, total_gib=None, diffusion_model_path=None):
+    """Fail safe for hybrid checkpoints on 32 GiB-and-smaller GPUs.
 
     Automatic bypass must not apply the stock-W4A8 diffusion estimate to these
-    checkpoints. On 24 GiB cards that can fill dedicated VRAM and spill several
-    GiB into WDDM shared memory before the runtime manager has been installed.
+    checkpoints.  On 24 GiB cards an underestimated hybrid can saturate dedicated
+    VRAM and spill into WDDM shared memory before the runtime manager is active.
     Larger cards keep the normal per-stage automatic decision.
     """
-    if not _is_int8_hybrid_checkpoint(diffusion_model_path):
+    if not _is_hybrid_checkpoint(diffusion_model_path):
         return
     if total_gib is not None and float(total_gib) > 32.0:
         return
@@ -228,7 +226,7 @@ def _force_int8_hybrid_manager(stages, *, total_gib=None, diffusion_model_path=N
         return
     d["use_manager"] = True
     d["reason"] = (
-        "INT8 hybrid/SparseRef checkpoint on <=32 GiB GPU; forcing managed diffusion "
+        "hybrid/SparseRef/Fused checkpoint on <=32 GiB GPU; forcing managed diffusion "
         "because the stock W4A8 auto estimate can understate hybrid residency and "
         "cause dedicated-VRAM saturation/shared-memory spill"
     )
@@ -307,7 +305,7 @@ def decide_vram_stages(
             needed=True,
         ),
     }
-    _force_int8_hybrid_manager(
+    _force_hybrid_manager(
         stages,
         total_gib=total,
         diffusion_model_path=diffusion_model_path,
