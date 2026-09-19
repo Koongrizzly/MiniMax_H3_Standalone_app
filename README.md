@@ -14,7 +14,7 @@ It supports :
 
   Added support for several int8 models, including the singularity & SparseRef15_Hybrid checkpoints.
   Slower but better quality, More choice between speed and quality while still trying to make it work on most RTX gpu cards.
-  download them wherever you want and load them in the app. 
+  download these checkpoints wherever you want and load them directly for use in the app. 
 
   Added support for Sol attention and SLA attention, (only 1 has effect at the same time, i like SLA more, faster and better quality in the test runs that i did)
 
