@@ -358,7 +358,61 @@ def prepare_audio_continue_conditioning(audio_vae, continue_video, audio_context
     )
     return [{'anchor':'history','latent_frame_count':total,'latent':latent}]
 
-def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=None, last_frame=None, continue_video=None, continue_context_frames=39):
+def _h3_video_latent_tokens(frame_count):
+    """Native MiniMax H3 17k+5 timeline -> video latent token count."""
+    n=max(5,int(frame_count))
+    while n % 17 != 5:
+        n += 1
+    return 2 if n <= 5 else ((n - 5) // 17) * 5 + 2
+
+
+def _load_continue_latent_payload(path, width, height):
+    """Load a standalone sidecar and reject incompatible spatial latent geometry."""
+    p=Path(path)
+    payload=torch.load(str(p), map_location='cpu', weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError('saved H3 latent sidecar is not a dictionary payload')
+    video=payload.get('video')
+    audio=payload.get('audio')
+    if not isinstance(video,torch.Tensor) or video.ndim != 5:
+        raise ValueError('saved H3 latent sidecar has no valid video latent')
+    expected_h=max(1,int(height)//16); expected_w=max(1,int(width)//16)
+    if tuple(video.shape[-2:]) != (expected_h,expected_w):
+        raise ValueError(f'latent resolution mismatch: saved spatial latent={tuple(video.shape[-2:])}, requested={(expected_h,expected_w)}')
+    return video.detach().cpu().contiguous(), (audio.detach().cpu().contiguous() if isinstance(audio,torch.Tensor) else None), payload
+
+
+def prepare_latent_continue_history(path, width, height, continue_context_frames=39):
+    video,_audio,payload=_load_continue_latent_payload(path,width,height)
+    requested=max(5,int(continue_context_frames))
+    k=max(0,round((requested-5)/17.0)); history_frames=17*k+5
+    wanted=_h3_video_latent_tokens(history_frames)
+    available=int(video.shape[2])
+    if available >= wanted:
+        tail=video[:,:,-wanted:]
+    else:
+        tail=torch.cat([video[:,:,:1].repeat(1,1,wanted-available,1,1),video],dim=2)
+    print(f"FL2VA LATENT continuation history: source={Path(path).name} | history frames={history_frames} | video latent tokens={wanted} | no RGB/VAE re-encode",flush=True)
+    return {'anchor':'history','latent_frame_count':int(tail.shape[2]),'source_frame_count':history_frames,'latent':tail}, payload
+
+
+def prepare_audio_latent_continue_conditioning(path, audio_context_frames=24, fps=24.0):
+    # Audio memory remains a separate opt-in just like the existing source-audio path.
+    payload=torch.load(str(path),map_location='cpu',weights_only=False)
+    audio=payload.get('audio') if isinstance(payload,dict) else None
+    if not isinstance(audio,torch.Tensor) or audio.ndim != 4 or audio.shape[-1] < 1:
+        return []
+    requested=max(1,int(audio_context_frames)); wanted=max(1,round((requested/float(fps))*40.0))
+    if audio.shape[-1] >= wanted:
+        tail=audio[...,-wanted:]
+    else:
+        tail=torch.cat([audio[...,:1].repeat(1,1,1,wanted-int(audio.shape[-1])),audio],dim=-1)
+    tail=tail.detach().cpu().contiguous()
+    print(f"FL2VA LATENT audio memory: source={Path(path).name} | {requested/float(fps):.3f}s | audio latent steps={int(tail.shape[-1])} | no audio VAE re-encode",flush=True)
+    return [{'anchor':'history','latent_frame_count':int(tail.shape[-1]),'latent':tail}]
+
+
+def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=None, last_frame=None, continue_video=None, continue_context_frames=39, continue_latent=None):
     """Encode FL2VA image anchors and optional native temporal continuation history.
 
     Continue-video conditioning follows H3's model-facing scheme: a temporal block from
@@ -375,6 +429,13 @@ def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=
         raise ValueError("Continue Video already supplies the first-frame boundary; remove the separate First frame")
     if continue_video:
         requested=max(5,int(continue_context_frames))
+        latent_history=None
+        if continue_latent:
+            try:
+                latent_history,_latent_payload=prepare_latent_continue_history(continue_latent,width,height,requested)
+            except Exception as exc:
+                print(f"WARNING: latent continuation unavailable ({type(exc).__name__}: {exc}); falling back to decoded-video history.",flush=True)
+                latent_history=None
         # H3's packed video timeline is exact only when the *history itself* is on
         # the native 17k+5 frame grid.  The old continuation path used a 17k+1
         # total-tail grid and then removed the final boundary frame.  For example,
@@ -389,21 +450,29 @@ def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=
         # nearest safe history size; 35 -> 39.
         k=max(0,round((requested-5)/17.0))
         history_frames=17*k+5
-        tail=_load_video_tail_24(continue_video,history_frames+1)
-        available=int(tail.shape[0])
-        if available < 2:
+        if latent_history is not None:
+            # Only the exact final RGB frame is needed as the FL2VA boundary anchor.
+            # Motion history comes straight from the saved model latent.
+            tail=_load_video_tail_24(continue_video,1)
             history=None
             boundary=tail[-1:]
+            keyframes.append(latent_history)
         else:
-            max_history=available-1
-            if max_history >= 5:
-                valid_history=((max_history-5)//17)*17+5
-                history=tail[-(valid_history+1):-1]
-            else:
-                # Very short external sources cannot form a native H3 temporal
-                # history block; use only their final frame as the boundary anchor.
+            tail=_load_video_tail_24(continue_video,history_frames+1)
+            available=int(tail.shape[0])
+            if available < 2:
                 history=None
-            boundary=tail[-1:]
+                boundary=tail[-1:]
+            else:
+                max_history=available-1
+                if max_history >= 5:
+                    valid_history=((max_history-5)//17)*17+5
+                    history=tail[-(valid_history+1):-1]
+                else:
+                    # Very short external sources cannot form a native H3 temporal
+                    # history block; use only their final frame as the boundary anchor.
+                    history=None
+                boundary=tail[-1:]
         tail=_resize_video_frames(tail,width,height,"center")
         boundary=_resize_video_frames(boundary,width,height,"center")
         if history is not None:
@@ -414,7 +483,7 @@ def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=
         with torch.inference_mode():
             boundary_latent=video_vae.encode(boundary)
         keyframes.append({"anchor":"first","resolved_frame_index":0,"latent_frame_count":int(boundary_latent.shape[2]),"latent":boundary_latent})
-        print(f"FL2VA continuation context: source={Path(continue_video).name} | history frames={0 if history is None else int(history.shape[0])} | boundary=final source frame | temporal grid=17k+5", flush=True)
+        print(f"FL2VA continuation context: source={Path(continue_video).name} | history={'saved H3 latent' if latent_history is not None else (0 if history is None else int(history.shape[0]))} | boundary=final source frame | temporal grid=17k+5", flush=True)
     elif first_frame:
         img=load_image(first_frame)
         samples=img[..., :3].movedim(-1,1)
