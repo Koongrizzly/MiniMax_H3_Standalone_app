@@ -1039,6 +1039,13 @@ class MainWindow(QMainWindow):
         self.continue_context = QComboBox()
         for n in (22, 39, 56, 73, 90, 107): self.continue_context.addItem(f"{n} history frames ({n/24:.2f} s)", n)
         self.continue_context.setCurrentIndex(1)
+        self.latent_continuation = QCheckBox("Use latent continuation")
+        self.latent_continuation.setChecked(False)
+        self.latent_continuation.setToolTip(
+            "Use the previous MiniMax H3 internal video/audio latent as continuation memory instead of rebuilding the motion history from decoded video frames. "
+            "This avoids the video -> VAE re-encode round trip and can reduce cumulative quality/character drift in long chains. "
+            "The previous result must have a compatible saved H3 latent at the same resolution. If no compatible latent is found, the app automatically falls back to normal video-frame continuation."
+        )
         self.glue_results = QCheckBox("Glue results")
         self.glue_results.setChecked(False)
         self.continue_last_result = QCheckBox("Continue last result")
@@ -1055,6 +1062,7 @@ class MainWindow(QMainWindow):
         caml.addWidget(self.continue_audio_memory); caml.addWidget(self.continue_audio_memory_warning); caml.addStretch()
         fl.addRow("First frame", self.first); fl.addRow("Last frame", self.last)
         fl.addRow("Continue video", self.continue_video); fl.addRow("Motion context", self.continue_context)
+        fl.addRow("", self.latent_continuation)
         fl.addRow("", self.glue_results); fl.addRow("", self.continue_last_result); fl.addRow("", self.continue_audio_memory_row); v.addWidget(self.fl_group)
 
         self.ref_group = QGroupBox("Ref2VA references"); rfl = QVBoxLayout(self.ref_group)
@@ -2335,6 +2343,8 @@ class MainWindow(QMainWindow):
             run_args += ["--continue-video", continue_source, "--continue-context-frames", str(int(job.get("continue_context_frames") or 39))]
             if job.get("continue_last_result") and job.get("continue_audio_memory"):
                 run_args += ["--continue-audio-memory"]
+            if job.get("latent_continuation"):
+                run_args += ["--latent-continuation"]
             if job.get("glue_results"):
                 run_args += ["--glue-source", continue_source]
             job["resolved_continue_source"] = continue_source
@@ -2686,13 +2696,12 @@ class MainWindow(QMainWindow):
         credits = QGroupBox("Credits / open-source components")
         cv = QVBoxLayout(credits)
         self.comfy_credit = QLabel(
-            "PySide6 GUI and standalone installer by Contrinsan.\n\n"
+            "PySide6 standalone app by Contrinsan.\n\n"
             "This standalone uses components from ComfyUI (Comfy-Org), such as model-loading / "
             "MiniMax H3 nodes in comfy_extras and MiniMax VAE support to make this work. "
             "ComfyUI is licensed under GPL-3.0.\n\n"
             "INT4 model and text-encoder files used by this install are sourced from Winnougan / "
             "MiniMax-H3-INT4_Convrot_ComfyUI on Hugging Face.\n\n"
-            "Spectrum Feature Forecasting is a standalone MiniMax H3 implementation based on the published Adaptive Spectral Feature Forecasting method by Han et al.\n\n"
             "The integrated Hailuo H3 Prompt Builder is an unofficial community tool created by Bob Doyle Media; "
             "its local server/UI was adapted here with standalone local-LLM and GGUF support."
         )
@@ -2889,7 +2898,7 @@ class MainWindow(QMainWindow):
         self.continue_video.setToolTip("Native H3 FL2VA continuation. The model receives a VAE-encoded block of preceding motion plus the source video's final frame as the exact boundary anchor; this is not last-frame-only I2V.")
         self.glue_results.setToolTip("When enabled, keep the complete source video first and append the newly generated continuation after it. No continuation overlap frames are trimmed from either clip during the glue step.")
         self.continue_last_result.setToolTip("Ignore the manual Continue video field and use the exact previous queue job as this job's continuation source. Pending chained jobs wait for that specific job to finish; the output folder is never scanned for the newest file.")
-        self.continue_context.setToolTip("How many source-motion history frames H3 receives before the separate final-frame boundary anchor. Values use H3's native 17k+5 temporal grid so source motion and generated motion stay on the same 24 FPS model clock. 39 history frames (~1.63 s) is the default.")
+        self.continue_context.setToolTip("How much motion history H3 receives before the separate final-frame boundary anchor. With Use latent continuation OFF this history is rebuilt from decoded source-video frames. With it ON the same history duration is taken directly from the saved H3 latent when available. Values use H3's native 17k+5 temporal grid. 39 history frames (~1.63 s) is the default.")
         self.ref_size.setToolTip(
             "How Ref2VA prepares reference images. 'match' follows the generation/reference sizing behavior; "
             "'max' uses the maximum reference sizing path. Default: match."
@@ -3139,7 +3148,7 @@ class MainWindow(QMainWindow):
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
             "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
-            "continue_audio_memory": self.continue_audio_memory.isChecked(),
+            "continue_audio_memory": self.continue_audio_memory.isChecked(), "latent_continuation": self.latent_continuation.isChecked(),
             "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "lock_source_audio": self.lock_source_audio.isChecked(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
@@ -3181,7 +3190,7 @@ class MainWindow(QMainWindow):
             self._set_frame_count(d.get("frames", 362))
             self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", "")); self.continue_video.edit.setText(d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
-            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self._sync_continue_video_options()
+            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
@@ -3675,11 +3684,12 @@ class MainWindow(QMainWindow):
         args=[script,"--width",str(w),"--height",str(h),"--frames",str(frames),"--steps",str(self.steps.value()),"--cfg",str(self.cfg.value()),"--shift",str(self.shift.value()),"--audio-shift",str(self.audio_shift.value()),"--seed",str(self.seed.value()),"--sampler",self.sampler.currentText(),"--scheduler",self.scheduler.currentText(),"--prompt",prompt]
         if long_mode:
             args += ["--experimental-long-duration"]
-        continue_last=False; continue_from_job_id=None; continue_from_job_number=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False
+        continue_last=False; continue_from_job_id=None; continue_from_job_number=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False; latent_continuation=False
         if mode==1:
             continue_last=self.continue_last_result.isChecked()
             glue_results=self.glue_results.isChecked()
             continue_audio_memory=bool(continue_last and self.continue_audio_memory.isChecked())
+            latent_continuation=bool(self.latent_continuation.isChecked())
             manual_continue_video="" if continue_last else self.continue_video.path()
             if (manual_continue_video or continue_last) and self.first.path():
                 QMessageBox.warning(self,"Conflicting FL2VA inputs","Continue Video already supplies the first-frame boundary. Clear the separate First frame."); return
@@ -3751,7 +3761,7 @@ class MainWindow(QMainWindow):
         else:
             model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
             model_label=Path(model_path).name if model_path else ("Ref2VA default" if mode==2 else "FL2VA default")
-        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory)}
+        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
 

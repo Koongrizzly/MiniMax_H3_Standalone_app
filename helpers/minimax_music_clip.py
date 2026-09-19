@@ -3201,6 +3201,45 @@ class MiniMaxMusicClipWidget(QWidget):
 
         previous_identity = str(self.project.output_identity or "")
         if previous_identity and previous_identity != identity:
+            # A title/track identity change starts a new output job, but the existing
+            # project may already have a locked generation seed. Ask whether that
+            # seed should be carried into the new job or replaced with a fresh one.
+            try:
+                previous_job_seed = int(getattr(self.project, "job_seed", -1))
+            except Exception:
+                previous_job_seed = -1
+            if previous_job_seed >= 0:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setWindowTitle("Seed for new job")
+                box.setText(f"The previous job used seed {previous_job_seed}.")
+                box.setInformativeText(
+                    "Do you want the newly named job to reuse that seed, or start fresh with a new random seed?"
+                )
+                keep_btn = box.addButton("Use same seed again", QMessageBox.ButtonRole.AcceptRole)
+                fresh_btn = box.addButton("Start fresh with random seed", QMessageBox.ButtonRole.ActionRole)
+                box.setDefaultButton(fresh_btn)
+                box.exec()
+                if box.clickedButton() is fresh_btn:
+                    fresh_seed = self._next_job_seed()
+                    while fresh_seed == previous_job_seed:
+                        fresh_seed = self._next_job_seed()
+                    self.project.job_seed = fresh_seed
+                    # Any per-shot seeds inherited from the old job must follow the
+                    # new job seed on the next generation instead of silently keeping
+                    # the previous value.
+                    for shot in self.project.shots:
+                        shot.seed = -1
+                    try:
+                        self._update_job_seed_label()
+                        self._populate_review()
+                    except Exception:
+                        pass
+                else:
+                    # Explicitly preserve both the job seed and any per-shot retry
+                    # overrides when the user chooses reproducibility.
+                    self.project.job_seed = previous_job_seed
+
             self.project.project_id = ""
             self.project.created_at = ""
             self.project.updated_at = ""
