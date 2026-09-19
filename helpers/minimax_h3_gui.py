@@ -546,7 +546,6 @@ RESOLUTION_PRESETS = {
     "576 × 320":  {"16:9": (576, 320),  "9:16": (320, 576),  "1:1": (320, 320)},
     "736 × 384":  {"16:9": (736, 384),  "9:16": (384, 736),  "1:1": (384, 384)},
     "832 × 448":  {"16:9": (832, 448),  "9:16": (448, 832),  "1:1": (448, 448)},
-    "832 × 480":  {"16:9": (832, 480),  "9:16": (480, 832),  "1:1": (480, 480)},
     "960 × 544":  {"16:9": (960, 544),  "9:16": (544, 960),  "1:1": (544, 544)},
     "1280 × 720": {"16:9": (1280, 704), "9:16": (704, 1280), "1:1": (704, 704)},
     "1344 × 768": {"16:9": (1344, 768), "9:16": (768, 1344), "1:1": (768, 768)},
@@ -1574,41 +1573,39 @@ class MainWindow(QMainWindow):
         right_scroll.setWidget(right_content)
         right_host_layout.addWidget(right_scroll, 1)
 
-        # Fixed queue action footer. Two compact rows prevent the controls from
-        # disappearing off-screen on narrower window sizes.
+        # Fixed queue action footer. Keep every queue action on one horizontal
+        # line so the controls stay compact and immediately visible.
         footer = QWidget(right_host)
         footer.setObjectName("QueueActionFooter")
-        footer_layout = QVBoxLayout(footer)
+        footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(0,0,4,0)
         footer_layout.setSpacing(6)
+        footer_layout.addStretch(1)
 
-        actionrow = QHBoxLayout()
-        actionrow.addStretch(1)
         self.cancel_all_btn = QPushButton("Cancel all")
         self.cancel_all_btn.setToolTip("Cancel the current run and remove all pending jobs from the queue.")
         self.cancel_all_btn.clicked.connect(self._cancel_all_jobs)
-        actionrow.addWidget(self.cancel_all_btn)
+        footer_layout.addWidget(self.cancel_all_btn)
+
         self.reset_counter_btn = QPushButton("Reset counter")
         self.reset_counter_btn.setToolTip("Reset the internal queue job counter so the next queued job starts again at Job #1.")
         self.reset_counter_btn.clicked.connect(self._reset_queue_counter)
-        actionrow.addWidget(self.reset_counter_btn)
-        footer_layout.addLayout(actionrow)
+        footer_layout.addWidget(self.reset_counter_btn)
 
-        clearrow = QHBoxLayout()
-        clearrow.addStretch(1)
         self.clear_cancelled_btn = QPushButton("Clear cancelled")
         self.clear_cancelled_btn.setToolTip("Remove cancelled jobs from this queue history only. Files on disk are not deleted.")
         self.clear_cancelled_btn.clicked.connect(self._clear_cancelled_jobs)
-        clearrow.addWidget(self.clear_cancelled_btn)
+        footer_layout.addWidget(self.clear_cancelled_btn)
+
         self.clear_failed_btn = QPushButton("Clear failed")
         self.clear_failed_btn.setToolTip("Remove failed jobs from this queue history only. Files on disk are not deleted.")
         self.clear_failed_btn.clicked.connect(self._clear_failed_jobs)
-        clearrow.addWidget(self.clear_failed_btn)
+        footer_layout.addWidget(self.clear_failed_btn)
+
         self.clear_finished_btn = QPushButton("Clear finished / failed jobs")
         self.clear_finished_btn.setToolTip("Remove finished and failed jobs from this queue history only. Output files on disk are not deleted.")
         self.clear_finished_btn.clicked.connect(self._clear_finished_jobs)
-        clearrow.addWidget(self.clear_finished_btn)
-        footer_layout.addLayout(clearrow)
+        footer_layout.addWidget(self.clear_finished_btn)
         right_host_layout.addWidget(footer, 0)
 
         splitter.addWidget(self.queue_preview_host)
@@ -3109,7 +3106,7 @@ class MainWindow(QMainWindow):
         try:
             self.mode.setCurrentIndex(int(d.get("mode", 0))); self.aspect.setCurrentText(d.get("aspect", "16:9"))
             saved_res = str(d.get("resolution", DEFAULT_RESOLUTION))
-            saved_res = {"Low / test": "576 × 320", "480p": "832 × 480", "768p": "1344 × 768", "1080p": "1920 × 1088"}.get(saved_res, saved_res)
+            saved_res = {"Low / test": "576 × 320", "480p": "832 × 448", "832 × 480": "832 × 448", "768p": "1344 × 768", "1080p": "1920 × 1088"}.get(saved_res, saved_res)
             if saved_res in RESOLUTION_PRESETS: self.res_class.setCurrentText(saved_res)
             else: self.res_class.setCurrentText(DEFAULT_RESOLUTION)
             self.experimental_long_duration.setChecked(bool(d.get("experimental_long_duration", False)))
