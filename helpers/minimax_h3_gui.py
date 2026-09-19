@@ -2430,7 +2430,7 @@ class MainWindow(QMainWindow):
         vf.addRow("Residency engine", self.vram_residency_engine)
 
         self.vram_runtime_free = QDoubleSpinBox(); self.vram_runtime_free.setRange(0.10, 8.0); self.vram_runtime_free.setDecimals(2); self.vram_runtime_free.setSingleStep(0.10); self.vram_runtime_free.setValue(0.50); self.vram_runtime_free.setSuffix(" GB")
-        self.vram_runtime_free.setToolTip("Hard safety floor. If CUDA free memory drops below this, the manager asks Comfy to evict model weights. 0.50 GB is the aggressive 24 GB starting point.")
+        self.vram_runtime_free.setToolTip("Hard safety floor. If CUDA free memory drops below this, the manager asks Comfy to evict model weights. 0.50 GB is the aggressive stock-model starting point; Hybrid mode automatically raises values below 1.50 GB to 1.50 GB.")
         vf.addRow("Runtime minimum free", self.vram_runtime_free)
 
         self.vram_text_headroom = QDoubleSpinBox(); self.vram_text_headroom.setRange(0.10, 16.0); self.vram_text_headroom.setDecimals(2); self.vram_text_headroom.setSingleStep(0.25); self.vram_text_headroom.setValue(1.0); self.vram_text_headroom.setSuffix(" GB")
@@ -2920,6 +2920,14 @@ class MainWindow(QMainWindow):
         self.hybrid_model.setEnabled(enabled)
         self.fl2va_model.setEnabled(not enabled)
         self.ref2va_model.setEnabled(not enabled)
+
+        # Hybrid checkpoints can need a little more transient CUDA workspace than
+        # the stock W4A8 models.  Do not let the aggressive 0.50 GB default carry
+        # over when Hybrid mode is enabled.  This only raises low values; a user
+        # who already selected a larger safety floor keeps that larger value.
+        if enabled and hasattr(self, "vram_runtime_free"):
+            if float(self.vram_runtime_free.value()) < 1.50:
+                self.vram_runtime_free.setValue(1.50)
 
     def settings_dict(self):
         return {

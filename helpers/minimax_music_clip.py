@@ -2289,9 +2289,12 @@ def _append_main_gui_generation_args(args: List[str], project: MusicProject) -> 
 
     if bool(cfg.get("vram_manager_enabled", True)):
         args += ["--vram-manager-auto" if bool(cfg.get("vram_manager_auto_bypass", True)) else "--vram-manager"]
+        runtime_free_gb = float(cfg.get("vram_runtime_free_gb", 0.5))
+        if use_hybrid:
+            runtime_free_gb = max(1.50, runtime_free_gb)
         args += [
             "--vram-residency-engine", str(cfg.get("vram_residency_engine", "static") or "static"),
-            "--vram-runtime-free-gb", str(float(cfg.get("vram_runtime_free_gb", 0.5))),
+            "--vram-runtime-free-gb", str(runtime_free_gb),
             "--vram-text-headroom-gb", str(float(cfg.get("vram_text_headroom_gb", 1.0))),
             "--vram-diffusion-headroom-gb", str(float(cfg.get("vram_diffusion_headroom_gb", 1.0))),
             "--vram-offload-chunk-mb", str(int(cfg.get("vram_offload_chunk_mb", 512))),
