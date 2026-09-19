@@ -480,6 +480,7 @@ RESOLUTION_PRESETS: Dict[str, Dict[str, Tuple[int, int]]] = {
     "736 × 384": {"16:9": (736, 384), "9:16": (384, 736), "1:1": (384, 384)},
     "832 × 480": {"16:9": (832, 480), "9:16": (480, 832), "1:1": (480, 480)},
     "960 × 544": {"16:9": (960, 544), "9:16": (544, 960), "1:1": (544, 544)},
+    "1024 × 576": {"16:9": (1024, 576), "9:16": (576, 1024), "1:1": (576, 576)},
     "1280 × 720": {"16:9": (1280, 704), "9:16": (704, 1280), "1:1": (704, 704)},
     "1344 × 768": {"16:9": (1344, 768), "9:16": (768, 1344), "1:1": (768, 768)},
     "1920 × 1088": {"16:9": (1920, 1088), "9:16": (1088, 1920), "1:1": (1088, 1088)},
@@ -1790,22 +1791,93 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
 
 
 def _limit_character_reference_names(project: MusicProject, names: Sequence[str], enabled: Sequence[ReferenceAsset]) -> List[str]:
-    """Keep all non-character refs but cap Character refs to one when requested."""
+    """Limit reference usage according to the per-clip cap mode.
+
+    Legacy field name aside, the "Use only 1 ref per clip" toggle is intended to
+    mean at most one reference per role/type in a single prompt: one Character,
+    one Background / Location, one Object / Prop, one Style / Mood, one Picture /
+    Composition anchor, and one Other.
+    """
     ordered = list(names)
     if not bool(getattr(project, "single_character_reference_per_clip", False)):
-        return ordered[:9]
+        # Normal mode keeps the existing project/router order, de-duplicated, up to
+        # the MiniMax per-shot image ceiling.
+        result: List[str] = []
+        for name in ordered:
+            if name not in result:
+                result.append(name)
+            if len(result) >= 9:
+                break
+        return result
     kind_by_name = {r.name: _normalise_reference_kind(r.kind) for r in enabled if r.name}
     result: List[str] = []
-    character_used = False
+    used_kinds: set[str] = set()
     for name in ordered:
-        if kind_by_name.get(name) == "Character":
-            if character_used:
-                continue
-            character_used = True
+        kind = kind_by_name.get(name, "Other")
+        if kind in used_kinds:
+            continue
         if name not in result:
             result.append(name)
+            used_kinds.add(kind)
         if len(result) >= 9:
             break
+    return result
+
+
+def _randomized_single_reference_per_kind_names(project: MusicProject, shot: MusicShot, names: Sequence[str], enabled: Sequence[ReferenceAsset]) -> List[str]:
+    """Pick one rotating/random reference for each represented role/type.
+
+    This is active only when both reference randomization and the one-ref-per-type
+    cap are enabled.  Each role gets its own deterministic shuffled deck, so a
+    Background / Location pool cycles through every candidate before repeating.
+    The saved reference_random_seed keeps rebuilds/retries reproducible.
+    """
+    ordered = []
+    for name in names:
+        if name and name not in ordered:
+            ordered.append(name)
+    if not (bool(getattr(project, "randomize_reference_characters", False)) and bool(getattr(project, "single_character_reference_per_clip", False))):
+        return ordered
+
+    kind_by_name = {r.name: _normalise_reference_kind(r.kind) for r in enabled if r.name}
+    try:
+        base_seed = int(getattr(project, "reference_random_seed", -1))
+    except Exception:
+        base_seed = -1
+    if base_seed < 0:
+        base_seed = random.SystemRandom().randint(0, 2_147_483_647)
+        try:
+            project.reference_random_seed = int(base_seed)
+        except Exception:
+            pass
+    try:
+        shot_index = max(1, int(getattr(shot, "index", 1) or 1))
+    except Exception:
+        shot_index = 1
+
+    by_kind: Dict[str, List[str]] = {}
+    kind_order: List[str] = []
+    for name in ordered:
+        kind = kind_by_name.get(name, "Other")
+        if kind not in by_kind:
+            by_kind[kind] = []
+            kind_order.append(kind)
+        if name not in by_kind[kind]:
+            by_kind[kind].append(name)
+
+    result: List[str] = []
+    offset = shot_index - 1
+    for kind in kind_order:
+        candidates = by_kind[kind]
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            result.append(candidates[0])
+            continue
+        round_no, position = divmod(offset, len(candidates))
+        deck = list(candidates)
+        random.Random(f"{base_seed}:role:{kind}:round:{round_no}:{len(candidates)}").shuffle(deck)
+        result.append(deck[position])
     return result
 
 
@@ -1838,6 +1910,7 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
     elif not any(_normalise_reference_kind(r.kind) == "Character" and r.name in chosen for r in enabled):
         chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character"]
         chosen.extend(x for x in chars[:2] if x not in chosen)
+    chosen = _randomized_single_reference_per_kind_names(project, shot, chosen, enabled)
     return _limit_character_reference_names(project, chosen, enabled)
 
 
@@ -2393,11 +2466,17 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         if used_retry_name:
             progress(f"Shot {shot.index}: recreation uses a new output file {out_path.name}; the existing clip is left untouched.")
         shot.output_path = str(out_path)
-        selected_names = [n for n in shot.reference_names if n in refs_by_name]
+        if bool(getattr(project, "randomize_reference_characters", False)):
+            # Randomized projects must resolve references for this exact shot at run
+            # time. Do not let an older/stale Director assignment pin the first ref.
+            selected_names = [n for n in auto_assign_references(project, shot) if n in refs_by_name]
+            shot.reference_names = list(selected_names)
+        else:
+            selected_names = [n for n in shot.reference_names if n in refs_by_name]
         if not selected_names:
             # Older/restored projects can have an empty shot assignment even though valid
             # project references exist. Re-run the same conservative router at generation
-            # time so a selected project character image is never silently dropped.
+            # time so a selected project reference image is never silently dropped.
             selected_names = [n for n in auto_assign_references(project, shot) if n in refs_by_name]
         if not selected_names and refs_by_name:
             # Last-resort safety: Ref2VA music shots should not silently ignore all images.
@@ -2810,15 +2889,17 @@ class MiniMaxMusicClipWidget(QWidget):
         )
         info.setWordWrap(True); lay.addWidget(info)
         ref_toggle_row = QHBoxLayout()
-        self.check_randomize_ref_characters = QCheckBox("Randomize reference characters per clip", body)
+        self.check_randomize_ref_characters = QCheckBox("Randomize references per clip", body)
         self.check_randomize_ref_characters.setToolTip(
-            "When enabled, each shot automatically picks one or two enabled Character references. "
-            "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh the random combinations."
+            "Randomize reference selection per shot. Character references keep the existing one-or-two random behavior. "
+            "When 'Use only 1 ref per clip' is also enabled, each non-character role/type (such as Background / Location or Style / Mood) "
+            "also rotates through its available images instead of always choosing the first one."
         )
         self.check_single_character_ref = QCheckBox("Use only 1 ref per clip", body)
         self.check_single_character_ref.setToolTip(
-            "Limit each clip to one Character reference, even when the project contains many Character images. "
-            "Background / Location, Object / Prop, Style / Mood, Picture / Composition anchor and other non-character references can still be used in the same clip."
+            "Limit each clip to at most one reference per role/type. For example: one Character, one Background / Location, "
+            "one Object / Prop, one Style / Mood, one Picture / Composition anchor and one Other. "
+            "If multiple enabled refs share the same role, only one of that role is kept in the final prompt for that clip."
         )
         ref_toggle_row.addWidget(self.check_randomize_ref_characters)
         ref_toggle_row.addWidget(self.check_single_character_ref)
@@ -4035,7 +4116,11 @@ class MiniMaxMusicClipWidget(QWidget):
                 f"Shot {shot.index}: recreation uses a new output file {out_path.name} so the existing clip can stay open."
             )
         refs_by_name = {r.name: r for r in self.project.references if r.enabled and Path(r.path).is_file()}
-        selected_names = [n for n in shot.reference_names if n in refs_by_name]
+        if bool(getattr(self.project, "randomize_reference_characters", False)):
+            selected_names = [n for n in auto_assign_references(self.project, shot) if n in refs_by_name]
+            shot.reference_names = list(selected_names)
+        else:
+            selected_names = [n for n in shot.reference_names if n in refs_by_name]
         if not selected_names:
             selected_names = [n for n in auto_assign_references(self.project, shot) if n in refs_by_name]
         if not selected_names and refs_by_name:
