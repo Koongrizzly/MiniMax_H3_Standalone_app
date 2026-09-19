@@ -448,6 +448,95 @@ class ImagePreviewDialog(QDialog):
         event.accept()
 
 
+class VideoFullscreenDialog(QDialog):
+    """Fullscreen view of the shared preview player with its own transport controls."""
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle("Fullscreen preview")
+        self.setModal(False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        self.scene = QGraphicsScene(self)
+        self.view = ZoomVideoView(self)
+        self.view.setScene(self.scene)
+        self.video_item = QGraphicsVideoItem()
+        self.video_item.setSize(QSizeF(1920, 1080))
+        self.scene.addItem(self.video_item)
+        lay.addWidget(self.view, 1)
+
+        transport = QHBoxLayout()
+        self.play_btn = QPushButton("Play / Pause")
+        self.stop_btn = QPushButton("Stop")
+        self.repeat_box = QCheckBox("Repeat")
+        self.exit_btn = QPushButton("Exit fullscreen")
+        self.play_btn.clicked.connect(owner._preview_toggle)
+        self.stop_btn.clicked.connect(owner.media_player.stop)
+        self.repeat_box.setChecked(owner.preview_repeat.isChecked())
+        self.repeat_box.toggled.connect(owner.preview_repeat.setChecked)
+        owner.preview_repeat.toggled.connect(self.repeat_box.setChecked)
+        self.exit_btn.clicked.connect(self.close)
+        transport.addWidget(self.play_btn)
+        transport.addWidget(self.stop_btn)
+        transport.addWidget(self.repeat_box)
+        transport.addStretch(1)
+        transport.addWidget(self.exit_btn)
+        lay.addLayout(transport)
+
+        seekrow = QHBoxLayout()
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, max(0, int(owner.media_player.duration())))
+        self.slider.sliderMoved.connect(owner.media_player.setPosition)
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setMinimumWidth(105)
+        seekrow.addWidget(self.slider, 1)
+        seekrow.addWidget(self.time_label)
+        lay.addLayout(seekrow)
+
+        owner.media_player.positionChanged.connect(self._position_changed)
+        owner.media_player.durationChanged.connect(self._duration_changed)
+
+    @staticmethod
+    def _fmt(ms):
+        sec = max(0, int(ms) // 1000)
+        return f"{sec//60:02d}:{sec%60:02d}"
+
+    def _duration_changed(self, duration):
+        self.slider.setRange(0, max(0, int(duration)))
+        self._position_changed(self.owner.media_player.position())
+
+    def _position_changed(self, position):
+        if not self.slider.isSliderDown():
+            self.slider.setValue(int(position))
+        self.time_label.setText(
+            f"{self._fmt(position)} / {self._fmt(self.owner.media_player.duration())}"
+        )
+
+    def open_fullscreen(self):
+        self.repeat_box.setChecked(self.owner.preview_repeat.isChecked())
+        self._duration_changed(self.owner.media_player.duration())
+        self.owner.media_player.setVideoOutput(self.video_item)
+        self.showFullScreen()
+        QTimer.singleShot(0, self.view.reset_view)
+
+    def closeEvent(self, event):
+        try:
+            self.owner.media_player.setVideoOutput(self.owner.video_item)
+            QTimer.singleShot(0, self.owner.preview_view.reset_view)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 # MiniMax H3 fixed resolution presets. Most combo labels are the exact generation
 # dimensions. The familiar 1280 x 720 label is intentionally mapped to MiniMax's
 # valid 704p tensor size (1280 x 704); 720 is not divisible by 32.
@@ -1388,14 +1477,17 @@ class MainWindow(QMainWindow):
             self.preview_stop = QPushButton("Stop")
             self.preview_repeat = QCheckBox("Repeat")
             self.preview_reset = QPushButton("Reset zoom")
+            self.preview_fullscreen = QPushButton("Fullscreen")
             self.preview_play.clicked.connect(self._preview_toggle)
             self.preview_stop.clicked.connect(self.media_player.stop)
             self.preview_reset.clicked.connect(self.preview_view.reset_view)
+            self.preview_fullscreen.clicked.connect(self._open_preview_fullscreen)
             transport.addWidget(self.preview_play)
             transport.addWidget(self.preview_stop)
             transport.addWidget(self.preview_repeat)
             transport.addStretch(1)
             transport.addWidget(self.preview_reset)
+            transport.addWidget(self.preview_fullscreen)
             pv.addLayout(transport)
 
             seekrow = QHBoxLayout()
@@ -1863,6 +1955,14 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))); return
         self.media_player.setSource(QUrl.fromLocalFile(str(path.resolve()))); self.preview_label.setText(path.name); self.preview_view.reset_view()
         if autoplay: self.media_player.play()
+
+    def _open_preview_fullscreen(self):
+        if not self.media_player or not self.preview_path:
+            QMessageBox.information(self, "Preview", "Load a video in the preview first.")
+            return
+        if not hasattr(self, "_preview_fullscreen_dialog") or self._preview_fullscreen_dialog is None:
+            self._preview_fullscreen_dialog = VideoFullscreenDialog(self)
+        self._preview_fullscreen_dialog.open_fullscreen()
 
     def _preview_toggle(self):
         if not self.media_player: return
