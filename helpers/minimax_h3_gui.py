@@ -1060,7 +1060,7 @@ class MainWindow(QMainWindow):
         self.continue_context = QComboBox()
         for n in (22, 39, 56, 73, 90, 107): self.continue_context.addItem(f"{n} history frames ({n/24:.2f} s)", n)
         self.continue_context.setCurrentIndex(1)
-        self.latent_continuation = QCheckBox("Use latent continuation")
+        self.latent_continuation = QCheckBox("Use latent continuation (experimental/beta test)")
         self.latent_continuation.setChecked(False)
         self.latent_continuation.setToolTip(
             "Use the previous MiniMax H3 internal video/audio latent as continuation memory instead of rebuilding the motion history from decoded video frames. "
@@ -1612,7 +1612,7 @@ class MainWindow(QMainWindow):
 
         # Keep the newest results where they are visible immediately when opening
         # Queue: Finished first, then currently Running, then Pending work.
-        self.finished_group = QGroupBox("Finished / failed (0)")
+        self.finished_group = QGroupBox("Finished / failed / Cancelled (0)")
         fg = QVBoxLayout(self.finished_group); fg.addWidget(self.finished_tree)
         right_layout.addWidget(self.finished_group)
         self.running_group = QGroupBox("Running jobs (0)")
