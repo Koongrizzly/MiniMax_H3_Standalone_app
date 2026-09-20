@@ -2932,6 +2932,7 @@ class MiniMaxMusicClipWidget(QWidget):
         header.resizeSection(5, 150)
         self.refs_table.setWordWrap(True)
         self.refs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.refs_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.refs_table.setMinimumHeight(320)
         lay.addWidget(self.refs_table, 1)
         row = QHBoxLayout()
@@ -2940,11 +2941,17 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_add_ref_folder.setToolTip("Add every supported image in a folder to the unlimited random Character reference pool.")
         self.btn_add_ref_folder.setVisible(False)
         self.btn_remove_ref = QPushButton("Remove selected", self.page_refs)
-        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_add_ref_folder); row.addWidget(self.btn_remove_ref); row.addStretch(1)
+        self.btn_select_all_refs = QPushButton("Select all", self.page_refs)
+        self.btn_clear_refs = QPushButton("Clear list", self.page_refs)
+        self.btn_select_all_refs.setToolTip("Select every reference row so role changes can be applied to the whole selection at once.")
+        self.btn_clear_refs.setToolTip("Remove every reference image from the current project reference list.")
+        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_add_ref_folder); row.addWidget(self.btn_remove_ref); row.addWidget(self.btn_select_all_refs); row.addWidget(self.btn_clear_refs); row.addStretch(1)
         outer.addLayout(row)
         self.btn_add_ref.clicked.connect(self._add_reference)
         self.btn_add_ref_folder.clicked.connect(self._add_reference_folder)
         self.btn_remove_ref.clicked.connect(self._remove_reference)
+        self.btn_select_all_refs.clicked.connect(self._select_all_references)
+        self.btn_clear_refs.clicked.connect(self._clear_reference_list)
 
     def _build_analysis_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_analysis)
@@ -3544,6 +3551,39 @@ class MiniMaxMusicClipWidget(QWidget):
         for row in rows: self.refs_table.removeRow(row)
         self.project.references = self._refs_from_table()
 
+    def _select_all_references(self) -> None:
+        if self.refs_table.rowCount() > 0:
+            self.refs_table.selectAll()
+
+    def _clear_reference_list(self) -> None:
+        if self.refs_table.rowCount() <= 0:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear reference list",
+            "Remove all reference images from this project?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.refs_table.setRowCount(0)
+        self.project.references = []
+
+    def _reference_role_changed(self, source_row: int, role: str) -> None:
+        """Apply a role edit to every selected reference row when editing a selection."""
+        role = _normalise_reference_kind(role)
+        selected_rows = sorted({idx.row() for idx in self.refs_table.selectedIndexes()})
+        target_rows = selected_rows if source_row in selected_rows and len(selected_rows) > 1 else [source_row]
+        for row in target_rows:
+            combo = self.refs_table.cellWidget(row, 2)
+            if not isinstance(combo, QComboBox) or combo.currentText() == role:
+                continue
+            combo.blockSignals(True)
+            combo.setCurrentText(role)
+            combo.blockSignals(False)
+        self.project.references = self._refs_from_table()
+
     def _populate_refs(self) -> None:
         self.refs_table.blockSignals(True); self.refs_table.setRowCount(0)
         # The table is the editable project reference pool. In unlimited-random
@@ -3567,8 +3607,10 @@ class MiniMaxMusicClipWidget(QWidget):
             role_combo.setCurrentText(_normalise_reference_kind(ref.kind))
             role_combo.setToolTip(
                 "Character = reusable person/identity. Background / Location = recurring environment. Object / Prop = reusable item. "
-                "Style / Mood = visual treatment. Picture / Composition anchor = use the image itself as framing/keyframe/shot-planning guidance."
+                "Style / Mood = visual treatment. Picture / Composition anchor = use the image itself as framing/keyframe/shot-planning guidance. "
+                "When multiple rows are selected, changing this role applies it to all selected rows."
             )
+            role_combo.currentTextChanged.connect(lambda value, r=row: self._reference_role_changed(r, value))
             self.refs_table.setCellWidget(row, 2, role_combo)
             desc_item = QTableWidgetItem(ref.description)
             desc_item.setToolTip(ref.description or "For characters: describe the individual appearance/identity traits that should stay distinct from other refs.")
