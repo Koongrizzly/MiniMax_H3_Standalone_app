@@ -3057,13 +3057,16 @@ class MiniMaxMusicClipWidget(QWidget):
         self.label_job_seed.setWordWrap(True)
         lay.addWidget(self.label_job_seed)
         self.review_table = QTableWidget(0, 6, body)
-        self.review_table.setHorizontalHeaderLabels(["#", "Status", "Frames", "Edit range", "Output", "Seed"])
+        # Keep the compact/editable values at the left and give the remaining width
+        # to Output.  Long Windows paths are much easier to inspect this way.
+        self.review_table.setHorizontalHeaderLabels(["#", "Seed", "Status", "Frames", "Edit range", "Output"])
         self.review_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.review_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.review_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.review_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.review_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.review_table.setTextElideMode(Qt.ElideMiddle)
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.review_table.setMinimumHeight(320)
         lay.addWidget(self.review_table, 1)
@@ -3991,7 +3994,7 @@ class MiniMaxMusicClipWidget(QWidget):
         return base_seed
 
     def _review_table_item_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() != 5:
+        if item.column() != 1:
             return
         row = item.row()
         if not (0 <= row < len(self.project.shots)):
@@ -4073,11 +4076,24 @@ class MiniMaxMusicClipWidget(QWidget):
         select_row = -1
         for shot in self.project.shots:
             r = self.review_table.rowCount(); self.review_table.insertRow(r)
-            vals = [str(shot.index), shot.status, str(shot.frames), f"{_fmt_time(shot.edit_start)}–{_fmt_time(shot.edit_end)}", shot.output_path, str(shot.seed)]
+            output_path = str(shot.output_path or "")
+            # Show the useful tail of a potentially very long path in the cell.
+            # The complete path remains available by hovering the Output cell.
+            output_display = output_path
+            if output_path:
+                try:
+                    out = Path(output_path)
+                    parent = out.parent.name
+                    output_display = str(Path(parent) / out.name) if parent else out.name
+                except Exception:
+                    pass
+            vals = [str(shot.index), str(shot.seed), shot.status, str(shot.frames), f"{_fmt_time(shot.edit_start)}–{_fmt_time(shot.edit_end)}", output_display]
             for c, value in enumerate(vals):
                 item = QTableWidgetItem(value)
-                if c != 5:
+                if c != 1:
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if c == 5 and output_path:
+                    item.setToolTip(output_path)
                 self.review_table.setItem(r, c, item)
             if current_index == shot.index: select_row = r
         self.review_table.blockSignals(False)

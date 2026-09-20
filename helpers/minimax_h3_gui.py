@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, sys, subprocess, time, socket, urllib.request, re, uuid, html, shutil, hashlib, tempfile, threading, zipfile
+import json, os, sys, subprocess, time, socket, urllib.request, urllib.parse, re, uuid, html, shutil, hashlib, tempfile, threading, zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +36,23 @@ APP_UPDATE_STATE = PRESET_DIR / "minimax_h3_update_state.json"
 APP_UPDATE_EXCLUDED_TOP = {"environments", "models", "output", "logs", "jobs", ".git"}
 APP_UPDATE_EXCLUDED_PREFIXES = {"presets/setsave", "h3_prompt_builder/.runtime"}
 FILE_DIALOG_HISTORY = PRESET_DIR / "minimax_file_dialog_history.json"
+
+SUPPORTED_CHECKPOINT_REPO = "koongrizzly/MiniMax_H3_int4_W4A8_ConvRot_Pruned"
+SUPPORTED_CHECKPOINT_SUBDIR = "diffusion_models"
+SUPPORTED_CHECKPOINT_API = (
+    f"https://huggingface.co/api/models/{SUPPORTED_CHECKPOINT_REPO}/tree/main/{SUPPORTED_CHECKPOINT_SUBDIR}"
+    "?recursive=false&expand=false"
+)
+SUPPORTED_CHECKPOINT_RESOLVE = f"https://huggingface.co/{SUPPORTED_CHECKPOINT_REPO}/resolve/main/{SUPPORTED_CHECKPOINT_SUBDIR}"
+SUPPORTED_CHECKPOINT_DIR = ROOT / "models" / "minimax_h3" / "diffusion_models"
+ARIA2C = ROOT / "presets" / "bin" / "aria2c.exe"
+ARIA2_VERSION = "1.37.0"
+ARIA2_ARCHIVE_NAME = f"aria2-{ARIA2_VERSION}-win-64bit-build1.zip"
+ARIA2_DOWNLOAD_URL = (
+    f"https://github.com/aria2/aria2/releases/download/release-{ARIA2_VERSION}/{ARIA2_ARCHIVE_NAME}"
+)
+# Published by the official aria2 release and mirrored by Microsoft's winget manifest.
+ARIA2_ARCHIVE_SHA256 = "67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288"
 
 
 def _dialog_start_dir(key: str, preferred: str | Path | None = None, fallback: str | Path | None = None) -> str:
@@ -831,9 +848,172 @@ class RefList(QWidget):
         for p in (vals or [])[:self.max_items]: self.list.addItem(self._make_item(str(p)))
 
 
+def _human_bytes(value):
+    try:
+        size = float(value or 0)
+    except Exception:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "—"
+
+
+class SupportedCheckpointDialog(QDialog):
+    """Repository-backed checkpoint picker. Downloads continue after this dialog closes."""
+    results_ready = Signal(object)
+    results_failed = Signal(str)
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle("Supported MiniMax H3 checkpoints")
+        self.resize(880, 430)
+        self.setModal(False)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Available supported diffusion checkpoints from the MiniMax H3 repository. "
+            "Select one or more files. Installed checkpoints are detected automatically and will not be downloaded again."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.state = QLabel("Checking repository…")
+        layout.addWidget(self.state)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Checkpoint", "Size", "Status"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.tree, 1)
+
+        row = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.load_repository)
+        self.download_btn = QPushButton("Download selected")
+        self.download_btn.setEnabled(False)
+        self.download_btn.clicked.connect(self._download_selected)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        row.addWidget(self.refresh_btn)
+        row.addStretch()
+        row.addWidget(self.download_btn)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+        self.results_ready.connect(self._populate)
+        self.results_failed.connect(self._show_error)
+        QTimer.singleShot(0, self.load_repository)
+
+    def load_repository(self):
+        self.refresh_btn.setEnabled(False)
+        self.download_btn.setEnabled(False)
+        self.state.setText("Checking repository…")
+        self.tree.clear()
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    SUPPORTED_CHECKPOINT_API,
+                    headers={"User-Agent": "MiniMax-H3-Standalone/CheckpointBrowser"},
+                )
+                with urllib.request.urlopen(req, timeout=20) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if not isinstance(payload, list):
+                    raise RuntimeError("Unexpected Hugging Face repository response.")
+                files = []
+                for entry in payload:
+                    if not isinstance(entry, dict) or entry.get("type") != "file":
+                        continue
+                    remote_path = str(entry.get("path") or "")
+                    name = Path(remote_path).name
+                    if not name.lower().endswith(".safetensors"):
+                        continue
+                    files.append({
+                        "name": name,
+                        "path": remote_path,
+                        "size": int(entry.get("size") or 0),
+                    })
+                files.sort(key=lambda item: item["name"].lower())
+                if not files:
+                    raise RuntimeError("No .safetensors checkpoints were found in the repository folder.")
+                self.results_ready.emit(files)
+            except Exception as exc:
+                self.results_failed.emit(str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _installed_state(self, info):
+        target = SUPPORTED_CHECKPOINT_DIR / info["name"]
+        control = Path(str(target) + ".aria2")
+        if not target.exists():
+            return False, "Available"
+        expected = int(info.get("size") or 0)
+        try:
+            actual = target.stat().st_size
+        except OSError:
+            actual = 0
+        if control.exists() or (expected and actual < expected):
+            return False, f"Partial ({_human_bytes(actual)}) — resumable"
+        return True, "Already installed"
+
+    def _populate(self, files):
+        if not self.isVisible():
+            return
+        self.refresh_btn.setEnabled(True)
+        SUPPORTED_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        available = 0
+        for info in files:
+            installed, status = self._installed_state(info)
+            item = QTreeWidgetItem([info["name"], _human_bytes(info.get("size")), status])
+            item.setData(0, Qt.ItemDataRole.UserRole, info)
+            flags = item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            if installed:
+                item.setFlags(flags & ~Qt.ItemFlag.ItemIsEnabled)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+            else:
+                item.setFlags(flags)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                available += 1
+            self.tree.addTopLevelItem(item)
+        self.state.setText(
+            f"{self.tree.topLevelItemCount()} supported checkpoint(s) found · "
+            f"download folder: {SUPPORTED_CHECKPOINT_DIR}"
+        )
+        self.download_btn.setEnabled(available > 0)
+
+    def _show_error(self, message):
+        if not self.isVisible():
+            return
+        self.refresh_btn.setEnabled(True)
+        self.state.setText("Could not read the supported checkpoint list.")
+        QMessageBox.warning(self, "Checkpoint list", f"Could not read the Hugging Face repository:\n\n{message}")
+
+    def _download_selected(self):
+        selected = []
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if item.checkState(0) == Qt.CheckState.Checked:
+                info = item.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(info, dict):
+                    selected.append(info)
+        if not selected:
+            QMessageBox.information(self, "Supported checkpoints", "Select at least one checkpoint to download.")
+            return
+        if self.owner.start_supported_checkpoint_downloads(selected):
+            self.accept()
+
+
 class MainWindow(QMainWindow):
     update_check_finished = Signal(object)
     update_check_failed = Signal(object)
+    aria2_bootstrap_finished = Signal(bool, str)
 
     def __init__(self):
         super().__init__()
@@ -873,6 +1053,20 @@ class MainWindow(QMainWindow):
         self._ffmpeg_setup_failed = False
         self._update_check_running = False
         self._update_payload = None
+        self._checkpoint_dialog = None
+        self._aria2_bootstrap_running = False
+        self._aria2_pending_checkpoint_request = None
+        self._checkpoint_download_proc = None
+        self._checkpoint_download_queue = []
+        self._checkpoint_download_total_bytes = 0
+        self._checkpoint_download_completed_bytes = 0
+        self._checkpoint_download_current = None
+        self._checkpoint_download_current_start_size = 0
+        self._checkpoint_download_output = ""
+        self._checkpoint_progress_timer = QTimer(self)
+        self._checkpoint_progress_timer.setInterval(500)
+        self._checkpoint_progress_timer.timeout.connect(self._refresh_checkpoint_download_progress)
+        self.aria2_bootstrap_finished.connect(self._handle_aria2_bootstrap_finished)
         self.update_check_finished.connect(self._handle_update_check_finished)
         self.update_check_failed.connect(self._handle_update_check_failed)
         self.wheel_filter = NoWheelFilter(self)
@@ -960,6 +1154,23 @@ class MainWindow(QMainWindow):
         # Always-visible system HUD. It sits outside the tabs so changing tabs never hides it.
         self.system_hud = SystemHud(self)
         outer.addWidget(self.system_hud, 0)
+
+        # Persistent checkpoint download strip. The browser popup may be closed,
+        # but aria2c remains owned by MainWindow and progress stays visible here.
+        self.checkpoint_download_strip = QFrame(self)
+        self.checkpoint_download_strip.setObjectName("checkpointDownloadStrip")
+        dlrow = QHBoxLayout(self.checkpoint_download_strip)
+        dlrow.setContentsMargins(8, 4, 8, 4)
+        dlrow.setSpacing(8)
+        self.checkpoint_download_label = QLabel("Checkpoint download")
+        self.checkpoint_download_progress = QProgressBar()
+        self.checkpoint_download_progress.setRange(0, 1000)
+        self.checkpoint_download_progress.setValue(0)
+        self.checkpoint_download_progress.setTextVisible(True)
+        dlrow.addWidget(self.checkpoint_download_label)
+        dlrow.addWidget(self.checkpoint_download_progress, 1)
+        self.checkpoint_download_strip.hide()
+        outer.addWidget(self.checkpoint_download_strip, 0)
 
         # One shared preview/player pane for the whole application.  The actual
         # preview widget is created by the Queue builder below, then adopted into
@@ -2599,6 +2810,12 @@ class MainWindow(QMainWindow):
         models = QGroupBox("Model overrides"); mf = QFormLayout(models)
         mnote = QLabel("Leave a field empty for automatic model discovery. Explicit overrides can use supported INT4/W4A8 or INT8 ConvRot .safetensors checkpoints. Hybrid mode can use a manually selected hybrid checkpoint or auto-discover one.")
         mnote.setWordWrap(True); mf.addRow(mnote)
+        self.check_supported_checkpoints = QPushButton("Check supported checkpoints")
+        self.check_supported_checkpoints.setToolTip(
+            "Show supported MiniMax H3 diffusion checkpoints from Hugging Face and download one or more with aria2c into models\\minimax_h3\\diffusion_models."
+        )
+        self.check_supported_checkpoints.clicked.connect(self.open_supported_checkpoint_browser)
+        mf.addRow(self.check_supported_checkpoints)
         self.use_hybrid_model = QCheckBox("Use hybrid model")
         self.use_hybrid_model.setChecked(False)
         self.use_hybrid_model.setToolTip("When enabled, use one hybrid MiniMax H3 checkpoint for T2VA/FL2VA and Ref2VA. A selected file/folder is preferred; when blank or stale, the MiniMax model folders are scanned automatically for a compatible hybrid .safetensors file. This setting is remembered after restart.")
@@ -3163,6 +3380,333 @@ class MainWindow(QMainWindow):
             if progress or any(t.lower() in low for t in tokens):
                 keep.append(line)
         if keep: self.append_log("\n".join(keep) + "\n")
+
+    def _aria2c_ready(self):
+        try:
+            return ARIA2C.is_file() and ARIA2C.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _ensure_aria2c_async(self, pending_request=None):
+        """Silently provision aria2c.exe from the official Windows x64 release when missing."""
+        if self._aria2c_ready():
+            return True
+        if pending_request is not None:
+            self._aria2_pending_checkpoint_request = list(pending_request)
+        if self._aria2_bootstrap_running:
+            return False
+
+        self._aria2_bootstrap_running = True
+        self.append_log(f"[CHECKPOINT] aria2c.exe missing; preparing aria2 {ARIA2_VERSION} downloader.\n")
+
+        def worker():
+            archive_path = ARIA2C.parent / ARIA2_ARCHIVE_NAME
+            temp_exe = ARIA2C.with_suffix(".exe.tmp")
+            try:
+                ARIA2C.parent.mkdir(parents=True, exist_ok=True)
+                req = urllib.request.Request(
+                    ARIA2_DOWNLOAD_URL,
+                    headers={"User-Agent": "MiniMax-H3-Standalone/aria2-bootstrap"},
+                )
+                digest = hashlib.sha256()
+                with urllib.request.urlopen(req, timeout=45) as response, archive_path.open("wb") as out:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        digest.update(chunk)
+                actual_hash = digest.hexdigest().lower()
+                if actual_hash != ARIA2_ARCHIVE_SHA256.lower():
+                    raise RuntimeError(
+                        f"aria2 archive checksum mismatch (got {actual_hash}, expected {ARIA2_ARCHIVE_SHA256})"
+                    )
+
+                with zipfile.ZipFile(archive_path, "r") as zf:
+                    candidates = [name for name in zf.namelist() if Path(name).name.lower() == "aria2c.exe"]
+                    if not candidates:
+                        raise RuntimeError("aria2c.exe was not found inside the downloaded aria2 archive")
+                    with zf.open(candidates[0], "r") as src, temp_exe.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                if not temp_exe.is_file() or temp_exe.stat().st_size <= 0:
+                    raise RuntimeError("Extracted aria2c.exe is empty")
+                temp_exe.replace(ARIA2C)
+                self.aria2_bootstrap_finished.emit(True, str(ARIA2C))
+            except Exception as exc:
+                try:
+                    if temp_exe.exists():
+                        temp_exe.unlink()
+                except OSError:
+                    pass
+                self.aria2_bootstrap_finished.emit(False, str(exc))
+            finally:
+                try:
+                    if archive_path.exists():
+                        archive_path.unlink()
+                except OSError:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def _handle_aria2_bootstrap_finished(self, ok, message):
+        self._aria2_bootstrap_running = False
+        pending = self._aria2_pending_checkpoint_request
+        self._aria2_pending_checkpoint_request = None
+        if ok:
+            self.append_log(f"[CHECKPOINT] aria2c ready: {ARIA2C}\n")
+            if pending:
+                QTimer.singleShot(0, lambda req=pending: self.start_supported_checkpoint_downloads(req))
+            return
+
+        self.append_log(f"[CHECKPOINT] Could not prepare aria2c: {message}\n")
+        if pending:
+            QMessageBox.warning(
+                self,
+                "Checkpoint downloader",
+                "Could not automatically prepare aria2c.exe.\n\n" + message,
+            )
+
+    def open_supported_checkpoint_browser(self):
+        # Start provisioning immediately on popup open. Usually this finishes while
+        # the Hugging Face checkpoint list is loading, so the downloader is ready
+        # before the user can make a selection.
+        self._ensure_aria2c_async()
+        if self._checkpoint_dialog is not None:
+            try:
+                self._checkpoint_dialog.close()
+            except RuntimeError:
+                pass
+        self._checkpoint_dialog = SupportedCheckpointDialog(self)
+        self._checkpoint_dialog.finished.connect(lambda *_: setattr(self, "_checkpoint_dialog", None))
+        self._checkpoint_dialog.show()
+        self._checkpoint_dialog.raise_()
+        self._checkpoint_dialog.activateWindow()
+
+    def start_supported_checkpoint_downloads(self, requested):
+        if self._checkpoint_download_proc is not None:
+            QMessageBox.information(
+                self,
+                "Checkpoint download",
+                "A checkpoint download is already running. Let it finish before starting another batch.",
+            )
+            return False
+        if not self._aria2c_ready():
+            # The popup-open path normally has this ready already. If the user is
+            # unusually fast or the bootstrap is still downloading, keep their
+            # selection and start the checkpoint batch automatically when ready.
+            self._ensure_aria2c_async(requested)
+            return True
+
+        SUPPORTED_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        queue = []
+        skipped = []
+        for info in requested:
+            if not isinstance(info, dict):
+                continue
+            name = Path(str(info.get("name") or "")).name
+            if not name.lower().endswith(".safetensors"):
+                continue
+            target = SUPPORTED_CHECKPOINT_DIR / name
+            control = Path(str(target) + ".aria2")
+            expected = int(info.get("size") or 0)
+            installed = False
+            if target.exists() and not control.exists():
+                try:
+                    installed = not expected or target.stat().st_size >= expected
+                except OSError:
+                    installed = False
+            if installed:
+                skipped.append(name)
+                continue
+            entry = dict(info)
+            entry["name"] = name
+            entry["target"] = str(target)
+            queue.append(entry)
+
+        if not queue:
+            QMessageBox.information(
+                self,
+                "Supported checkpoints",
+                "The selected checkpoint(s) are already installed. Nothing needs to be downloaded.",
+            )
+            return False
+
+        self._checkpoint_download_queue = queue
+        self._checkpoint_download_total_bytes = sum(max(0, int(x.get("size") or 0)) for x in queue)
+        self._checkpoint_download_completed_bytes = 0
+        self._checkpoint_download_current = None
+        self._checkpoint_download_current_start_size = 0
+        self._checkpoint_download_output = ""
+        self.checkpoint_download_progress.setValue(0)
+        self.checkpoint_download_strip.show()
+        skipped_text = f" · {len(skipped)} already installed" if skipped else ""
+        self.checkpoint_download_label.setText(f"Checkpoint downloads queued: {len(queue)}{skipped_text}")
+        self.append_log(f"[CHECKPOINT] Queued {len(queue)} supported checkpoint download(s) with aria2c.{skipped_text}\n")
+        self._checkpoint_progress_timer.start()
+        self._start_next_supported_checkpoint_download()
+        return True
+
+    def _start_next_supported_checkpoint_download(self):
+        if self._closing:
+            return
+        if not self._checkpoint_download_queue:
+            self._checkpoint_download_proc = None
+            self._checkpoint_download_current = None
+            self._checkpoint_progress_timer.stop()
+            self.checkpoint_download_progress.setValue(1000)
+            self.checkpoint_download_progress.setFormat("100%")
+            self.checkpoint_download_label.setText("Supported checkpoint download complete")
+            self.status.setText("Checkpoint download complete")
+            self.append_log(f"[CHECKPOINT] Downloads complete: {SUPPORTED_CHECKPOINT_DIR}\n")
+            QTimer.singleShot(8000, self._hide_completed_checkpoint_download_strip)
+            return
+
+        info = self._checkpoint_download_queue.pop(0)
+        target = Path(info["target"])
+        expected = max(0, int(info.get("size") or 0))
+        try:
+            existing = target.stat().st_size if target.exists() else 0
+        except OSError:
+            existing = 0
+        self._checkpoint_download_current = info
+        self._checkpoint_download_current_start_size = existing
+        self._checkpoint_download_output = ""
+
+        url = f"{SUPPORTED_CHECKPOINT_RESOLVE}/{urllib.parse.quote(info['name'])}?download=true"
+        args = [
+            "--continue=true",
+            "--max-connection-per-server=16",
+            "--split=16",
+            "--min-split-size=16M",
+            "--file-allocation=none",
+            "--auto-file-renaming=false",
+            "--allow-overwrite=false",
+            "--console-log-level=notice",
+            "--summary-interval=1",
+            f"--dir={SUPPORTED_CHECKPOINT_DIR}",
+            f"--out={info['name']}",
+            url,
+        ]
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(self._checkpoint_download_read_output)
+        proc.finished.connect(self._checkpoint_download_finished)
+        proc.errorOccurred.connect(self._checkpoint_download_process_error)
+        self._checkpoint_download_proc = proc
+        self.checkpoint_download_label.setText(f"Downloading {info['name']}")
+        self.append_log(
+            f"[CHECKPOINT] aria2c: {info['name']} ({_human_bytes(expected)}) -> {SUPPORTED_CHECKPOINT_DIR}\n"
+        )
+        proc.start(str(ARIA2C), args)
+
+    def _checkpoint_download_read_output(self):
+        proc = self._checkpoint_download_proc
+        if proc is None:
+            return
+        try:
+            chunk = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        except Exception:
+            return
+        self._checkpoint_download_output = (self._checkpoint_download_output + chunk)[-16000:]
+
+    def _refresh_checkpoint_download_progress(self):
+        info = self._checkpoint_download_current
+        if not info:
+            return
+        target = Path(info["target"])
+        expected = max(0, int(info.get("size") or 0))
+        try:
+            current_size = target.stat().st_size if target.exists() else 0
+        except OSError:
+            current_size = 0
+        current_size = min(current_size, expected) if expected else current_size
+
+        if self._checkpoint_download_total_bytes > 0:
+            done = self._checkpoint_download_completed_bytes + current_size
+            ratio = max(0.0, min(1.0, done / self._checkpoint_download_total_bytes))
+            self.checkpoint_download_progress.setValue(int(ratio * 1000))
+            self.checkpoint_download_progress.setFormat(f"{ratio * 100:.1f}%")
+        elif expected > 0:
+            ratio = max(0.0, min(1.0, current_size / expected))
+            self.checkpoint_download_progress.setValue(int(ratio * 1000))
+            self.checkpoint_download_progress.setFormat(f"{ratio * 100:.1f}%")
+        else:
+            self.checkpoint_download_progress.setRange(0, 0)
+            self.checkpoint_download_progress.setFormat("Downloading…")
+
+        count_done = self._checkpoint_download_completed_bytes
+        count_total = self._checkpoint_download_total_bytes
+        suffix = f" · {_human_bytes(current_size)} / {_human_bytes(expected)}" if expected else f" · {_human_bytes(current_size)}"
+        if count_total:
+            suffix += f" · batch {_human_bytes(min(count_done + current_size, count_total))} / {_human_bytes(count_total)}"
+        self.checkpoint_download_label.setText(f"Downloading {info['name']}{suffix}")
+
+    def _checkpoint_download_finished(self, exit_code, exit_status):
+        proc = self._checkpoint_download_proc
+        if proc is not None:
+            self._checkpoint_download_read_output()
+        info = self._checkpoint_download_current
+        self._checkpoint_download_proc = None
+        if not info:
+            return
+
+        target = Path(info["target"])
+        expected = max(0, int(info.get("size") or 0))
+        try:
+            actual = target.stat().st_size if target.exists() else 0
+        except OSError:
+            actual = 0
+        control = Path(str(target) + ".aria2")
+        complete = exit_code == 0 and target.exists() and not control.exists() and (not expected or actual >= expected)
+        if complete:
+            self._checkpoint_download_completed_bytes += expected if expected else actual
+            self.append_log(f"[CHECKPOINT] Installed: {target.name}\n")
+            self._checkpoint_download_current = None
+            QTimer.singleShot(0, self._start_next_supported_checkpoint_download)
+            return
+
+        self._checkpoint_progress_timer.stop()
+        self._checkpoint_download_current = None
+        self._checkpoint_download_queue = []
+        self.checkpoint_download_progress.setRange(0, 1000)
+        self.checkpoint_download_progress.setFormat("Failed")
+        self.checkpoint_download_label.setText(f"Checkpoint download failed: {info['name']}")
+        tail = self._checkpoint_download_output.strip()[-4000:] or f"aria2c exit code {exit_code}"
+        self.append_log(f"[CHECKPOINT] Download failed: {info['name']} (exit {exit_code})\n{tail}\n")
+        QMessageBox.warning(
+            self,
+            "Checkpoint download failed",
+            f"aria2c could not finish {info['name']}.\n\nThe partial download is kept so a later retry can resume it.\n\n{tail}",
+        )
+
+    def _checkpoint_download_process_error(self, error):
+        if self._closing:
+            return
+        self.append_log(f"[CHECKPOINT] aria2c process error: {error}\n")
+        if error != QProcess.ProcessError.FailedToStart:
+            return
+        info = self._checkpoint_download_current or {}
+        self._checkpoint_download_proc = None
+        self._checkpoint_download_current = None
+        self._checkpoint_download_queue = []
+        self._checkpoint_progress_timer.stop()
+        self.checkpoint_download_progress.setRange(0, 1000)
+        self.checkpoint_download_progress.setFormat("Failed")
+        name = str(info.get("name") or "checkpoint")
+        self.checkpoint_download_label.setText(f"Checkpoint download failed to start: {name}")
+        QMessageBox.critical(
+            self,
+            "aria2c failed to start",
+            f"Could not start aria2c.exe from:\n\n{ARIA2C}",
+        )
+
+    def _hide_completed_checkpoint_download_strip(self):
+        if self._checkpoint_download_proc is None and not self._checkpoint_download_queue and self._checkpoint_download_current is None:
+            self.checkpoint_download_strip.hide()
+            self.checkpoint_download_progress.setRange(0, 1000)
+            self.checkpoint_download_progress.setValue(0)
+            self.checkpoint_download_progress.setFormat("%p%")
 
     def _sync_hybrid_model_ui(self, enabled):
         enabled = bool(enabled)
@@ -3907,6 +4451,9 @@ class MainWindow(QMainWindow):
             pid=int(self.proc.processId())
             if os.name=='nt' and pid: subprocess.run(["taskkill","/PID",str(pid),"/T","/F"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             else: self.proc.kill()
+        if self._checkpoint_download_proc is not None and self._checkpoint_download_proc.state() != QProcess.ProcessState.NotRunning:
+            self._checkpoint_download_proc.kill()
+            self._checkpoint_download_proc.waitForFinished(1500)
         self._stop_prompt_builder()
         super().closeEvent(e)
 
