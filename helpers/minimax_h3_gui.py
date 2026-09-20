@@ -1077,7 +1077,7 @@ class MainWindow(QMainWindow):
         self.continue_audio_memory = QCheckBox("Use sound in memory for new clip")
         self.continue_audio_memory.setChecked(False)
         self.continue_audio_memory.setToolTip("Carries the final 1.00 s of source audio as H3 history. The 24-frame / 40-step window is end-aligned to the new clip on H3's native 40 Hz audio timeline.")
-        self.continue_audio_memory_warning = QLabel("1.00 s timeline-aligned test")
+        self.continue_audio_memory_warning = QLabel("1.00 s timeline-aligned")
         self.continue_audio_memory_warning.setStyleSheet("color: #d58a00;")
         self.continue_audio_memory_warning.setToolTip("Test patch: full audio history ends exactly at target time zero; no guessed boundary-latent deletion is used.")
         caml.addWidget(self.continue_audio_memory); caml.addWidget(self.continue_audio_memory_warning); caml.addStretch()
