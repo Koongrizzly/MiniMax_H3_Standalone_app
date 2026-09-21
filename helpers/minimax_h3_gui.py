@@ -1278,11 +1278,20 @@ class MainWindow(QMainWindow):
             "This avoids the video -> VAE re-encode round trip and can reduce cumulative quality/character drift in long chains. "
             "The previous result must have a compatible saved H3 latent at the same resolution. If no compatible latent is found, the app automatically falls back to normal video-frame continuation."
         )
+        self.latent_continuation.toggled.connect(self._sync_continue_video_options)
+        self.continue_context.setToolTip(
+            "Number of decoded source-video history frames used by normal continuation. "
+            "Ignored while latent continuation is active; the saved value is kept as the fallback context if no compatible latent can be used."
+        )
         self.glue_results = QCheckBox("Glue results")
         self.glue_results.setChecked(False)
         self.continue_last_result = QCheckBox("Continue last result")
         self.continue_last_result.setChecked(False)
         self.continue_last_result.toggled.connect(self._sync_continue_video_options)
+        # Manual Continue video is also a valid source for sound-memory continuation,
+        # so update the sound-memory control as soon as that path changes.
+        if getattr(self.continue_video, "edit", None) is not None:
+            self.continue_video.edit.textChanged.connect(self._sync_continue_video_options)
         self.continue_audio_memory_row = QWidget()
         caml = QHBoxLayout(self.continue_audio_memory_row); caml.setContentsMargins(0, 0, 0, 0)
         self.continue_audio_memory = QCheckBox("Use sound in memory for new clip")
@@ -3261,6 +3270,12 @@ class MainWindow(QMainWindow):
 
     def _sync_continue_video_options(self):
         chain = bool(getattr(self, "continue_last_result", None) and self.continue_last_result.isChecked())
+        latent = bool(getattr(self, "latent_continuation", None) and self.latent_continuation.isChecked())
+        if hasattr(self, "continue_context"):
+            # Latent continuation carries H3 state directly, so decoded-video history
+            # length is not an active setting. Keep the selected value stored because
+            # it is still used automatically if latent continuation has to fall back.
+            self.continue_context.setEnabled(not latent)
         if hasattr(self, "continue_video"):
             self.continue_video.setEnabled(not chain)
             # When Continue last result is active, the queued dependency is the only
@@ -3273,10 +3288,21 @@ class MainWindow(QMainWindow):
         # a manually selected Continue Video source. Keep Last frame available as a destination.
         if hasattr(self, "first"):
             self.first.setEnabled(not chain)
+        # Sound memory is useful for either continuation source: the latest queued
+        # result or a manually selected Continue video. Keep the control visible at
+        # all times so its stored ON/OFF state is obvious, and only grey it out when
+        # there is currently no continuation source to take audio history from.
+        manual_source = bool(
+            hasattr(self, "continue_video")
+            and getattr(self.continue_video, "edit", None) is not None
+            and self.continue_video.edit.text().strip()
+        )
+        has_audio_memory_source = bool(chain or manual_source)
         if hasattr(self, "continue_audio_memory_row"):
-            self.continue_audio_memory_row.setVisible(chain)
+            self.continue_audio_memory_row.setVisible(True)
+            self.continue_audio_memory_row.setEnabled(has_audio_memory_source)
         if hasattr(self, "continue_audio_memory"):
-            self.continue_audio_memory.setEnabled(chain)
+            self.continue_audio_memory.setEnabled(has_audio_memory_source)
 
     def current_output_dir(self) -> Path:
         p = self.output_folder.path()
