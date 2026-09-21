@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, sys, subprocess, time, socket, urllib.request, urllib.parse, re, uuid, html, shutil, hashlib, tempfile, threading, zipfile
+import json, os, sys, subprocess, time, socket, urllib.request, urllib.parse, re, uuid, html, shutil, hashlib, tempfile, threading, zipfile, copy
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +20,11 @@ from PySide6.QtWidgets import (
     QHeaderView, QMenu, QSplitter, QSlider, QProgressBar, QGraphicsView, QGraphicsScene,
     QDialog, QDialogButtonBox, QAbstractItemView, QLayout, QSizePolicy
 )
+
+try:
+    from .minimax_timeline import TimelineTab
+except ImportError:
+    from minimax_timeline import TimelineTab
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / "environments" / ".minimax_h3_int4" / "python.exe"
@@ -1049,6 +1054,9 @@ class MainWindow(QMainWindow):
         self._ffmpeg_setup_proc = None
         self._ffmpeg_setup_popup = None
         self._ffmpeg_setup_output = ""
+        self._timeline_assembly_proc = None
+        self._timeline_assembly_output = ""
+        self._timeline_assembly_concat = None
         self._ffmpeg_setup_status = ""
         self._ffmpeg_setup_failed = False
         self._update_check_running = False
@@ -1147,7 +1155,7 @@ class MainWindow(QMainWindow):
 
     def _build(self):
         root = QWidget(); outer = QVBoxLayout(root); outer.setContentsMargins(10, 10, 10, 10); outer.setSpacing(8)
-        hdr = QHBoxLayout(); title = QLabel("minimax H3"); title.setObjectName("title")
+        hdr = QHBoxLayout(); title = QLabel("GrizzlyMax (Minimax H3 standalone)"); title.setObjectName("title")
         self.status = QLabel("Checking install…"); self.status.setObjectName("status")
         hdr.addWidget(title); hdr.addStretch(); hdr.addWidget(self.status); outer.addLayout(hdr)
 
@@ -1188,6 +1196,9 @@ class MainWindow(QMainWindow):
         self.global_preview_host.hide()
 
         self.tabs = QTabWidget()
+        # Main tabs are user-reorderable. Stable string keys are stored on the
+        # QTabBar so the saved order remains valid even when new tabs are added.
+        self.tabs.setMovable(True)
         # When the global preview pane is widened the right-hand workspace can
         # become narrower than the complete tab strip.  Keep all tabs at their
         # normal readable width and let Qt expose its native left/right tab
@@ -1213,7 +1224,10 @@ class MainWindow(QMainWindow):
         self._build_prompt_builder_tab()
         self._build_queue_tab()
         self._build_music_clip_tab()
+        self._build_timeline_tab()
         self._build_settings_tab()
+        if getattr(self, "timeline_widget", None) is not None:
+            self.timeline_widget.initialize_from_current_settings()
         self._adopt_global_preview_pane()
 
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.
@@ -1229,6 +1243,7 @@ class MainWindow(QMainWindow):
         self._add_tooltips()
         self.tabs.currentChanged.connect(self._sync_main_generate_button)
         self.tabs.currentChanged.connect(self._sync_global_preview_for_tab)
+        self.tabs.tabBar().tabMoved.connect(self._sync_cached_tab_indexes)
         self._sync_main_generate_button(self.tabs.currentIndex())
         self._sync_global_preview_for_tab(self.tabs.currentIndex())
 
@@ -1377,7 +1392,8 @@ class MainWindow(QMainWindow):
         self.generation_splitter.setStretchFactor(1, 6)
         self.generation_splitter.setSizes([520, 650])
         page_layout.addWidget(self.generation_splitter, 1)
-        self.tabs.addTab(page, "Generation")
+        index = self.tabs.addTab(page, "Generation")
+        self.tabs.tabBar().setTabData(index, "generation")
 
     def _builder_root(self) -> Path:
         return ROOT / "h3_prompt_builder"
@@ -1425,6 +1441,7 @@ class MainWindow(QMainWindow):
         # widget identity is stable for the lifetime of this window.
         self.prompt_builder_page = page
         self.prompt_builder_tab_index = self.tabs.addTab(page, "Prompt Builder")
+        self.tabs.tabBar().setTabData(self.prompt_builder_tab_index, "prompt_builder")
 
         # The embedded page starts asynchronously and can perform a visible
         # reload shortly after the user opens this tab.  Re-assert the Prompt
@@ -1898,7 +1915,8 @@ class MainWindow(QMainWindow):
         self.queue_splitter = splitter
         self.queue_jobs_scroll = right_scroll
 
-        self.tabs.addTab(page,"Queue")
+        index = self.tabs.addTab(page,"Queue")
+        self.tabs.tabBar().setTabData(index, "queue")
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(500)
         self.queue_timer.timeout.connect(self._queue_tick)
@@ -2146,6 +2164,11 @@ class MainWindow(QMainWindow):
                 elif self._ffmpeg_setup_failed and not ffmpeg_tools_ready():
                     base += "  •  FFmpeg setup failed"
                 self.queue_summary.setText(base)
+            if getattr(self, "timeline_widget", None) is not None:
+                try:
+                    self.timeline_widget.sync_queue_jobs(self.queue_jobs)
+                except Exception as exc:
+                    self.append_log(f"Timeline status refresh warning: {exc}\n")
         finally:
             self.running_tree.setUpdatesEnabled(True); self.pending_tree.setUpdatesEnabled(True); self.finished_tree.setUpdatesEnabled(True)
             self.running_tree.viewport().update(); self.pending_tree.viewport().update(); self.finished_tree.viewport().update()
@@ -2636,6 +2659,7 @@ class MainWindow(QMainWindow):
             )
             lay.addWidget(self.music_clip_widget, 1)
             self.music_clip_tab_index = self.tabs.addTab(page, "Music Clip Creator")
+            self.tabs.tabBar().setTabData(self.music_clip_tab_index, "music_clip_creator")
         except Exception as exc:
             self.music_clip_widget = None
             msg = QLabel(
@@ -2646,20 +2670,422 @@ class MainWindow(QMainWindow):
             lay.addWidget(msg)
             lay.addStretch(1)
             self.music_clip_tab_index = self.tabs.addTab(page, "Music Clip Creator")
+            self.tabs.tabBar().setTabData(self.music_clip_tab_index, "music_clip_creator")
+
+    def _build_timeline_tab(self):
+        # The timeline owns its project/chunk/CUT model in minimax_timeline.py.
+        # It only calls back into this window at the final queue boundary so the
+        # existing, proven MiniMax generation/continuation backend stays the one
+        # source of truth.
+        self.timeline_widget = TimelineTab(
+            self,
+            settings_provider=self.settings_dict,
+            queue_timeline_callback=self._queue_timeline_jobs,
+            assemble_timeline_callback=self._assemble_timeline_project,
+            preview_result_callback=self._preview_timeline_result,
+            open_output_callback=self._open_timeline_output_folder,
+            frame_values=EXPERIMENTAL_FRAME_PRESETS,
+        )
+        self.timeline_tab_index = self.tabs.addTab(self.timeline_widget, "Timeline")
+        self.tabs.tabBar().setTabData(self.timeline_tab_index, "timeline")
+
+    def _extract_timeline_first_frame(self, video_path, clip_id):
+        video = Path(str(video_path or ""))
+        if not video.is_file():
+            return ""
+        if not ffmpeg_tools_ready():
+            self._ensure_ffmpeg_async()
+            QMessageBox.information(
+                self,
+                "Timeline bridge",
+                "FFmpeg is not ready yet. FrameVision has started preparing it; try Generate Selected again when setup finishes.",
+            )
+            return ""
+        bridge_dir = ROOT / "jobs" / "timeline_bridge_frames"
+        bridge_dir.mkdir(parents=True, exist_ok=True)
+        out = bridge_dir / f"{str(clip_id or uuid.uuid4().hex)}_next_first.png"
+        try:
+            if out.is_file():
+                out.unlink()
+        except Exception:
+            pass
+        cmd = [
+            str(ffmpeg_tool_path("ffmpeg")), "-y", "-i", str(video),
+            "-map", "0:v:0", "-frames:v", "1", str(out),
+        ]
+        try:
+            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as exc:
+            QMessageBox.critical(self, "Timeline bridge", f"Could not extract the next clip's first frame:\n{exc}")
+            return ""
+        if cp.returncode != 0 or not out.is_file():
+            detail = (cp.stderr or cp.stdout or "FFmpeg frame extraction failed.").strip().splitlines()
+            QMessageBox.critical(self, "Timeline bridge", detail[-1] if detail else "FFmpeg frame extraction failed.")
+            return ""
+        return str(out)
+
+    def _queue_timeline_jobs(self, specs):
+        """Translate timeline generation chunks into normal standalone queue jobs.
+
+        The timeline deliberately does not own a second H3 runner.  Each clip is
+        converted back into the same Generation-tab settings that ``generate``
+        already knows how to validate and queue.  Continue clips therefore use
+        the exact existing Continue Last Result dependency path.
+        """
+        if not isinstance(specs, list) or not specs:
+            QMessageBox.warning(self, "Timeline", "The timeline has no clips to generate.")
+            return False
+
+        original = copy.deepcopy(self.settings_dict())
+        created = []
+        try:
+            for pos, spec in enumerate(specs):
+                clip_id = str(spec.get("id") or "")
+                clip_name = str(spec.get("name") or f"Clip {pos + 1}")
+                settings = copy.deepcopy(spec.get("settings") or original)
+                frames = int(spec.get("frames") or settings.get("frames") or 243)
+                settings["frames"] = frames
+                settings["experimental_long_duration"] = frames > NORMAL_FRAME_MAX
+                settings["prompt"] = str(spec.get("compiled_prompt") or "").strip()
+                settings["seed"] = int((spec.get("settings") or {}).get("seed", settings.get("seed", -1)))
+                settings["steps"] = int((spec.get("settings") or {}).get("steps", settings.get("steps", 15)))
+                settings["scheduler"] = str((spec.get("settings") or {}).get("scheduler", settings.get("scheduler", "beta")))
+
+                is_continue = str(spec.get("generation_mode") or "new") == "continue"
+                single_regen = bool(spec.get("timeline_single_regeneration", False))
+                if is_continue:
+                    timeline_index = int(spec.get("timeline_index", pos) or 0)
+                    if timeline_index == 0:
+                        QMessageBox.warning(self, "Timeline", "The first timeline clip cannot Continue Previous Clip.")
+                        return False
+                    settings["mode"] = 1  # FL2VA
+                    settings["first"] = ""
+                    if single_regen:
+                        # A middle-clip replacement must continue from the exact
+                        # preserved previous timeline result, not whichever queue
+                        # job happens to be newest globally.
+                        prev_output = str(spec.get("timeline_previous_output") or "")
+                        if not prev_output or not Path(prev_output).is_file():
+                            QMessageBox.warning(self, "Timeline", f"{clip_name} has no valid finished previous timeline result to continue from.")
+                            return False
+                        settings["continue_last_result"] = False
+                        settings["continue_video"] = prev_output
+                    else:
+                        # Full timeline generation keeps using the existing queue
+                        # dependency chain so each clip waits for the one before it.
+                        if pos == 0:
+                            QMessageBox.warning(self, "Timeline", "A continued clip cannot be the first queued timeline item.")
+                            return False
+                        settings["continue_last_result"] = True
+                        settings["continue_video"] = ""
+                    settings["last"] = ""
+                else:
+                    # Start a fresh dependency chain. A captured manual source
+                    # (first/last frame, Ref2VA refs, or manual Continue video)
+                    # remains valid, but it must never silently target the last
+                    # queue result from an earlier timeline chain.
+                    settings["continue_last_result"] = False
+
+                if bool(spec.get("match_next_first_frame", False)):
+                    if not single_regen:
+                        QMessageBox.warning(
+                            self, "Timeline bridge",
+                            f"{clip_name} is set to use the next video's first frame. Use Generate Selected for bridge replacement mode."
+                        )
+                        return False
+                    next_output = str(spec.get("timeline_next_output") or "")
+                    if not next_output or not Path(next_output).is_file():
+                        QMessageBox.warning(self, "Timeline bridge", f"{clip_name} has no valid next timeline result to use as its end anchor.")
+                        return False
+                    anchor = self._extract_timeline_first_frame(next_output, clip_id)
+                    if not anchor:
+                        return False
+                    settings["last"] = anchor
+
+                # Keep long timeline outputs readable without replacing a user's
+                # chosen output directory. Existing make_output_path() still
+                # guarantees uniqueness when names collide.
+                timeline_number = int(spec.get("timeline_index", pos) or 0) + 1
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", clip_name).strip("_") or f"clip_{timeline_number:03d}"
+                settings["output_name"] = f"timeline_{timeline_number:03d}_{safe_name}.mp4"
+
+                self.apply_settings(settings)
+                before = len(self.queue_jobs)
+                self.generate()
+                if len(self.queue_jobs) <= before:
+                    # generate() already showed the specific validation dialog.
+                    # Stop here so a later Continue clip can never attach to the
+                    # wrong queue job after an earlier clip failed to enqueue.
+                    return False
+                job = self.queue_jobs[-1]
+                job["timeline_project_id"] = str(getattr(self.timeline_widget, "project", {}).get("project_id", ""))
+                job["timeline_clip_id"] = clip_id
+                job["timeline_clip_index"] = pos
+                job["timeline_clip_name"] = clip_name
+                created.append((clip_id, job.get("id"), job.get("output", "")))
+
+            # Add timeline metadata to persisted queue state after every generated
+            # job has been tagged.
+            self._save_queue_state()
+            self._refresh_queue_views()
+            for clip_id, job_id, output in created:
+                if getattr(self, "timeline_widget", None) is not None:
+                    self.timeline_widget.mark_queued(clip_id, job_id, output)
+            self.status.setText(f"Timeline queued: {len(created)} clip(s)")
+            return True
+        finally:
+            # Timeline queuing must not leave the ordinary Generation tab changed
+            # to whatever happened to be the last clip in the project.
+            self.apply_settings(original)
+            self.save_last()
+
+    def _preview_timeline_result(self, output, job_id=None):
+        path = Path(str(output or ""))
+        if not path.is_file():
+            QMessageBox.warning(self, "Timeline preview", "The selected timeline output file is no longer on disk.")
+            return False
+        job = self._job_by_id(job_id) if job_id else None
+        self._load_preview(job or {"output": str(path)}, autoplay=True)
+        return True
+
+    def _open_timeline_output_folder(self, output):
+        path = Path(str(output or ""))
+        folder = path.parent if path.suffix else path
+        if not folder.is_dir():
+            QMessageBox.warning(self, "Timeline output", "The output folder is no longer on disk.")
+            return False
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+        return True
+
+    @staticmethod
+    def _timeline_safe_name(text):
+        value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip()).strip("_.")
+        return value or "minimax_timeline"
+
+    def _assemble_timeline_project(self, project):
+        """Join finished timeline clip outputs into one final MP4 without re-encoding."""
+        clips = list((project or {}).get("clips") or [])
+        if not clips:
+            QMessageBox.warning(self, "Timeline assembly", "The timeline has no clips to assemble.")
+            return False
+        if self._timeline_assembly_proc and self._timeline_assembly_proc.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.information(self, "Timeline assembly", "A timeline assembly is already running.")
+            return False
+
+        outputs = []
+        resolutions = set()
+        jobs_by_id = {str(j.get("id")): j for j in self.queue_jobs if j.get("id")}
+        for index, clip in enumerate(clips, 1):
+            output = Path(str(clip.get("output") or ""))
+            if str(clip.get("status") or "") != "finished" or clip.get("stale") or not output.is_file():
+                QMessageBox.warning(
+                    self,
+                    "Timeline assembly",
+                    f"Clip {index} is not a current finished result. Regenerate missing/stale clips before assembly.",
+                )
+                return False
+            outputs.append(output)
+            job = jobs_by_id.get(str(clip.get("queue_job_id") or ""))
+            if job and job.get("resolution"):
+                resolutions.add(str(job.get("resolution")))
+        if len(resolutions) > 1:
+            QMessageBox.warning(
+                self,
+                "Timeline assembly",
+                "The timeline contains clips with different output resolutions:\n\n"
+                + "\n".join(sorted(resolutions))
+                + "\n\nUse one resolution across the timeline before assembling.",
+            )
+            return False
+
+        if not ffmpeg_tools_ready():
+            self._ensure_ffmpeg_async()
+            QMessageBox.information(
+                self,
+                "Timeline assembly",
+                "FFmpeg is not ready yet. FrameVision has started preparing it; press Assemble Video again when setup finishes.",
+            )
+            return False
+
+        out_dir = outputs[0].parent
+        base = self._timeline_safe_name((project or {}).get("name") or "MiniMax Timeline") + "_final"
+        final_path = out_dir / f"{base}.mp4"
+        suffix = 2
+        while final_path.exists():
+            final_path = out_dir / f"{base}_{suffix}.mp4"
+            suffix += 1
+
+        work_dir = ROOT / "jobs" / "timeline_assembly"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        concat_path = work_dir / f"concat_{uuid.uuid4().hex}.txt"
+
+        def ffconcat_path(path):
+            return str(path.resolve()).replace("\\", "/").replace("'", "\\'")
+
+        concat_path.write_text(
+            "".join(f"file '{ffconcat_path(path)}'\n" for path in outputs),
+            encoding="utf-8",
+        )
+
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.setProgram(str(ffmpeg_tool_path("ffmpeg")))
+        proc.setArguments([
+            "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
+            "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+            "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+            str(final_path),
+        ])
+        self._timeline_assembly_proc = proc
+        self._timeline_assembly_output = ""
+        self._timeline_assembly_concat = concat_path
+        if getattr(self, "timeline_widget", None) is not None:
+            self.timeline_widget.mark_assembly_started(str(final_path))
+        self.status.setText("Timeline: assembling final video…")
+        self.append_log(f"\n=== TIMELINE ASSEMBLY ===\nClips: {len(outputs)}\nOutput: {final_path}\n")
+
+        def read_output():
+            text = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+            if text:
+                self._timeline_assembly_output = (self._timeline_assembly_output + text)[-16000:]
+                self.append_log(text)
+
+        def finished(code, _status):
+            read_output()
+            try:
+                if self._timeline_assembly_concat and Path(self._timeline_assembly_concat).is_file():
+                    Path(self._timeline_assembly_concat).unlink()
+            except Exception:
+                pass
+            self._timeline_assembly_concat = None
+            self._timeline_assembly_proc = None
+            ok = int(code) == 0 and final_path.is_file() and final_path.stat().st_size > 0
+            if ok:
+                if getattr(self, "timeline_widget", None) is not None:
+                    self.timeline_widget.mark_assembly_finished(str(final_path))
+                self.status.setText("Timeline assembly finished")
+                self.append_log(f"=== TIMELINE ASSEMBLY FINISHED ===\n{final_path}\n")
+            else:
+                try:
+                    if final_path.is_file():
+                        final_path.unlink()
+                except Exception:
+                    pass
+                lines = [x.strip() for x in self._timeline_assembly_output.replace("\r", "\n").splitlines() if x.strip()]
+                detail = lines[-1] if lines else f"FFmpeg exited with code {code}."
+                if getattr(self, "timeline_widget", None) is not None:
+                    self.timeline_widget.mark_assembly_failed(detail)
+                self.status.setText("Timeline assembly failed")
+                QMessageBox.critical(self, "Timeline assembly failed", detail)
+
+        proc.readyReadStandardOutput.connect(read_output)
+        proc.finished.connect(finished)
+        proc.start()
+        if not proc.waitForStarted(3000):
+            detail = proc.errorString() or "Could not start FFmpeg."
+            try:
+                if concat_path.is_file():
+                    concat_path.unlink()
+            except Exception:
+                pass
+            self._timeline_assembly_proc = None
+            self._timeline_assembly_concat = None
+            if getattr(self, "timeline_widget", None) is not None:
+                self.timeline_widget.mark_assembly_failed(detail)
+            QMessageBox.critical(self, "Timeline assembly failed", detail)
+            return False
+        return True
+
+    def _current_tab_order(self):
+        bar = self.tabs.tabBar()
+        order = []
+        for index in range(self.tabs.count()):
+            key = bar.tabData(index)
+            if key:
+                order.append(str(key))
+        return order
+
+    def _restore_tab_order(self, order):
+        if not isinstance(order, (list, tuple)):
+            return
+        requested = [str(key) for key in order if key]
+        if not requested:
+            return
+
+        bar = self.tabs.tabBar()
+        current_key = bar.tabData(self.tabs.currentIndex())
+
+        target = 0
+        for key in requested:
+            source = -1
+            for index in range(self.tabs.count()):
+                if str(bar.tabData(index) or "") == key:
+                    source = index
+                    break
+            if source < 0:
+                continue
+            if source != target:
+                bar.moveTab(source, target)
+            target += 1
+
+        # Keep whichever page was selected before restoration selected afterwards.
+        if current_key:
+            for index in range(self.tabs.count()):
+                if str(bar.tabData(index) or "") == str(current_key):
+                    self.tabs.setCurrentIndex(index)
+                    break
+
+        # Numeric tab indexes are not stable once users reorder the bar; refresh
+        # the two legacy cached indexes still used by the main GUI.
+        for index in range(self.tabs.count()):
+            key = str(bar.tabData(index) or "")
+            if key == "prompt_builder":
+                self.prompt_builder_tab_index = index
+            elif key == "music_clip_creator":
+                self.music_clip_tab_index = index
+            elif key == "timeline":
+                self.timeline_tab_index = index
+
+    def _sync_cached_tab_indexes(self, *args):
+        bar = self.tabs.tabBar()
+        for index in range(self.tabs.count()):
+            key = str(bar.tabData(index) or "")
+            if key == "prompt_builder":
+                self.prompt_builder_tab_index = index
+            elif key == "music_clip_creator":
+                self.music_clip_tab_index = index
+            elif key == "timeline":
+                self.timeline_tab_index = index
+        # A move can change the selected page's numeric index without changing
+        # its identity. Refresh index-based behavior immediately.
+        self._sync_main_generate_button(self.tabs.currentIndex())
+        self._sync_global_preview_for_tab(self.tabs.currentIndex())
 
     def _sync_main_generate_button(self, index=None):
         is_music = (
             getattr(self, "music_clip_widget", None) is not None
             and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
         )
+        is_timeline = getattr(self, "timeline_tab_index", -1) == self.tabs.currentIndex()
         if hasattr(self, "gen"):
-            self.gen.setText("Create video clip" if is_music else "Generate")
-            self.gen.setToolTip(
-                "Analyze the selected song, use Whisper lyric timing when enabled, build the H3 shot list, queue every missing clip, then queue final trim/assembly."
-                if is_music else "Add the current MiniMax generation job to the queue."
-            )
+            self.gen.setEnabled(True)
+            if is_music:
+                self.gen.setText("Create video clip")
+                self.gen.setToolTip(
+                    "Analyze the selected song, use Whisper lyric timing when enabled, build the H3 shot list, queue every missing clip, then queue final trim/assembly."
+                )
+            elif is_timeline:
+                self.gen.setText("Generate Timeline")
+                self.gen.setToolTip("Validate the visible timeline, queue every generation clip in order, and use existing Continue Last Result dependencies for continuation blocks.")
+            else:
+                self.gen.setText("Generate")
+                self.gen.setToolTip("Add the current MiniMax generation job to the queue.")
 
     def _main_generate_action(self):
+        if getattr(self, "timeline_tab_index", -1) == self.tabs.currentIndex():
+            if getattr(self, "timeline_widget", None) is not None:
+                self.timeline_widget.generate_timeline()
+            return
         if (
             getattr(self, "music_clip_widget", None) is not None
             and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
@@ -2968,7 +3394,8 @@ class MainWindow(QMainWindow):
         cv.addLayout(crow)
         v.addWidget(credits)
         v.addStretch(1)
-        self.tabs.addTab(self._scroll_page(body), "Settings")
+        index = self.tabs.addTab(self._scroll_page(body), "Settings")
+        self.tabs.tabBar().setTabData(index, "settings")
 
     def _adopt_global_preview_pane(self):
         """Move the one real preview/player into the application-wide splitter."""
@@ -3823,6 +4250,7 @@ class MainWindow(QMainWindow):
             self._font_size_pt = saved_font
             self._update_font_size_label(saved_font)
             self._apply_style()
+            self._restore_tab_order(d.get("tab_order", []))
             self.play_result_finished.setChecked(bool(d.get("play_result_finished", False)))
             self.play_result_queue_player.setChecked(True)
             self.play_result_queue_player.setVisible(False)
@@ -3958,7 +4386,10 @@ class MainWindow(QMainWindow):
         return found
 
     def save_last(self):
-        PRESET_DIR.mkdir(parents=True, exist_ok=True); (PRESET_DIR / "minimax_h3_gui_last.json").write_text(json.dumps(self.settings_dict(), indent=2), encoding="utf-8")
+        PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        data = self.settings_dict()
+        data["tab_order"] = self._current_tab_order()
+        (PRESET_DIR / "minimax_h3_gui_last.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
     def load_last(self):
         p = PRESET_DIR / "minimax_h3_gui_last.json"
         if p.is_file():
