@@ -4331,9 +4331,16 @@ class MainWindow(QMainWindow):
             self._set_frame_count(d.get("frames", 362))
             self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", ""))
             continue_last_setting = bool(d.get("continue_last_result", False))
+            # Set the dependency toggle BEFORE restoring a manual Continue-video path.
+            # If the GUI was previously left on "Continue last result", its change
+            # handler deliberately clears the manual path. Restoring the path first
+            # therefore made Timeline regenerate jobs lose their previous-clip source
+            # and fail FL2VA validation with "Visual input required". Establish the
+            # toggle state first, then restore the mutually exclusive manual source.
+            self.continue_last_result.setChecked(continue_last_setting)
             self.continue_video.edit.setText("" if continue_last_setting else d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
-            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(continue_last_setting); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self._sync_continue_video_options()
+            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.

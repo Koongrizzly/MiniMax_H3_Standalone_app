@@ -109,12 +109,33 @@ def _reference_entries(clip: dict) -> list[dict]:
     return entries[:5]
 
 
+def _subject_tokens_present(text: str) -> bool:
+    return bool(re.search(r"<\s*Subject\s+\d+\s*>", str(text or ""), flags=re.IGNORECASE))
+
+
+def _automatic_subject_usage_line(refs: list[dict]) -> str:
+    if not refs:
+        return ""
+    tokens = [f"<Subject {idx}>" for idx in range(1, len(refs) + 1)]
+    if len(tokens) == 1:
+        return f"Feature {tokens[0]} as the main visible subject in the video."
+    if len(tokens) == 2:
+        joined = f"{tokens[0]} and {tokens[1]}"
+    else:
+        joined = ", ".join(tokens[:-1]) + f", and {tokens[-1]}"
+    return f"Feature {joined} as visible subject references in the video."
+
+
 def _compiled_reference_prompt(clip: dict) -> str:
     """Return the H3 prompt with stable Subject->Picture definitions for Ref2VA.
 
     MiniMax receives reference images as <Picture N> in input order.  The user-facing
     timeline uses <Subject N> for reusable visible content, matching MiniMax's official
     full-reference prompt guide.
+
+    If the authored prompt body never mentions any <Subject N> token, automatically add
+    one helper usage line so Ref2VA references still participate instead of being defined
+    but never invoked.
     """
     body = _compiled_prompt(clip)
     if not bool(clip.get("use_reference_images", False)):
@@ -126,7 +147,9 @@ def _compiled_reference_prompt(clip: dict) -> str:
     for idx, ref in enumerate(refs, 1):
         friendly = str(ref.get("name") or f"Reference {idx}").strip() or f"Reference {idx}"
         defs.append(f'<Subject {idx}> is the reusable visible content named "{friendly}" from <Picture {idx}>.')
-    return "\n".join(defs + ([body] if body else [])).strip()
+    auto_use = "" if _subject_tokens_present(body) else _automatic_subject_usage_line(refs)
+    parts = defs + ([auto_use] if auto_use else []) + ([body] if body else [])
+    return "\n".join(parts).strip()
 
 
 class TimelineCanvas(QWidget):
@@ -237,10 +260,10 @@ class TimelineCanvas(QWidget):
                 try:
                     self._thumb_cache_dir.mkdir(parents=True, exist_ok=True)
                     key = hashlib.sha1(str(path).encode("utf-8", errors="ignore")).hexdigest()[:16]
-                    thumb = self._thumb_cache_dir / f"{path.stem}_{stamp}_{key}.jpg"
+                    thumb = self._thumb_cache_dir / f"{path.stem}_{stamp}_{key}.png"
                     if not thumb.is_file():
                         subprocess.run(
-                            [ffmpeg, "-y", "-ss", "0.5", "-i", str(path), "-frames:v", "1", "-vf", "scale=320:-2", str(thumb)],
+                            [ffmpeg, "-y", "-i", str(path), "-ss", "0.5", "-frames:v", "1", "-vf", "scale=320:-2:flags=lanczos,format=rgb24", str(thumb)],
                             capture_output=True,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         )
@@ -356,7 +379,8 @@ class TimelineCanvas(QWidget):
                 painter.fillRect(thumb_rect, QColor("#223548"))
                 draw_x = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
                 draw_y = thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2
-                painter.drawPixmap(draw_x, draw_y, scaled)
+                draw_rect = QRect(draw_x, draw_y, scaled.width(), scaled.height())
+                painter.drawPixmap(draw_rect, scaled, scaled.rect())
                 painter.setPen(QPen(QColor("#8ea7bf"), 1))
                 painter.drawRect(thumb_rect)
                 text_left = thumb_rect.right() + 8
@@ -838,6 +862,11 @@ class TimelineTab(QWidget):
         self.use_refs_warning = QLabel("Using reference image(s) disables the selection to continue from a previous clip.")
         self.use_refs_warning.setWordWrap(True)
         self.use_refs_warning.setVisible(False)
+        self.use_refs_guide = QLabel(
+            "Tip: the Insert buttons add a ready-to-use subject snippet. If your prompt body never mentions any <Subject N>, Timeline now automatically adds one helper sentence so the loaded reference image(s) are actually invoked."
+        )
+        self.use_refs_guide.setWordWrap(True)
+        self.use_refs_guide.setVisible(False)
         self.add_refs_btn = QPushButton("+ Add reference images")
         self.add_refs_btn.setToolTip("Add up to 5 reference images for this timeline clip.")
         self.refs_rows_widget = QWidget()
@@ -846,6 +875,7 @@ class TimelineTab(QWidget):
         self.refs_rows_layout.setSpacing(6)
         rv.addWidget(self.use_refs_check)
         rv.addWidget(self.use_refs_warning)
+        rv.addWidget(self.use_refs_guide)
         rv.addWidget(self.add_refs_btn)
         rv.addWidget(self.refs_rows_widget)
         iv.addWidget(self.references_box)
@@ -969,6 +999,8 @@ class TimelineTab(QWidget):
                 self.prompt_box.setEnabled(False)
                 self.references_box.setEnabled(False)
                 self._clear_reference_rows()
+                self.use_refs_warning.setVisible(False)
+                self.use_refs_guide.setVisible(False)
                 self.settings_box.setEnabled(False)
                 self.preview_clip_btn.setEnabled(False); self.open_clip_btn.setEnabled(False)
                 self._refresh_edit_workflow(None)
@@ -990,7 +1022,9 @@ class TimelineTab(QWidget):
             self.use_refs_check.blockSignals(True)
             self.use_refs_check.setChecked(bool(clip.get("use_reference_images", False)))
             self.use_refs_check.blockSignals(False)
-            self.use_refs_warning.setVisible(bool(clip.get("use_reference_images", False)))
+            refs_enabled = bool(clip.get("use_reference_images", False))
+            self.use_refs_warning.setVisible(refs_enabled)
+            self.use_refs_guide.setVisible(refs_enabled)
             self._refresh_reference_rows(clip)
             # A loaded start video is already the first timeline result; it needs no H3 prompt or generation settings.
             for w in (self.frames_combo, self.seed_spin, self.steps_spin, self.scheduler_combo, self.glue_check,
@@ -1339,7 +1373,7 @@ class TimelineTab(QWidget):
             name_edit.editingFinished.connect(lambda i=idx-1, w=name_edit: self._reference_name_changed(i, w.text()))
 
             insert_btn = QPushButton(f"Insert <Subject {idx}>")
-            insert_btn.setToolTip(f"Insert <Subject {idx}> at the prompt cursor.")
+            insert_btn.setToolTip(f"Insert a ready-to-use Ref2VA prompt snippet for <Subject {idx}> at the prompt cursor.")
             insert_btn.clicked.connect(lambda _=False, n=idx: self._insert_reference_token(n))
             remove_btn = QPushButton("Remove")
             remove_btn.clicked.connect(lambda _=False, i=idx-1: self._remove_reference_image(i))
@@ -1365,6 +1399,7 @@ class TimelineTab(QWidget):
         enabled = bool(enabled)
         clip["use_reference_images"] = enabled
         self.use_refs_warning.setVisible(enabled)
+        self.use_refs_guide.setVisible(enabled)
         if enabled and str(clip.get("generation_mode") or "new") == "continue":
             clip["generation_mode"] = "new"
             clip["edit_mode"] = "standalone"
@@ -1460,8 +1495,19 @@ class TimelineTab(QWidget):
     def _insert_reference_token(self, number: int):
         if not self.cut_prompt.isEnabled():
             return
+        clip = self._selected_clip() or {}
+        refs = _reference_entries(clip)
+        friendly = ""
+        if 1 <= int(number) <= len(refs):
+            friendly = str(refs[int(number) - 1].get("name") or "").strip()
+        snippet = f"Feature <Subject {int(number)}> prominently in the scene."
+        if friendly:
+            snippet = f"Feature <Subject {int(number)}> prominently in the scene as {friendly}."
         cursor = self.cut_prompt.textCursor()
-        cursor.insertText(f"<Subject {int(number)}>" )
+        current_text = self.cut_prompt.toPlainText()
+        if cursor.position() > 0 and current_text and not current_text.endswith((" ", "\n")):
+            cursor.insertText(" ")
+        cursor.insertText(snippet + " ")
         self.cut_prompt.setTextCursor(cursor)
         self.cut_prompt.setFocus()
 
