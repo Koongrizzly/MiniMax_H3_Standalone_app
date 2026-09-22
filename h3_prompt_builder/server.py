@@ -32,7 +32,7 @@ PID_FILE = RUNTIME_DIR / "hailuo-h3-server.pid"
 PRESETS_DIR = APP_ROOT.parent / "presets" / "setsave"
 LLM_PREFS_FILE = PRESETS_DIR / "minimax_h3_prompt_builder_llm.json"
 DEFAULT_PORT = 8785
-APP_VERSION = "2.9.1-beta.2"
+APP_VERSION = "2.9.1-beta.3"
 LLAMA_BUNDLE_DIR = APP_ROOT.parent / "presets" / "bin" / "llama"
 LLAMA_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=50"
