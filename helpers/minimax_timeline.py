@@ -658,15 +658,20 @@ class TimelineTab(QWidget):
             self.edit_mode_group.addButton(button)
             button.setProperty("edit_mode", mode)
             ev.addWidget(button)
-        ev.addStretch(1)
+        # Do not add a stretch here.  The scroll contents must retain the full
+        # height of every edit option; otherwise QScrollArea can compress the
+        # contents to the viewport height and the lower radio buttons become
+        # hidden behind the sticky Regenerate button with nothing to scroll to.
+        edit_scroll_contents.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        edit_scroll_contents.setMinimumHeight(edit_scroll_contents.sizeHint().height())
 
         self.edit_scroll = QScrollArea()
         self.edit_scroll.setWidgetResizable(True)
         self.edit_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.edit_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.edit_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        # Roughly three to four text/control rows are visible at once; remaining
-        # edit choices are reached with the vertical scrollbar.
+        # Roughly three to four rows stay visible.  The complete option list is
+        # taller than this viewport, so the lower choices are always reachable.
         self.edit_scroll.setFixedHeight(118)
         self.edit_scroll.setWidget(edit_scroll_contents)
         edit_outer.addWidget(self.edit_scroll, 1)
