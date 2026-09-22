@@ -2850,6 +2850,13 @@ class MainWindow(QMainWindow):
                             return False
                         settings["continue_last_result"] = False
                         settings["continue_video"] = prev_output
+                        # Edit-mode continuations are expected to visibly carry the
+                        # previous clip forward. If the clip's stored settings do not
+                        # already request an additional continuity helper, enable
+                        # latent continuation automatically so this replacement does
+                        # more than a weak free-standing FL2VA restart.
+                        if edit_mode in {"bridge_both", "continue_previous"} and not bool(settings.get("latent_continuation", False)) and not bool(settings.get("continue_audio_memory", False)):
+                            settings["latent_continuation"] = True
                     else:
                         # Full timeline generation normally uses the existing queue
                         # dependency chain. If Clip 1 is a user-loaded start video,
