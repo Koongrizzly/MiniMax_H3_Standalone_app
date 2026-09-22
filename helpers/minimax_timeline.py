@@ -86,7 +86,7 @@ def _compiled_prompt(clip: dict) -> str:
 
 
 class TimelineCanvas(QWidget):
-    """Compact NLE-like overview of H3 generation jobs and their internal prompt segments."""
+    """Compact NLE-like overview of MiniMax H3 generation jobs."""
 
     clipSelected = Signal(str)
     clipsReordered = Signal(int, int)
@@ -222,26 +222,19 @@ class TimelineCanvas(QWidget):
             painter.setPen(muted if not selected else accent_text)
             painter.drawText(int(left + 8), self.CLIP_TOP + 38, fm.elidedText(info, Qt.TextElideMode.ElideRight, name_width))
 
-            # Internal Segments use the same proportional-weight model as Director.
-            segments = clip.get("segments") or []
-            total_weight = sum(max(0.0001, float(s.get("weight") or 1.0)) for s in segments) or 1.0
-            seg_left = left + 5
-            usable = max(4.0, width - 14)
-            seg_y = self.CLIP_TOP + 53
-            seg_h = 42
-            for seg_idx, seg in enumerate(segments):
-                seg_w = usable * max(0.0001, float(seg.get("weight") or 1.0)) / total_weight
-                color = cut_palette[seg_idx % len(cut_palette)]
-                painter.setBrush(QBrush(color))
-                painter.setPen(QPen(bg, 1))
-                painter.drawRect(int(seg_left), seg_y, max(1, int(seg_w)), seg_h)
-                if seg_w > 34:
-                    painter.setPen(QColor("#f4f6f8"))
-                    cut_label = f"Segment {seg_idx + 1}"
-                    painter.drawText(int(seg_left + 4), seg_y + 16, fm.elidedText(cut_label, Qt.TextElideMode.ElideRight, int(seg_w - 8)))
-                    prompt = str(seg.get("prompt") or "").replace("\n", " ").strip() or "Empty"
-                    painter.drawText(int(seg_left + 4), seg_y + 34, fm.elidedText(prompt, Qt.TextElideMode.ElideRight, int(seg_w - 8)))
-                seg_left += seg_w
+            # Show a compact prompt preview. A timeline block is one complete H3 job;
+            # shot/timestamp structure stays inside the normal H3 prompt itself.
+            prompt_y = self.CLIP_TOP + 53
+            prompt_h = 42
+            painter.setBrush(QBrush(QColor("#375a7f")))
+            painter.setPen(QPen(bg, 1))
+            painter.drawRect(int(left + 5), prompt_y, max(1, int(width - 14)), prompt_h)
+            prompt = _compiled_prompt(clip).replace("\n", " ").strip() or "Empty prompt"
+            painter.setPen(QColor("#f4f6f8"))
+            painter.drawText(
+                int(left + 10), prompt_y + 26,
+                fm.elidedText(prompt, Qt.TextElideMode.ElideRight, int(max(12, width - 24)))
+            )
 
             if clip.get("generation_mode") == "continue" and idx > 0:
                 painter.setPen(QPen(accent, 2))
@@ -532,15 +525,11 @@ class TimelineTab(QWidget):
         self.auto_assemble_check.setToolTip(
             "After Generate Timeline, automatically assemble the final MP4 when every timeline clip has finished."
         )
-        self.run_hint = QLabel(
-            "Each timeline block = one H3 generation. Select a middle clip to regenerate it; optional next-frame anchoring can preserve the clips after it."
-        )
-        self.run_hint.setWordWrap(True)
         runbar.addWidget(self.generate_timeline_btn)
         runbar.addWidget(self.generate_selected_btn)
         runbar.addWidget(self.assemble_timeline_btn)
         runbar.addWidget(self.auto_assemble_check)
-        runbar.addWidget(self.run_hint, 1)
+        runbar.addStretch(1)
         root.addLayout(runbar)
 
         self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -553,8 +542,7 @@ class TimelineTab(QWidget):
         tl.setSpacing(6)
 
         self.chain_help = QLabel(
-            "Each large block is one actual H3 generation. Prompt segments inside a block only change the prompt during that generation; they do not create extra clips.  "
-            "↪ Continue blocks use FrameVision's existing Continue Last Result workflow.  Drag blocks to reorder; drag a block's right edge to change duration."
+            "Each block is a new generation, You can drag blocks to reorder them or drag the right side of a block to make duration shorter/longer."
         )
         self.chain_help.setWordWrap(True)
         tl.addWidget(self.chain_help)
@@ -633,40 +621,15 @@ class TimelineTab(QWidget):
         cf.addRow("", clip_result_actions)
         iv.addWidget(clip_box)
 
-        cut_box = QGroupBox("Prompt / timed segments")
-        cv = QVBoxLayout(cut_box)
-        cut_actions = QHBoxLayout()
-        self.add_cut_btn = QPushButton("+ Segment")
-        self.del_cut_btn = QPushButton("Delete Segment")
-        self.cut_up_btn = QPushButton("▲")
-        self.cut_down_btn = QPushButton("▼")
-        cut_actions.addWidget(self.add_cut_btn); cut_actions.addWidget(self.del_cut_btn)
-        cut_actions.addWidget(self.cut_up_btn); cut_actions.addWidget(self.cut_down_btn); cut_actions.addStretch(1)
-        cv.addLayout(cut_actions)
-        cv.addWidget(QLabel("Prompt for selected segment"))
+        prompt_box = QGroupBox("Prompt")
+        pv = QVBoxLayout(prompt_box)
         self.cut_prompt = QPlainTextEdit()
-        self.cut_prompt.setPlaceholderText("What happens during this part of the clip — action, dialogue, camera move...")
-        self.cut_prompt.setMinimumHeight(180)
-        cv.addWidget(self.cut_prompt)
-        self.cut_list = QListWidget()
-        self.cut_list.setMinimumHeight(100)
-        cv.addWidget(self.cut_list)
-        duration_row = QHBoxLayout()
-        duration_row.addWidget(QLabel("Selected segment duration"))
-        self.cut_duration = QDoubleSpinBox()
-        self.cut_duration.setDecimals(2)
-        self.cut_duration.setSingleStep(0.25)
-        self.cut_duration.setMinimum(MIN_CUT_SECONDS)
-        self.cut_duration.setSuffix(" s")
-        duration_row.addWidget(self.cut_duration, 1)
-        cv.addLayout(duration_row)
-        self.compiled_preview = QPlainTextEdit()
-        self.compiled_preview.setReadOnly(True)
-        self.compiled_preview.setMaximumHeight(120)
-        self.compiled_preview.setPlaceholderText("Compiled H3 prompt")
-        cv.addWidget(QLabel("Prompt sent to H3"))
-        cv.addWidget(self.compiled_preview)
-        iv.addWidget(cut_box)
+        self.cut_prompt.setPlaceholderText(
+            "Prompt for this H3 generation. You can use the normal Prompt Builder output here, including multiple shots or timestamps."
+        )
+        self.cut_prompt.setMinimumHeight(240)
+        pv.addWidget(self.cut_prompt)
+        iv.addWidget(prompt_box)
 
         settings_box = QGroupBox("MiniMax settings")
         sf = QFormLayout(settings_box)
@@ -684,6 +647,7 @@ class TimelineTab(QWidget):
         self.model_label = QLabel("—"); self.model_label.setWordWrap(True)
         self.refs_label = QLabel("—"); self.refs_label.setWordWrap(True)
         self.loras_label = QLabel("—"); self.loras_label.setWordWrap(True)
+        sf.addRow("", self.capture_btn)
         sf.addRow("Seed", self.seed_spin)
         sf.addRow("Steps", self.steps_spin)
         sf.addRow("Scheduler", self.scheduler_combo)
@@ -694,7 +658,6 @@ class TimelineTab(QWidget):
         sf.addRow("Model", self.model_label)
         sf.addRow("References", self.refs_label)
         sf.addRow("LoRAs", self.loras_label)
-        sf.addRow("", self.capture_btn)
         iv.addWidget(settings_box)
         iv.addStretch(1)
 
@@ -738,12 +701,6 @@ class TimelineTab(QWidget):
         self.latent_check.toggled.connect(self._settings_changed)
         self.match_next_check.toggled.connect(self._match_next_changed)
         self.capture_btn.clicked.connect(self.capture_current_settings)
-        self.add_cut_btn.clicked.connect(self.add_cut)
-        self.del_cut_btn.clicked.connect(self.delete_cut)
-        self.cut_up_btn.clicked.connect(lambda: self.move_cut(-1))
-        self.cut_down_btn.clicked.connect(lambda: self.move_cut(1))
-        self.cut_list.currentRowChanged.connect(self._cut_selected)
-        self.cut_duration.valueChanged.connect(self._cut_duration_changed)
         self.cut_prompt.textChanged.connect(self._cut_prompt_changed)
 
     # -------------------------------------------------------------- refreshers
@@ -788,14 +745,13 @@ class TimelineTab(QWidget):
             enabled = clip is not None
             for w in (self.clip_name, self.gen_mode, self.frames_combo, self.seed_spin, self.steps_spin,
                       self.scheduler_combo, self.glue_check, self.audio_memory_check, self.latent_check, self.match_next_check,
-                      self.capture_btn, self.add_cut_btn, self.del_cut_btn, self.cut_up_btn, self.cut_down_btn,
-                      self.cut_list, self.cut_duration, self.cut_prompt):
+                      self.capture_btn, self.cut_prompt):
                 w.setEnabled(enabled)
             if clip is None:
                 self.state_label.setText("No clip selected")
                 self.clip_output_label.setText("—")
                 self.preview_clip_btn.setEnabled(False); self.open_clip_btn.setEnabled(False)
-                self.cut_list.clear(); self.cut_prompt.clear(); self.compiled_preview.clear()
+                self.cut_prompt.clear()
                 return
             settings = clip.setdefault("settings", {})
             self.clip_name.setText(str(clip.get("name") or ""))
@@ -831,8 +787,7 @@ class TimelineTab(QWidget):
             self.preview_clip_btn.setEnabled(output_exists and str(clip.get("status") or "") == "finished")
             self.open_clip_btn.setEnabled(output_exists)
             self._refresh_settings_summary(clip)
-            self._refresh_cut_list()
-            self.compiled_preview.setPlainText(_compiled_prompt(clip))
+            self._load_prompt_editor()
         finally:
             self._loading_inspector = False
 
@@ -851,42 +806,29 @@ class TimelineTab(QWidget):
         else:
             self.loras_label.setText("None")
 
-    def _refresh_cut_list(self):
+    def _load_prompt_editor(self):
         clip = self._selected_clip()
-        self.cut_list.blockSignals(True)
-        self.cut_list.clear()
-        if not clip:
-            self.cut_list.blockSignals(False)
-            return
-        durations = _segment_seconds(clip)
-        for i, (seg, seconds) in enumerate(zip(clip.get("segments") or [], durations)):
-            prompt = str(seg.get("prompt") or "").replace("\n", " ").strip() or "Empty segment"
-            text = f"Segment {i + 1}  •  {seconds:.2f}s  •  {prompt}"
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, seg.get("id"))
-            self.cut_list.addItem(item)
-        self.selected_cut_index = max(0, min(self.selected_cut_index, max(0, self.cut_list.count() - 1)))
-        if self.cut_list.count(): self.cut_list.setCurrentRow(self.selected_cut_index)
-        self.cut_list.blockSignals(False)
-        self._load_cut_editor()
-
-    def _load_cut_editor(self):
-        clip = self._selected_clip()
-        if not clip or not clip.get("segments"):
-            self.cut_duration.setEnabled(False); self.cut_prompt.setEnabled(False)
-            return
-        idx = max(0, min(self.selected_cut_index, len(clip["segments"]) - 1))
-        self.selected_cut_index = idx
-        seg = clip["segments"][idx]
-        durations = _segment_seconds(clip)
-        self.cut_duration.blockSignals(True)
-        self.cut_duration.setMaximum(max(MIN_CUT_SECONDS, _clip_seconds(clip)))
-        self.cut_duration.setValue(durations[idx])
-        self.cut_duration.setEnabled(len(clip["segments"]) > 1)
-        self.cut_duration.blockSignals(False)
         self.cut_prompt.blockSignals(True)
-        self.cut_prompt.setPlainText(str(seg.get("prompt") or ""))
-        self.cut_prompt.blockSignals(False)
+        try:
+            if not clip:
+                self.cut_prompt.clear()
+                self.cut_prompt.setEnabled(False)
+                return
+            # Timeline v2 presents one normal H3 prompt per generation. Legacy
+            # multi-segment projects are flattened into their timestamped compiled
+            # prompt once, so no authored content is lost.
+            segments = clip.get("segments") or []
+            if len(segments) > 1:
+                merged = _compiled_prompt(clip)
+                clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": merged, "weight": 1.0}]
+                segments = clip["segments"]
+            if not segments:
+                clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
+                segments = clip["segments"]
+            self.cut_prompt.setEnabled(True)
+            self.cut_prompt.setPlainText(str(segments[0].get("prompt") or ""))
+        finally:
+            self.cut_prompt.blockSignals(False)
 
     # ------------------------------------------------------------- project I/O
     def _write_project_json(self, path: Path):
@@ -973,6 +915,9 @@ class TimelineTab(QWidget):
                     clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
                 for seg in clip["segments"]:
                     seg.setdefault("id", uuid.uuid4().hex); seg.setdefault("prompt", ""); seg.setdefault("weight", 1.0)
+                if len(clip["segments"]) > 1:
+                    merged_prompt = _compiled_prompt(clip)
+                    clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": merged_prompt, "weight": 1.0}]
             self._project_path = Path(name)
             self.project_file_label.setText(str(self._project_path))
             self.selected_clip_id = self._clips()[0]["id"] if self._clips() else None
@@ -989,8 +934,7 @@ class TimelineTab(QWidget):
         base_settings = clips[idx].get("settings") if idx >= 0 else None
         clip = self._blank_clip(continue_previous=bool(clips), source_settings=base_settings)
         clip["name"] = f"Clip {insert_at + 1}"
-        # A newly continued clip starts with an empty CUT so content is explicit,
-        # mirroring Director's blank-new-chunk policy instead of silently copying stale action.
+        # A newly continued clip starts with an empty prompt instead of silently copying stale action.
         if clip["generation_mode"] == "continue":
             clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
         clips.insert(insert_at, clip)
@@ -1137,99 +1081,55 @@ class TimelineTab(QWidget):
 
     def capture_current_settings(self):
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip: return
-        old_segments = clip.get("segments") or []
-        settings = self._capture_settings()
-        clip["settings"] = settings
-        frames = int(settings.get("frames") or clip.get("frames") or 243)
-        if self.frame_values: frames = min(self.frame_values, key=lambda v: abs(v - frames))
-        clip["frames"] = frames
-        # Only replace prompt when this is still a single-segment clip. Multi-segment
-        # planning is deliberate and must not be flattened by a settings capture.
-        if len(old_segments) == 1:
-            old_segments[0]["prompt"] = str(settings.get("prompt") or old_segments[0].get("prompt") or "")
-        self._touch_clip(idx)
-        self._refresh_all()
-
-    # --------------------------------------------------------------- CUT model
-    def _cut_selected(self, row):
-        if row < 0: return
-        self.selected_cut_index = row
-        self._load_cut_editor()
-
-    def add_cut(self):
-        clip = self._selected_clip(); idx = self._selected_index()
-        if not clip: return
-        segs = clip.setdefault("segments", [])
-        insert_at = min(len(segs), self.selected_cut_index + 1)
-        segs.insert(insert_at, {"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0})
-        self.selected_cut_index = insert_at
-        self._touch_clip(idx)
-        self._refresh_all()
-
-    def delete_cut(self):
-        clip = self._selected_clip(); idx = self._selected_index()
-        if not clip or len(clip.get("segments") or []) <= 1:
-            QMessageBox.information(self, "Segments", "A generation clip must keep at least one prompt segment.")
+        if not clip:
             return
-        clip["segments"].pop(self.selected_cut_index)
-        self.selected_cut_index = max(0, self.selected_cut_index - 1)
+
+        # Capture technical Generation-tab settings only. The timeline prompt is
+        # authored independently and must never be replaced by whatever prompt
+        # happens to be present on the Generation tab.
+        current_prompt = _compiled_prompt(clip)
+        current_segments = copy.deepcopy(clip.get("segments") or [])
+        settings = self._capture_settings()
+        settings.pop("prompt", None)
+        clip["settings"] = settings
+
+        frames = int(settings.get("frames") or clip.get("frames") or 243)
+        if self.frame_values:
+            frames = min(self.frame_values, key=lambda v: abs(v - frames))
+        clip["frames"] = frames
+
+        # Preserve the timeline prompt verbatim. Keep the existing segment id so
+        # saved project state remains stable even though the UI exposes one prompt.
+        if current_segments:
+            clip["segments"] = current_segments
+        else:
+            clip["segments"] = [{
+                "id": uuid.uuid4().hex,
+                "prompt": current_prompt,
+                "weight": 1.0,
+            }]
+
         self._touch_clip(idx)
         self._refresh_all()
 
-    def move_cut(self, delta):
-        clip = self._selected_clip(); idx = self._selected_index()
-        if not clip: return
-        segs = clip.get("segments") or []
-        old = self.selected_cut_index; new = old + int(delta)
-        if not (0 <= new < len(segs)): return
-        seg = segs.pop(old); segs.insert(new, seg)
-        self.selected_cut_index = new
-        self._touch_clip(idx)
-        self._refresh_all()
-
+    # -------------------------------------------------------------- prompt edit
     def _cut_prompt_changed(self):
-        if self._loading_inspector: return
+        if self._loading_inspector:
+            return
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip or not clip.get("segments"): return
-        if not (0 <= self.selected_cut_index < len(clip["segments"])): return
-        clip["segments"][self.selected_cut_index]["prompt"] = self.cut_prompt.toPlainText()
+        if not clip:
+            return
+        segments = clip.setdefault("segments", [])
+        if not segments:
+            segments.append({"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0})
+        if len(segments) > 1:
+            merged = _compiled_prompt(clip)
+            clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": merged, "weight": 1.0}]
+            segments = clip["segments"]
+        segments[0]["prompt"] = self.cut_prompt.toPlainText()
+        segments[0]["weight"] = 1.0
         self._touch_clip(idx)
-        durations = _segment_seconds(clip)
-        item = self.cut_list.item(self.selected_cut_index)
-        if item is not None and self.selected_cut_index < len(durations):
-            prompt = self.cut_prompt.toPlainText().replace("\n", " ").strip() or "Empty segment"
-            item.setText(f"Segment {self.selected_cut_index + 1}  •  {durations[self.selected_cut_index]:.2f}s  •  {prompt}")
-        self.compiled_preview.setPlainText(_compiled_prompt(clip))
         self.canvas.update()
-
-    def _cut_duration_changed(self, wanted_seconds):
-        if self._loading_inspector: return
-        clip = self._selected_clip(); clip_idx = self._selected_index()
-        if not clip: return
-        segs = clip.get("segments") or []
-        i = self.selected_cut_index
-        if len(segs) <= 1 or not (0 <= i < len(segs)): return
-        chunk_duration = _clip_seconds(clip)
-        live_total_weight = sum(max(0.0001, float(s.get("weight") or 1.0)) for s in segs)
-        min_weight = (MIN_CUT_SECONDS / chunk_duration) * live_total_weight
-        others = [s for j, s in enumerate(segs) if j != i]
-        others_total_weight = sum(max(0.0001, float(s.get("weight") or 1.0)) for s in others)
-        max_seg_weight = live_total_weight - len(others) * min_weight
-        max_seconds = max(MIN_CUT_SECONDS, (max_seg_weight / live_total_weight) * chunk_duration)
-        wanted = max(MIN_CUT_SECONDS, min(max_seconds, float(wanted_seconds)))
-        seg = segs[i]
-        current = max(0.0001, float(seg.get("weight") or 1.0))
-        wanted_weight = (wanted / chunk_duration) * live_total_weight
-        delta = wanted_weight - current
-        if others_total_weight > 0:
-            for other in others:
-                ow = max(0.0001, float(other.get("weight") or 1.0))
-                share = ow / others_total_weight
-                other["weight"] = max(min_weight, ow - delta * share)
-        seg["weight"] = wanted_weight
-        self._touch_clip(clip_idx)
-        self._refresh_all()
 
     # --------------------------------------------------------------- results
     def _assembly_ready(self):
