@@ -658,30 +658,39 @@ class TimelineTab(QWidget):
             self.edit_mode_group.addButton(button)
             button.setProperty("edit_mode", mode)
             ev.addWidget(button)
-        # Do not add a stretch here.  The scroll contents must retain the full
-        # height of every edit option; otherwise QScrollArea can compress the
-        # contents to the viewport height and the lower radio buttons become
-        # hidden behind the sticky Regenerate button with nothing to scroll to.
+        # Keep a real scroll tail below the final radio button.  Qt can otherwise
+        # report a content size that stops at the last control's top edge while
+        # the sticky footer sits immediately below the viewport, making the final
+        # option impossible to scroll fully above the Regenerate button.
+        ev.addSpacing(28)
         edit_scroll_contents.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
-        edit_scroll_contents.setMinimumHeight(edit_scroll_contents.sizeHint().height())
+        # Four radio rows + the selected-clip label need more vertical content than
+        # the intentionally compact viewport.  Use an explicit floor so the scroll
+        # range always reaches past the final option on all font/DPI scales.
+        edit_scroll_contents.setMinimumHeight(max(220, edit_scroll_contents.sizeHint().height() + 28))
 
         self.edit_scroll = QScrollArea()
         self.edit_scroll.setWidgetResizable(True)
         self.edit_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.edit_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.edit_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        # Roughly three to four rows stay visible.  The complete option list is
-        # taller than this viewport, so the lower choices are always reachable.
-        self.edit_scroll.setFixedHeight(118)
+        # Keep this deliberately short: the group title + roughly two/three
+        # option rows are visible at once.  Everything else belongs to the
+        # inner vertical scrollbar, while the Regenerate button lives in a
+        # separate footer and can never cover the scroll contents.
+        self.edit_scroll.setFixedHeight(82)
         self.edit_scroll.setWidget(edit_scroll_contents)
-        edit_outer.addWidget(self.edit_scroll, 1)
+        edit_outer.addWidget(self.edit_scroll, 0)
 
         self.generate_selected_btn = QPushButton("Regenerate selected block")
-        self.generate_selected_btn.setMinimumHeight(36)
+        self.generate_selected_btn.setFixedHeight(36)
         self.generate_selected_btn.setToolTip("Regenerate only the selected block using the replacement continuity mode selected above.")
         edit_outer.addWidget(self.generate_selected_btn, 0)
 
-        edit_box.setMaximumHeight(190)
+        # Fixed overall height prevents this panel from expanding and forcing
+        # the main timeline itself to scroll vertically.  The option list owns
+        # its own scrollbar instead.
+        edit_box.setFixedHeight(154)
         tl.addWidget(edit_box, 0)
 
         inspector_scroll = QScrollArea(self.workspace_splitter)
