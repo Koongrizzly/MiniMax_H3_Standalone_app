@@ -2761,6 +2761,14 @@ class MainWindow(QMainWindow):
                 settings["steps"] = int((spec.get("settings") or {}).get("steps", settings.get("steps", 15)))
                 settings["scheduler"] = str((spec.get("settings") or {}).get("scheduler", settings.get("scheduler", "beta")))
 
+                # Timeline clips must never inherit the standalone Generation-tab
+                # "Glue results" flag.  The timeline owns final assembly itself;
+                # carrying Glue into a timeline job makes generate() demand a manual
+                # Continue-video/Continue-last source before the timeline bridge has
+                # established its dependency chain.  Force it off for every timeline
+                # job, including HQ restart and projects saved with an older setting.
+                settings["glue_results"] = False
+
                 # HQ restart is deliberately a narrow override: keep the complete
                 # per-clip Timeline/Generation settings snapshot and replace only
                 # the output resolution/orientation selected by the HQ popup.
