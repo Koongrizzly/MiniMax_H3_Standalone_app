@@ -2742,6 +2742,16 @@ class MainWindow(QMainWindow):
             for pos, spec in enumerate(specs):
                 clip_id = str(spec.get("id") or "")
                 clip_name = str(spec.get("name") or f"Clip {pos + 1}")
+                generation_mode = str(spec.get("generation_mode") or "new")
+                if generation_mode == "source":
+                    # A loaded Clip 1 is an existing source video, not an H3 job.
+                    # Keep it on the timeline and let the next Continue block use
+                    # its exact file as the continuation source.
+                    source_video = str(spec.get("start_source_video") or spec.get("output") or "")
+                    if not source_video or not Path(source_video).is_file():
+                        QMessageBox.warning(self, "Timeline", f"{clip_name} is a loaded start clip, but its video file is missing.")
+                        return False
+                    continue
                 settings = copy.deepcopy(spec.get("settings") or original)
                 frames = int(spec.get("frames") or settings.get("frames") or 243)
                 settings["frames"] = frames
@@ -2751,8 +2761,55 @@ class MainWindow(QMainWindow):
                 settings["steps"] = int((spec.get("settings") or {}).get("steps", settings.get("steps", 15)))
                 settings["scheduler"] = str((spec.get("settings") or {}).get("scheduler", settings.get("scheduler", "beta")))
 
+                # Timeline reference images are per-clip Ref2VA inputs.  They are
+                # deliberately separate from the Generation tab's global refs.
+                timeline_refs = [
+                    str(item.get("path") or "")
+                    for item in (spec.get("timeline_reference_images") or spec.get("reference_images") or [])
+                    if isinstance(item, dict) and str(item.get("path") or "").strip()
+                ]
+                use_timeline_refs = bool(spec.get("use_reference_images", False))
+                if use_timeline_refs:
+                    if not timeline_refs:
+                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} has reference mode enabled but no reference images.")
+                        return False
+                    if len(timeline_refs) > 5:
+                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} has more than 5 reference images.")
+                        return False
+                    missing_ref = next((x for x in timeline_refs if not Path(x).is_file()), "")
+                    if missing_ref:
+                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} cannot find reference image:\n{missing_ref}")
+                        return False
+                    if str(spec.get("generation_mode") or "new") == "continue":
+                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} uses reference images and cannot continue from the previous block.")
+                        return False
+                    settings["mode"] = 2  # Ref2VA; hybrid routing is handled by the existing generator when enabled.
+                    settings["ref_images"] = timeline_refs
+                    settings["ref_videos"] = []
+                    settings["ref_audios"] = []
+                    settings["first"] = ""
+                    settings["last"] = ""
+                    settings["continue_video"] = ""
+                    settings["continue_last_result"] = False
+                    settings["continue_audio_memory"] = False
+                    settings["latent_continuation"] = False
+                    settings["glue_results"] = False
+                else:
+                    settings["ref_images"] = []
+                    settings["ref_videos"] = []
+                    settings["ref_audios"] = []
+
                 is_continue = str(spec.get("generation_mode") or "new") == "continue"
                 single_regen = bool(spec.get("timeline_single_regeneration", False))
+                edit_mode = str(spec.get("edit_mode") or "") if single_regen else ""
+                if single_regen and edit_mode in {"anchor_next", "standalone"}:
+                    # These replacement modes explicitly break the dependency on
+                    # the previous timeline block. Do not let captured continuation
+                    # helpers silently reintroduce that dependency.
+                    settings["continue_last_result"] = False
+                    settings["glue_results"] = False
+                    settings["continue_audio_memory"] = False
+                    settings["latent_continuation"] = False
                 if is_continue:
                     timeline_index = int(spec.get("timeline_index", pos) or 0)
                     if timeline_index == 0:
@@ -2771,20 +2828,43 @@ class MainWindow(QMainWindow):
                         settings["continue_last_result"] = False
                         settings["continue_video"] = prev_output
                     else:
-                        # Full timeline generation keeps using the existing queue
-                        # dependency chain so each clip waits for the one before it.
+                        # Full timeline generation normally uses the existing queue
+                        # dependency chain. If Clip 1 is a user-loaded start video,
+                        # there is no queue job for it, so continue explicitly from
+                        # that source file instead.
                         if pos == 0:
-                            QMessageBox.warning(self, "Timeline", "A continued clip cannot be the first queued timeline item.")
+                            QMessageBox.warning(self, "Timeline", "A continued clip cannot be the first timeline item.")
                             return False
-                        settings["continue_last_result"] = True
-                        settings["continue_video"] = ""
+                        if bool(spec.get("timeline_previous_is_source", False)):
+                            prev_output = str(spec.get("timeline_previous_output") or "")
+                            if not prev_output or not Path(prev_output).is_file():
+                                QMessageBox.warning(self, "Timeline", f"{clip_name} cannot find the loaded start clip to continue from.")
+                                return False
+                            settings["continue_last_result"] = False
+                            settings["continue_video"] = prev_output
+                        else:
+                            settings["continue_last_result"] = True
+                            settings["continue_video"] = ""
                     settings["last"] = ""
                 else:
                     # Start a fresh dependency chain. A captured manual source
-                    # (first/last frame, Ref2VA refs, or manual Continue video)
                     # remains valid, but it must never silently target the last
                     # queue result from an earlier timeline chain.
                     settings["continue_last_result"] = False
+                    if bool(spec.get("timeline_single_regeneration", False)) and str(spec.get("edit_mode") or "") == "anchor_next":
+                        if use_timeline_refs:
+                            QMessageBox.warning(
+                                self, "Timeline Ref2VA",
+                                f"{clip_name} uses Ref2VA references. The current H3 runner cannot combine Ref2VA with a fixed FL2VA next-frame anchor in one replacement job. Choose Standalone clip for this referenced replacement."
+                            )
+                            return False
+                        # Edit mode: do not use the previous timeline block, but
+                        # still constrain the replacement to land on the next
+                        # block's first frame. H3's last-frame boundary lives in
+                        # FL2VA, so use that path without a continuation video.
+                        settings["mode"] = 1
+                        settings["continue_video"] = ""
+                        settings["continue_last_result"] = False
 
                 if bool(spec.get("match_next_first_frame", False)):
                     if not single_regen:
@@ -2831,7 +2911,9 @@ class MainWindow(QMainWindow):
             for clip_id, job_id, output in created:
                 if getattr(self, "timeline_widget", None) is not None:
                     self.timeline_widget.mark_queued(clip_id, job_id, output)
-            self.status.setText(f"Timeline queued: {len(created)} clip(s)")
+            source_count = sum(1 for spec in specs if str(spec.get("generation_mode") or "") == "source")
+            suffix = f" + {source_count} loaded start clip" if source_count == 1 else (f" + {source_count} loaded start clips" if source_count else "")
+            self.status.setText(f"Timeline queued: {len(created)} H3 clip(s){suffix}")
             return True
         finally:
             # Timeline queuing must not leave the ordinary Generation tab changed
