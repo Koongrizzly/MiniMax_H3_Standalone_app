@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QSlider,
+    QInputDialog,
 )
 
 FPS = 24.0
@@ -576,6 +577,11 @@ class TimelineTab(QWidget):
         self.generate_timeline_btn.setToolTip(
             "Queue every clip on this timeline as a separate MiniMax H3 generation in timeline order."
         )
+        self.hq_restart_btn = QPushButton("HQ restart")
+        self.hq_restart_btn.setMinimumHeight(36)
+        self.hq_restart_btn.setToolTip(
+            "Use the HQ restart feature when your timeline is tested on a low resolution and results look good."
+        )
         self.assemble_timeline_btn = QPushButton("Assemble Video")
         self.assemble_timeline_btn.setMinimumHeight(36)
         self.assemble_timeline_btn.setToolTip(
@@ -591,6 +597,7 @@ class TimelineTab(QWidget):
         self.preview_final_btn.setEnabled(False)
         self.open_final_btn.setEnabled(False)
         runbar.addWidget(self.generate_timeline_btn)
+        runbar.addWidget(self.hq_restart_btn)
         runbar.addWidget(self.assemble_timeline_btn)
         runbar.addWidget(self.auto_assemble_check)
         runbar.addWidget(self.preview_final_btn)
@@ -804,6 +811,7 @@ class TimelineTab(QWidget):
         self.save_btn.clicked.connect(self.save_project)
         self.load_btn.clicked.connect(self.load_project)
         self.generate_timeline_btn.clicked.connect(self.generate_timeline)
+        self.hq_restart_btn.clicked.connect(self.hq_restart)
         self.generate_selected_btn.clicked.connect(self.generate_selected)
         self.assemble_timeline_btn.clicked.connect(self.assemble_timeline)
         self.auto_assemble_check.toggled.connect(self._auto_assemble_changed)
@@ -844,6 +852,7 @@ class TimelineTab(QWidget):
         total = sum(_clip_seconds(c) for c in self._clips())
         self.summary_label.setText(f"{len(self._clips())} clips  •  {total:.2f}s  •  {round(total * FPS)} timeline frames")
         self.generate_timeline_btn.setEnabled(bool(self._clips()))
+        self.hq_restart_btn.setEnabled(bool(self._clips()))
         ready, reason = self._assembly_ready()
         self.assemble_timeline_btn.setEnabled(bool(self._clips()))
         self.assemble_timeline_btn.setToolTip(
@@ -1818,6 +1827,71 @@ class TimelineTab(QWidget):
         if result:
             self.project["assembled_output"] = ""
             self.project["assembly_status"] = "Waiting for timeline clips to finish…" if self.auto_assemble_check.isChecked() else ""
+            self.project["auto_assemble"] = self.auto_assemble_check.isChecked()
+            self.project["auto_assemble_pending"] = self.auto_assemble_check.isChecked()
+            self._refresh_all()
+        return bool(result)
+
+    def hq_restart(self):
+        """Requeue the complete timeline with one HQ resolution override.
+
+        Every other generation setting remains owned by each timeline clip. The
+        orientation is taken from the live MiniMax GUI for normal HQ presets so a
+        9:16 or 1:1 project stays in that orientation. Explicit 21:9 choices force
+        21:9 because those entries already describe their complete output shape.
+        """
+        ok, error = self.validate_timeline()
+        if not ok:
+            QMessageBox.warning(self, "Timeline not ready", error)
+            return False
+        if not callable(self.queue_timeline_callback):
+            QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
+            return False
+
+        choices = [
+            "1280x704",
+            "1344x768",
+            "1920x1080",
+            "1344x576 (21:9)",
+            "1792x768 (21:9)",
+        ]
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "HQ restart",
+            "Select HQ resolution:",
+            choices,
+            0,
+            False,
+        )
+        if not accepted:
+            return False
+
+        current = self._capture_settings()
+        current_aspect = str(current.get("aspect") or "16:9")
+        if current_aspect not in {"9:16", "1:1"}:
+            current_aspect = "16:9"
+
+        if choice == "1280x704":
+            override = {"aspect": current_aspect, "resolution": "1280 × 720"}
+        elif choice == "1344x768":
+            override = {"aspect": current_aspect, "resolution": "1344 × 768"}
+        elif choice == "1920x1080":
+            # The GUI's 1080p choice intentionally maps to MiniMax's valid
+            # 1920x1088 tensor size, exactly like the normal Generation tab.
+            override = {"aspect": current_aspect, "resolution": "1920 × 1088"}
+        elif choice == "1344x576 (21:9)":
+            override = {"aspect": "21:9", "widescreen_quality": "Medium — 1344 × 576"}
+        else:
+            override = {"aspect": "21:9", "widescreen_quality": "High — 1792 × 768"}
+
+        specs = self.generation_specs()
+        for spec in specs:
+            spec["timeline_hq_override"] = copy.deepcopy(override)
+
+        result = self.queue_timeline_callback(specs)
+        if result:
+            self.project["assembled_output"] = ""
+            self.project["assembly_status"] = "Waiting for HQ timeline clips to finish…" if self.auto_assemble_check.isChecked() else ""
             self.project["auto_assemble"] = self.auto_assemble_check.isChecked()
             self.project["auto_assemble_pending"] = self.auto_assemble_check.isChecked()
             self._refresh_all()

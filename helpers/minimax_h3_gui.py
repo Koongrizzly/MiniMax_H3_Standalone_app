@@ -2761,6 +2761,21 @@ class MainWindow(QMainWindow):
                 settings["steps"] = int((spec.get("settings") or {}).get("steps", settings.get("steps", 15)))
                 settings["scheduler"] = str((spec.get("settings") or {}).get("scheduler", settings.get("scheduler", "beta")))
 
+                # HQ restart is deliberately a narrow override: keep the complete
+                # per-clip Timeline/Generation settings snapshot and replace only
+                # the output resolution/orientation selected by the HQ popup.
+                hq_override = spec.get("timeline_hq_override")
+                if isinstance(hq_override, dict):
+                    hq_aspect = str(hq_override.get("aspect") or "").strip()
+                    if hq_aspect in {"16:9", "9:16", "1:1", "21:9"}:
+                        settings["aspect"] = hq_aspect
+                    hq_resolution = str(hq_override.get("resolution") or "").strip()
+                    if hq_resolution in RESOLUTION_PRESETS:
+                        settings["resolution"] = hq_resolution
+                    hq_wide = str(hq_override.get("widescreen_quality") or "").strip()
+                    if hq_wide in WIDESCREEN_21_9_PRESETS:
+                        settings["widescreen_quality"] = hq_wide
+
                 # Timeline reference images are per-clip Ref2VA inputs.  They are
                 # deliberately separate from the Generation tab's global refs.
                 timeline_refs = [
