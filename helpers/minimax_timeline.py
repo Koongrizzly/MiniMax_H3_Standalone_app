@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import re
@@ -8,7 +9,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSize, QTimer
+from PySide6.QtCore import Qt, Signal, QSize, QTimer, QRect
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
     QWidget,
@@ -139,6 +140,8 @@ class TimelineCanvas(QWidget):
     CLIP_TOP = 40
     CLIP_H = 116
     BOTTOM_PAD = 16
+    THUMB_W = 46
+    THUMB_H = 36
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -151,6 +154,8 @@ class TimelineCanvas(QWidget):
         self._press_clip_index = -1
         self._dragging = False
         self._resizing = False
+        self._thumb_cache: dict[str, QPixmap | None] = {}
+        self._thumb_cache_dir = Path(__file__).resolve().parent / "_timeline_thumb_cache"
         self.setMinimumHeight(self.CLIP_TOP + self.CLIP_H + self.BOTTOM_PAD)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -191,6 +196,62 @@ class TimelineCanvas(QWidget):
         if not self.allowed_frames:
             return max(1, int(wanted))
         return min(self.allowed_frames, key=lambda v: abs(v - wanted))
+
+    def _ffmpeg_path(self) -> str:
+        try:
+            from runtime.ffmpeg_tools import tool_path as ffmpeg_tool_path
+            for candidate in ("ffmpeg.exe", "ffmpeg"):
+                path = str(ffmpeg_tool_path(candidate))
+                if path and Path(path).is_file():
+                    return path
+        except Exception:
+            pass
+        return ""
+
+    def _thumbnail_source_path(self, clip: dict) -> Path | None:
+        source = str(clip.get("output") or clip.get("start_source_video") or "").strip()
+        if not source:
+            return None
+        path = Path(source)
+        return path if path.is_file() else None
+
+    def _clip_thumbnail(self, clip: dict) -> QPixmap | None:
+        path = self._thumbnail_source_path(clip)
+        if path is None:
+            return None
+        try:
+            stamp = int(path.stat().st_mtime_ns)
+        except Exception:
+            stamp = 0
+        cache_key = f"{path}|{stamp}"
+        if cache_key in self._thumb_cache:
+            return self._thumb_cache[cache_key]
+
+        pix: QPixmap | None = None
+        if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            raw = QPixmap(str(path))
+            pix = None if raw.isNull() else raw
+        else:
+            ffmpeg = self._ffmpeg_path()
+            if ffmpeg:
+                try:
+                    self._thumb_cache_dir.mkdir(parents=True, exist_ok=True)
+                    key = hashlib.sha1(str(path).encode("utf-8", errors="ignore")).hexdigest()[:16]
+                    thumb = self._thumb_cache_dir / f"{path.stem}_{stamp}_{key}.jpg"
+                    if not thumb.is_file():
+                        subprocess.run(
+                            [ffmpeg, "-y", "-ss", "0.5", "-i", str(path), "-frames:v", "1", "-vf", "scale=320:-2", str(thumb)],
+                            capture_output=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                    if thumb.is_file():
+                        raw = QPixmap(str(thumb))
+                        pix = None if raw.isNull() else raw
+                except Exception:
+                    pix = None
+
+        self._thumb_cache[cache_key] = pix
+        return pix
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -271,23 +332,39 @@ class TimelineCanvas(QWidget):
             painter.setPen(muted if not selected else accent_text)
             painter.drawText(int(left + 8), self.CLIP_TOP + 38, fm.elidedText(info, Qt.TextElideMode.ElideRight, name_width))
 
-            # Show a compact prompt preview. A timeline block is one complete H3 job;
-            # shot/timestamp structure stays inside the normal H3 prompt itself.
+            # Show a compact prompt preview. If an output clip already exists, also
+            # draw a small thumbnail so timeline blocks are visually recognizable.
             prompt_y = self.CLIP_TOP + 53
             prompt_h = 42
+            box_left = int(left + 5)
+            box_w = max(1, int(width - 14))
             painter.setBrush(QBrush(QColor("#375a7f")))
             painter.setPen(QPen(bg, 1))
-            painter.drawRect(int(left + 5), prompt_y, max(1, int(width - 14)), prompt_h)
+            painter.drawRect(box_left, prompt_y, box_w, prompt_h)
             if clip.get("generation_mode") == "source":
                 source = str(clip.get("start_source_video") or clip.get("output") or "").strip()
                 prompt = Path(source).name if source else "No start video loaded"
             else:
                 prompt = _compiled_prompt(clip).replace("\n", " ").strip() or "Empty prompt"
+
+            text_left = box_left + 6
+            text_w = max(12, box_w - 12)
+            pix = self._clip_thumbnail(clip)
+            if pix is not None and box_w >= 70:
+                thumb_rect = QRect(box_left + 4, prompt_y + 3, self.THUMB_W, self.THUMB_H)
+                scaled = pix.scaled(thumb_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                painter.fillRect(thumb_rect, QColor("#223548"))
+                draw_x = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
+                draw_y = thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2
+                painter.drawPixmap(draw_x, draw_y, scaled)
+                painter.setPen(QPen(QColor("#8ea7bf"), 1))
+                painter.drawRect(thumb_rect)
+                text_left = thumb_rect.right() + 8
+                text_w = max(12, box_left + box_w - text_left - 6)
+
             painter.setPen(QColor("#f4f6f8"))
-            painter.drawText(
-                int(left + 10), prompt_y + 26,
-                fm.elidedText(prompt, Qt.TextElideMode.ElideRight, int(max(12, width - 24)))
-            )
+            text_rect = QRect(text_left, prompt_y + 2, text_w, prompt_h - 4)
+            painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine), fm.elidedText(prompt, Qt.TextElideMode.ElideRight, text_w))
 
             if clip.get("generation_mode") == "continue" and idx > 0:
                 painter.setPen(QPen(accent, 2))
