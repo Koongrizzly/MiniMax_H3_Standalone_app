@@ -40,7 +40,7 @@ def main():
     ap.add_argument('--frames', type=int, required=True); ap.add_argument('--steps', type=int, required=True); ap.add_argument('--cfg', type=float, required=True)
     ap.add_argument('--seed', type=int, required=True); ap.add_argument('--shift', type=float, required=True); ap.add_argument('--audio-shift', type=float, required=True)
     ap.add_argument('--sampler', default='euler'); ap.add_argument('--scheduler', default='simple'); ap.add_argument('--out', required=True)
-    ap.add_argument('--first-frame'); ap.add_argument('--last-frame'); ap.add_argument('--continue-video'); ap.add_argument('--continue-context-frames', type=int, default=39); ap.add_argument('--continue-audio-memory', action='store_true'); ap.add_argument('--continue-latent')
+    ap.add_argument('--first-frame'); ap.add_argument('--last-frame'); ap.add_argument('--continue-video'); ap.add_argument('--continue-context-frames', type=int, default=39); ap.add_argument('--continue-audio-memory', action='store_true'); ap.add_argument('--continue-latent'); ap.add_argument('--combine-frames-latent', action='store_true')
     ap.add_argument('--lora', action='append', default=[]); ap.add_argument('--lora-strength', action='append', type=float, default=[])
     ap.add_argument('--extended-logging', action='store_true')
     ap.add_argument('--spectrum', action='store_true', help='Enable MiniMax H3 Spectrum feature forecasting')
@@ -111,7 +111,7 @@ def main():
         if ns.extended_logging: log_mem('before keyframe VAE load', sync=True)
         vv=load_vae(Path(ns.video_vae))
         print('Encoding FL2VA keyframe conditioning before text encoder load...', flush=True)
-        prepared_keyframes=prepare_keyframe_conditioning(vv,ns.width,ns.height,ns.frames,ns.first_frame,ns.last_frame,ns.continue_video,ns.continue_context_frames,ns.continue_latent)
+        prepared_keyframes=prepare_keyframe_conditioning(vv,ns.width,ns.height,ns.frames,ns.first_frame,ns.last_frame,ns.continue_video,ns.continue_context_frames,ns.continue_latent,ns.combine_frames_latent)
         if ns.extended_logging: log_mem('after keyframe VAE encode / before VAE flush', sync=True)
         del vv
         vv=None
