@@ -1136,24 +1136,60 @@ class TimelineTab(QWidget):
         self._refresh_all(select_first=True)
 
     def save_project(self):
-        if not self._project_path:
+        # The temporary autosave is only a recovery file. It must never silently
+        # become the user's "saved project" and it must never be deleted until a
+        # real user-chosen destination has been written successfully.
+        current_path = Path(self._project_path) if self._project_path else None
+        needs_destination = (
+            current_path is None
+            or current_path == self._autosave_temp_path
+            or current_path.name == self._autosave_temp_path.name
+        )
+
+        if needs_destination:
             suggested = _safe_project_name(self.project.get("name")).replace(" ", "_") + ".json"
-            name, _ = QFileDialog.getSaveFileName(self, "Save MiniMax timeline", suggested, "MiniMax Timeline (*.json);;JSON (*.json)")
+            name, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save MiniMax timeline",
+                suggested,
+                "MiniMax Timeline (*.json);;JSON (*.json)",
+            )
             if not name:
+                # User cancelled: keep the recovery autosave untouched.
                 return
-            self._project_path = Path(name)
+            chosen_path = Path(name)
+        else:
+            chosen_path = current_path
+
         try:
-            self._write_project_json(self._project_path)
+            self._write_project_json(chosen_path)
+            if not chosen_path.is_file():
+                raise OSError(f"Timeline save did not create the requested file:\n{chosen_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Save timeline failed", str(exc))
             return
-        # Once the project has a real file, the temporary recovery copy is no
-        # longer authoritative. Future autosaves go to the saved JSON.
+
+        # Only now commit the real project path.
+        self._project_path = chosen_path
+
+        # Delete the temporary recovery copy only after a distinct real save file
+        # definitely exists. If cleanup fails, leave it in place; an extra recovery
+        # file is safer than losing the project.
         try:
-            if self._autosave_temp_path.exists():
+            if (
+                self._autosave_temp_path.exists()
+                and self._autosave_temp_path.resolve() != chosen_path.resolve()
+            ):
                 self._autosave_temp_path.unlink()
         except Exception:
             pass
+
+        self.summary_label.setToolTip(str(self._project_path))
+        QMessageBox.information(
+            self,
+            "Timeline saved",
+            f"Timeline project saved to:\n{self._project_path}",
+        )
 
     def load_project(self):
         name, _ = QFileDialog.getOpenFileName(self, "Load MiniMax timeline", "", "MiniMax Timeline (*.json);;JSON (*.json)")
