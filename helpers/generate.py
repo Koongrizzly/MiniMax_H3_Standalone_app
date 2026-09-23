@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
     ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
-    ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=39); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--latent-continuation", action="store_true", help="Prefer the saved native H3 latent sidecar for continuation history; fall back to video history if unavailable/incompatible"); ap.add_argument("--glue-source"); ap.add_argument("--output")
+    ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=39); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--latent-continuation", action="store_true", help="Prefer the saved native H3 latent sidecar for continuation history; fall back to video history if unavailable/incompatible"); ap.add_argument("--combine-frames-latent", action="store_true", help="When latent continuation is active, combine saved H3 latent history with decoded source-video frame history and the exact final-frame boundary"); ap.add_argument("--glue-source"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
     ap.add_argument("--extended-logging", action="store_true")
@@ -393,7 +393,11 @@ def main():
                     latent_sidecar = continue_path.with_suffix(".h3latent.pt")
                     if latent_sidecar.is_file():
                         sample_cmd += ["--continue-latent", str(latent_sidecar)]
-                        print(f"Latent continuation: using saved H3 state {latent_sidecar.name}", flush=True)
+                        if ns.combine_frames_latent:
+                            sample_cmd += ["--combine-frames-latent"]
+                            print(f"Latent continuation: using saved H3 state {latent_sidecar.name} + decoded frame memory", flush=True)
+                        else:
+                            print(f"Latent continuation: using saved H3 state {latent_sidecar.name}", flush=True)
                     else:
                         print(f"Latent continuation requested, but no sidecar was found at {latent_sidecar.name}; falling back to decoded-video history.", flush=True)
                 if ns.continue_audio_memory:

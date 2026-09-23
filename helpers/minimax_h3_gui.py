@@ -1294,9 +1294,17 @@ class MainWindow(QMainWindow):
             "The previous result must have a compatible saved H3 latent at the same resolution. If no compatible latent is found, the app automatically falls back to normal video-frame continuation."
         )
         self.latent_continuation.toggled.connect(self._sync_continue_video_options)
+        self.combine_frames_latent = QCheckBox("Combine frames memory & latent continuation")
+        self.combine_frames_latent.setChecked(False)
+        self.combine_frames_latent.setToolTip(
+            "When latent continuation is enabled, also VAE-encode the decoded source-video history frames and provide them together with the saved native H3 latent history and exact final-frame boundary. "
+            "This uses both frame memory and latent memory for stronger continuity. It costs some extra VAE work and memory."
+        )
+        self.combine_frames_latent.setVisible(False)
+        self.combine_frames_latent.toggled.connect(self._sync_continue_video_options)
         self.continue_context.setToolTip(
-            "Number of decoded source-video history frames used by normal continuation. "
-            "Ignored while latent continuation is active; the saved value is kept as the fallback context if no compatible latent can be used."
+            "Continuation history window. The same native 17k+5-aligned duration is used for decoded-frame memory and saved latent memory. "
+            "When Combine frames memory & latent continuation is enabled, both memories use this same window."
         )
         self.glue_results = QCheckBox("Glue results")
         self.glue_results.setChecked(False)
@@ -1319,6 +1327,7 @@ class MainWindow(QMainWindow):
         fl.addRow("First frame", self.first); fl.addRow("Last frame", self.last)
         fl.addRow("Continue video", self.continue_video); fl.addRow("Motion context", self.continue_context)
         fl.addRow("", self.latent_continuation)
+        fl.addRow("", self.combine_frames_latent)
         fl.addRow("", self.glue_results); fl.addRow("", self.continue_last_result); fl.addRow("", self.continue_audio_memory_row); v.addWidget(self.fl_group)
 
         self.ref_group = QGroupBox("Ref2VA references"); rfl = QVBoxLayout(self.ref_group)
@@ -2609,6 +2618,8 @@ class MainWindow(QMainWindow):
                 run_args += ["--continue-audio-memory"]
             if job.get("latent_continuation"):
                 run_args += ["--latent-continuation"]
+                if job.get("combine_frames_latent"):
+                    run_args += ["--combine-frames-latent"]
             if job.get("glue_results"):
                 run_args += ["--glue-source", continue_source]
             job["resolved_continue_source"] = continue_source
@@ -2710,11 +2721,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         cmd = [
-            str(ffmpeg_tool_path("ffmpeg")), "-y", "-i", str(video),
-            "-map", "0:v:0", "-frames:v", "1", str(out),
+            str(ffmpeg_tool_path("ffmpeg.exe")), "-y", "-nostdin", "-loglevel", "error",
+            "-i", str(video), "-map", "0:v:0", "-frames:v", "1", str(out),
         ]
         try:
-            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # This runs on the GUI thread because the queue bridge needs the frame
+            # path before it can construct the job. Bound it so a damaged/odd video
+            # cannot freeze the application indefinitely.
+            cp = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired:
+            QMessageBox.critical(self, "Timeline bridge", "Timed out while extracting the next clip's first frame. The regeneration was not queued.")
+            return ""
         except Exception as exc:
             QMessageBox.critical(self, "Timeline bridge", f"Could not extract the next clip's first frame:\n{exc}")
             return ""
@@ -2840,6 +2860,16 @@ class MainWindow(QMainWindow):
                         return False
                     settings["mode"] = 1  # FL2VA
                     settings["first"] = ""
+
+                    # Timeline continuity always uses the strongest native continuation
+                    # path available. Keep the existing .h3latent.pt sidecar format:
+                    # when the previous generated clip has one, generate.py feeds that
+                    # original H3 latent history to the worker. The worker ALSO uses
+                    # the previous MP4's exact final RGB frame as the boundary anchor.
+                    # If an imported/old clip has no .h3latent.pt, the existing pixel
+                    # history fallback is used automatically.
+                    settings["latent_continuation"] = True
+
                     if single_regen:
                         # A middle-clip replacement must continue from the exact
                         # preserved previous timeline result, not whichever queue
@@ -2850,13 +2880,9 @@ class MainWindow(QMainWindow):
                             return False
                         settings["continue_last_result"] = False
                         settings["continue_video"] = prev_output
-                        # Edit-mode continuations are expected to visibly carry the
-                        # previous clip forward. If the clip's stored settings do not
-                        # already request an additional continuity helper, enable
-                        # latent continuation automatically so this replacement does
-                        # more than a weak free-standing FL2VA restart.
-                        if edit_mode in {"bridge_both", "continue_previous"} and not bool(settings.get("latent_continuation", False)) and not bool(settings.get("continue_audio_memory", False)):
-                            settings["latent_continuation"] = True
+                        # latent_continuation is already forced for every Timeline
+                        # continuation above. Audio memory remains independent; turning
+                        # it on never disables the visual latent + final-frame path.
                     else:
                         # Full timeline generation normally uses the existing queue
                         # dependency chain. If Clip 1 is a user-loaded start video,
@@ -2897,6 +2923,9 @@ class MainWindow(QMainWindow):
                         settings["continue_last_result"] = False
 
                 if bool(spec.get("match_next_first_frame", False)):
+                    self.status.setText(f"Timeline: preparing bridge for {clip_name}…")
+                    self.append_log(f"[TIMELINE] Preparing bridge destination frame for {clip_name}.\n")
+                    QApplication.processEvents()
                     if not single_regen:
                         QMessageBox.warning(
                             self, "Timeline bridge",
@@ -2911,6 +2940,7 @@ class MainWindow(QMainWindow):
                     if not anchor:
                         return False
                     settings["last"] = anchor
+                    self.append_log(f"[TIMELINE] Bridge destination frame ready: {anchor}\n")
 
                 # Keep long timeline outputs readable without replacing a user's
                 # chosen output directory. Existing make_output_path() still
@@ -3019,12 +3049,18 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        out_dir = outputs[0].parent
-        base = self._timeline_safe_name((project or {}).get("name") or "MiniMax Timeline") + "_final"
-        final_path = out_dir / f"{base}.mp4"
+        # Timeline assembly is a user-requested final export. Always put it in the
+        # standalone app's main output folder instead of inheriting the directory
+        # of whichever clip happened to be first on the timeline. This makes the
+        # result predictable and easy to find.
+        out_dir = DEFAULT_OUTPUT_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base = self._timeline_safe_name((project or {}).get("name") or "MiniMax Timeline") + "_assembled"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_path = out_dir / f"{base}_{stamp}.mp4"
         suffix = 2
         while final_path.exists():
-            final_path = out_dir / f"{base}_{suffix}.mp4"
+            final_path = out_dir / f"{base}_{stamp}_{suffix}.mp4"
             suffix += 1
 
         work_dir = ROOT / "jobs" / "timeline_assembly"
@@ -3041,7 +3077,7 @@ class MainWindow(QMainWindow):
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        proc.setProgram(str(ffmpeg_tool_path("ffmpeg")))
+        proc.setProgram(str(ffmpeg_tool_path("ffmpeg.exe")))
         proc.setArguments([
             "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
             "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
@@ -3075,8 +3111,13 @@ class MainWindow(QMainWindow):
             if ok:
                 if getattr(self, "timeline_widget", None) is not None:
                     self.timeline_widget.mark_assembly_finished(str(final_path))
-                self.status.setText("Timeline assembly finished")
+                self.status.setText(f"Timeline assembly finished: {final_path.name}")
                 self.append_log(f"=== TIMELINE ASSEMBLY FINISHED ===\n{final_path}\n")
+                QMessageBox.information(
+                    self,
+                    "Timeline assembly finished",
+                    f"The timeline was assembled successfully.\n\nSaved to:\n{final_path}",
+                )
             else:
                 try:
                     if final_path.is_file():
@@ -3810,11 +3851,13 @@ class MainWindow(QMainWindow):
     def _sync_continue_video_options(self):
         chain = bool(getattr(self, "continue_last_result", None) and self.continue_last_result.isChecked())
         latent = bool(getattr(self, "latent_continuation", None) and self.latent_continuation.isChecked())
+        if hasattr(self, "combine_frames_latent"):
+            self.combine_frames_latent.setVisible(latent)
+            self.combine_frames_latent.setEnabled(latent)
         if hasattr(self, "continue_context"):
-            # Latent continuation carries H3 state directly, so decoded-video history
-            # length is not an active setting. Keep the selected value stored because
-            # it is still used automatically if latent continuation has to fall back.
-            self.continue_context.setEnabled(not latent)
+            # The context length controls both native latent history and decoded
+            # frame history, so keep it available in every continuation mode.
+            self.continue_context.setEnabled(True)
         if hasattr(self, "continue_video"):
             self.continue_video.setEnabled(not chain)
             # When Continue last result is active, the queued dependency is the only
@@ -4294,6 +4337,7 @@ class MainWindow(QMainWindow):
             "continue_video": "" if self.continue_last_result.isChecked() else self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(), "latent_continuation": self.latent_continuation.isChecked(),
+            "combine_frames_latent": self.combine_frames_latent.isChecked(),
             "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "lock_source_audio": self.lock_source_audio.isChecked(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
@@ -4347,7 +4391,7 @@ class MainWindow(QMainWindow):
             self.continue_last_result.setChecked(continue_last_setting)
             self.continue_video.edit.setText("" if continue_last_setting else d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
-            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self._sync_continue_video_options()
+            self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self.combine_frames_latent.setChecked(bool(d.get("combine_frames_latent", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
@@ -4845,12 +4889,13 @@ class MainWindow(QMainWindow):
         args=[script,"--width",str(w),"--height",str(h),"--frames",str(frames),"--steps",str(self.steps.value()),"--cfg",str(self.cfg.value()),"--shift",str(self.shift.value()),"--audio-shift",str(self.audio_shift.value()),"--seed",str(self.seed.value()),"--sampler",self.sampler.currentText(),"--scheduler",self.scheduler.currentText(),"--prompt",prompt]
         if long_mode:
             args += ["--experimental-long-duration"]
-        continue_last=False; continue_from_job_id=None; continue_from_job_number=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False; latent_continuation=False
+        continue_last=False; continue_from_job_id=None; continue_from_job_number=None; manual_continue_video=""; glue_results=False; continue_audio_memory=False; latent_continuation=False; combine_frames_latent=False
         if mode==1:
             continue_last=self.continue_last_result.isChecked()
             glue_results=self.glue_results.isChecked()
             continue_audio_memory=bool(continue_last and self.continue_audio_memory.isChecked())
             latent_continuation=bool(self.latent_continuation.isChecked())
+            combine_frames_latent=bool(latent_continuation and self.combine_frames_latent.isChecked())
             manual_continue_video="" if continue_last else self.continue_video.path()
             if (manual_continue_video or continue_last) and self.first.path():
                 QMessageBox.warning(self,"Conflicting FL2VA inputs","Continue Video already supplies the first-frame boundary. Clear the separate First frame."); return
@@ -4922,7 +4967,7 @@ class MainWindow(QMainWindow):
         else:
             model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
             model_label=Path(model_path).name if model_path else ("Ref2VA default" if mode==2 else "FL2VA default")
-        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation)}
+        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation),"combine_frames_latent":bool(combine_frames_latent)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
 

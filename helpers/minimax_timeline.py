@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QSlider,
     QInputDialog,
+    QApplication,
 )
 
 FPS = 24.0
@@ -513,29 +514,64 @@ class TimelineTab(QWidget):
             "clips": [],
             "assembled_output": "",
             "assembly_status": "",
-            "auto_assemble": True,
+            "auto_assemble": False,
             "auto_assemble_pending": False,
+            "global_generation_settings": {},
         }
 
     def _capture_settings(self):
         if callable(self.settings_provider):
             try:
                 data = self.settings_provider()
-                return copy.deepcopy(data) if isinstance(data, dict) else {}
+                captured = copy.deepcopy(data) if isinstance(data, dict) else {}
+                # Timeline always owns final assembly. Standalone FL2VA Glue is
+                # intentionally ignored here so a Generation-tab checkbox can
+                # never become a stale/fantasy Timeline setting.
+                captured["glue_results"] = False
+                return captured
             except Exception:
                 return {}
         return {}
 
+    def _timeline_global_settings(self, raw=None):
+        """Return Generation-tab settings safe to use as a Timeline-wide baseline.
+
+        Timeline owns prompt text, clip duration, Ref2VA inputs and continuation
+        topology. Those fields must never be overwritten by the global settings
+        capture button. Everything else (model, LoRAs, resolution, sampler,
+        scheduler, seed, steps, VRAM/runtime options, etc.) remains global.
+        """
+        settings = copy.deepcopy(raw if isinstance(raw, dict) else self._capture_settings())
+        for key in (
+            "prompt", "frames", "experimental_long_duration",
+            "ref_images", "ref_videos", "ref_audios",
+            "first", "last", "continue_video", "continue_last_result",
+        ):
+            settings.pop(key, None)
+        # Timeline decides T2VA / FL2VA / Ref2VA per block at queue time.
+        settings["mode"] = 0
+        settings["glue_results"] = False
+        return settings
+
     def _blank_clip(self, *, continue_previous=False, source_settings=None):
-        settings = copy.deepcopy(source_settings if isinstance(source_settings, dict) else self._capture_settings())
-        frames = int(settings.get("frames") or 243)
+        global_settings = self.project.get("global_generation_settings") if isinstance(getattr(self, "project", None), dict) else {}
+        if isinstance(global_settings, dict) and global_settings:
+            settings = copy.deepcopy(global_settings)
+        elif isinstance(source_settings, dict):
+            settings = copy.deepcopy(source_settings)
+        else:
+            settings = self._timeline_global_settings()
+        # Duration belongs to the Timeline block itself. Global Generation settings
+        # never get to change it. New blocks use the existing Timeline default.
+        frames = 243
         frames = min(self.frame_values, key=lambda v: abs(v - frames)) if self.frame_values else frames
-        prompt = str(settings.get("prompt") or "")
+        prompt = ""
         # Timeline reference images are owned by each clip, not implicitly copied
         # from whatever happens to be loaded on the Generation tab.
         settings["ref_images"] = []
         settings["ref_videos"] = []
         settings["ref_audios"] = []
+        settings["glue_results"] = False
         return {
             "id": uuid.uuid4().hex,
             "name": "",
@@ -627,16 +663,8 @@ class TimelineTab(QWidget):
         settings = self._capture_settings()
         if not settings:
             return
-        settings["ref_images"] = []
-        settings["ref_videos"] = []
-        settings["ref_audios"] = []
+        settings = self._timeline_global_settings(settings)
         clip["settings"] = settings
-        frames = int(settings.get("frames") or clip.get("frames") or 243)
-        if self.frame_values:
-            frames = min(self.frame_values, key=lambda v: abs(v - frames))
-        clip["frames"] = frames
-        if len(clip.get("segments") or []) == 1 and not str(clip["segments"][0].get("prompt") or "").strip():
-            clip["segments"][0]["prompt"] = str(settings.get("prompt") or "")
         self._refresh_all()
 
     # --------------------------------------------------------------------- UI
@@ -688,21 +716,16 @@ class TimelineTab(QWidget):
         self.assemble_timeline_btn.setToolTip(
             "Join the finished timeline clip outputs, in timeline order, into one final MP4."
         )
-        self.auto_assemble_check = QCheckBox("Auto assemble when finished")
-        self.auto_assemble_check.setChecked(bool(self.project.get("auto_assemble", True)))
-        self.auto_assemble_check.setToolTip(
-            "After Generate Timeline, automatically assemble the final MP4 when every timeline clip has finished."
+        self.use_generation_settings_btn = QPushButton("Use current Generation settings")
+        self.use_generation_settings_btn.setMinimumHeight(36)
+        self.use_generation_settings_btn.setToolTip(
+            "Capture the current Generation-tab settings and apply them to every Timeline generation block. "
+            "Timeline prompts, reference images and clip durations are preserved. New clips will inherit this global settings snapshot."
         )
-        self.preview_final_btn = QPushButton("Preview final")
-        self.open_final_btn = QPushButton("Open final folder")
-        self.preview_final_btn.setEnabled(False)
-        self.open_final_btn.setEnabled(False)
         runbar.addWidget(self.generate_timeline_btn)
         runbar.addWidget(self.hq_restart_btn)
         runbar.addWidget(self.assemble_timeline_btn)
-        runbar.addWidget(self.auto_assemble_check)
-        runbar.addWidget(self.preview_final_btn)
-        runbar.addWidget(self.open_final_btn)
+        runbar.addWidget(self.use_generation_settings_btn)
         runbar.addStretch(1)
         root.addLayout(runbar)
 
@@ -886,20 +909,14 @@ class TimelineTab(QWidget):
         self.seed_spin = QSpinBox(); self.seed_spin.setRange(-1, 2147483647)
         self.steps_spin = QSpinBox(); self.steps_spin.setRange(1, 100)
         self.scheduler_combo = QComboBox(); self.scheduler_combo.addItems(["simple", "beta"])
-        self.glue_check = QCheckBox("Glue result to source")
         self.audio_memory_check = QCheckBox("Carry audio memory")
-        self.latent_check = QCheckBox("Latent continuation")
-        self.capture_btn = QPushButton("Capture current Generation-tab settings")
         self.model_label = QLabel("—"); self.model_label.setWordWrap(True)
         self.refs_label = QLabel("—"); self.refs_label.setWordWrap(True)
         self.loras_label = QLabel("—"); self.loras_label.setWordWrap(True)
-        sf.addRow("", self.capture_btn)
         sf.addRow("Seed", self.seed_spin)
         sf.addRow("Steps", self.steps_spin)
         sf.addRow("Scheduler", self.scheduler_combo)
-        sf.addRow("", self.glue_check)
         sf.addRow("", self.audio_memory_check)
-        sf.addRow("", self.latent_check)
         sf.addRow("Model", self.model_label)
         sf.addRow("References", self.refs_label)
         sf.addRow("LoRAs", self.loras_label)
@@ -921,11 +938,9 @@ class TimelineTab(QWidget):
         self.hq_restart_btn.clicked.connect(self.hq_restart)
         self.generate_selected_btn.clicked.connect(self.generate_selected)
         self.assemble_timeline_btn.clicked.connect(self.assemble_timeline)
-        self.auto_assemble_check.toggled.connect(self._auto_assemble_changed)
+        self.use_generation_settings_btn.clicked.connect(self.use_current_generation_settings)
         self.preview_clip_btn.clicked.connect(self.preview_selected_result)
         self.open_clip_btn.clicked.connect(self.open_selected_output)
-        self.preview_final_btn.clicked.connect(self.preview_final_result)
-        self.open_final_btn.clicked.connect(self.open_final_output)
         self.add_clip_btn.clicked.connect(self.add_clip)
         self.dup_clip_btn.clicked.connect(self.duplicate_clip)
         self.del_clip_btn.clicked.connect(self.delete_clip)
@@ -941,10 +956,7 @@ class TimelineTab(QWidget):
         self.seed_spin.valueChanged.connect(self._settings_changed)
         self.steps_spin.valueChanged.connect(self._settings_changed)
         self.scheduler_combo.currentTextChanged.connect(self._settings_changed)
-        self.glue_check.toggled.connect(self._settings_changed)
         self.audio_memory_check.toggled.connect(self._settings_changed)
-        self.latent_check.toggled.connect(self._settings_changed)
-        self.capture_btn.clicked.connect(self.capture_current_settings)
         self.edit_mode_group.buttonClicked.connect(self._edit_mode_changed)
         self.cut_prompt.textChanged.connect(self._cut_prompt_changed)
         self.use_refs_check.toggled.connect(self._reference_mode_changed)
@@ -966,16 +978,6 @@ class TimelineTab(QWidget):
             "Join the finished timeline clip outputs, in timeline order, into one final MP4."
             if ready else reason
         )
-        self.auto_assemble_check.blockSignals(True)
-        self.auto_assemble_check.setChecked(bool(self.project.get("auto_assemble", True)))
-        self.auto_assemble_check.blockSignals(False)
-        final_path = str(self.project.get("assembled_output") or "")
-        final_exists = bool(final_path and Path(final_path).is_file())
-        self.preview_final_btn.setEnabled(final_exists)
-        self.open_final_btn.setEnabled(final_exists)
-        final_status = str(self.project.get("assembly_status") or "").strip()
-        self.preview_final_btn.setToolTip(final_path if final_exists else (final_status or "No assembled timeline result yet."))
-        self.open_final_btn.setToolTip(final_path if final_exists else (final_status or "No assembled timeline result yet."))
         self.summary_label.setToolTip(str(self._project_path) if self._project_path else "Autosaving to temporary timeline JSON until you choose Save.")
         self.canvas.set_clips(self._clips(), self.selected_clip_id)
         self._load_inspector()
@@ -986,8 +988,7 @@ class TimelineTab(QWidget):
         try:
             enabled = clip is not None
             for w in (self.clip_name, self.gen_mode, self.frames_combo, self.seed_spin, self.steps_spin,
-                      self.scheduler_combo, self.glue_check, self.audio_memory_check, self.latent_check,
-                      self.capture_btn, self.cut_prompt):
+                      self.scheduler_combo, self.audio_memory_check, self.cut_prompt):
                 w.setEnabled(enabled)
             if clip is None:
                 self.state_label.setText("No clip selected")
@@ -1027,8 +1028,8 @@ class TimelineTab(QWidget):
             self.use_refs_guide.setVisible(refs_enabled)
             self._refresh_reference_rows(clip)
             # A loaded start video is already the first timeline result; it needs no H3 prompt or generation settings.
-            for w in (self.frames_combo, self.seed_spin, self.steps_spin, self.scheduler_combo, self.glue_check,
-                      self.audio_memory_check, self.latent_check, self.capture_btn, self.cut_prompt):
+            for w in (self.frames_combo, self.seed_spin, self.steps_spin, self.scheduler_combo,
+                      self.audio_memory_check, self.cut_prompt):
                 w.setEnabled(enabled and not is_source)
             fidx = self.frames_combo.findData(int(clip.get("frames") or 243))
             if fidx >= 0: self.frames_combo.setCurrentIndex(fidx)
@@ -1037,9 +1038,10 @@ class TimelineTab(QWidget):
             sched = str(settings.get("scheduler") or "beta")
             if self.scheduler_combo.findText(sched) < 0: self.scheduler_combo.addItem(sched)
             self.scheduler_combo.setCurrentText(sched)
-            self.glue_check.setChecked(bool(settings.get("glue_results", False)))
+            # Old projects may still contain glue_results=True. Timeline no longer
+            # exposes or honors that flag; clips remain separate until assembly.
+            settings["glue_results"] = False
             self.audio_memory_check.setChecked(bool(settings.get("continue_audio_memory", True)))
-            self.latent_check.setChecked(bool(settings.get("latent_continuation", False)))
             self._refresh_edit_workflow(clip)
             state = str(clip.get("status") or "draft").title()
             if clip.get("stale"): state = "Stale — edited after queue/render"
@@ -1167,8 +1169,9 @@ class TimelineTab(QWidget):
             self.project.setdefault("name", Path(name).stem)
             self.project.setdefault("assembled_output", "")
             self.project.setdefault("assembly_status", "")
-            self.project.setdefault("auto_assemble", True)
-            self.project.setdefault("auto_assemble_pending", False)
+            self.project["auto_assemble"] = False
+            self.project["auto_assemble_pending"] = False
+            self.project.setdefault("global_generation_settings", {})
             for clip in self.project.get("clips") or []:
                 legacy_match = bool(clip.get("match_next_first_frame", False))
                 if not clip.get("edit_mode"):
@@ -1191,6 +1194,11 @@ class TimelineTab(QWidget):
                 clip.setdefault("use_reference_images", False)
                 clip.setdefault("reference_images", [])
                 clip.setdefault("settings", {})
+                # Legacy Timeline projects may contain a captured standalone Glue
+                # flag. Generated Timeline outputs were already forced to remain
+                # separate, so clearing this metadata is safe and must not mark the
+                # finished clip stale or require regeneration.
+                clip["settings"]["glue_results"] = False
                 clip.setdefault("status", "draft")
                 clip.setdefault("stale", False)
                 clip.setdefault("queue_job_id", None)
@@ -1609,7 +1617,8 @@ class TimelineTab(QWidget):
         if not clip: return
         s = clip.setdefault("settings", {})
         s["seed"] = self.seed_spin.value(); s["steps"] = self.steps_spin.value(); s["scheduler"] = self.scheduler_combo.currentText()
-        s["glue_results"] = self.glue_check.isChecked(); s["continue_audio_memory"] = self.audio_memory_check.isChecked(); s["latent_continuation"] = self.latent_check.isChecked()
+        s["glue_results"] = False
+        s["continue_audio_memory"] = self.audio_memory_check.isChecked()
         self._touch_clip(idx)
         self._refresh_all()
 
@@ -1681,45 +1690,37 @@ class TimelineTab(QWidget):
         # stale the clip or mutate the normal first-time creation workflow.
         self.canvas.update()
 
-    def capture_current_settings(self):
-        clip = self._selected_clip(); idx = self._selected_index()
-        if not clip:
-            return
+    def use_current_generation_settings(self):
+        """Apply one Generation-tab snapshot globally without touching Timeline content/duration."""
+        settings = self._timeline_global_settings()
+        if not settings:
+            QMessageBox.warning(self, "Timeline settings", "No Generation-tab settings were available to capture.")
+            return False
 
-        # Capture technical Generation-tab settings only. The timeline prompt is
-        # authored independently and must never be replaced by whatever prompt
-        # happens to be present on the Generation tab.
-        current_prompt = _compiled_prompt(clip)
-        current_segments = copy.deepcopy(clip.get("segments") or [])
-        settings = self._capture_settings()
-        settings.pop("prompt", None)
-        # Reference images are edited per timeline clip in the dedicated Ref2VA
-        # section; Capture Settings must not overwrite them from the Generation tab.
-        settings["ref_images"] = []
-        settings["ref_videos"] = []
-        settings["ref_audios"] = []
-        clip["settings"] = settings
+        self.project["global_generation_settings"] = copy.deepcopy(settings)
+        changed_finished = False
+        for idx, clip in enumerate(self._clips()):
+            if str(clip.get("generation_mode") or "") == "source":
+                continue
+            # Preserve all Timeline-owned values. Queue-time logic will add the
+            # block's frames, prompt, refs and continuation source separately.
+            clip["settings"] = copy.deepcopy(settings)
+            clip["settings"]["glue_results"] = False
+            if clip.get("queue_job_id") or clip.get("status") in {"pending", "running", "finished"}:
+                clip["stale"] = True
+                changed_finished = True
 
-        frames = int(settings.get("frames") or clip.get("frames") or 243)
-        if self.frame_values:
-            frames = min(self.frame_values, key=lambda v: abs(v - frames))
-        clip["frames"] = frames
-
-        # Preserve the timeline prompt verbatim. Keep the existing segment id so
-        # saved project state remains stable even though the UI exposes one prompt.
-        if current_segments:
-            clip["segments"] = current_segments
-        else:
-            clip["segments"] = [{
-                "id": uuid.uuid4().hex,
-                "prompt": current_prompt,
-                "weight": 1.0,
-            }]
-
-        self._touch_clip(idx)
+        self._invalidate_assembly(
+            "Generation settings changed — regenerate affected clips before assembling."
+            if changed_finished else "Generation settings updated."
+        )
         self._refresh_all()
+        return True
 
-    # -------------------------------------------------------------- prompt edit
+    # Compatibility for older signal/project code; this is now Timeline-global.
+    def capture_current_settings(self):
+        return self.use_current_generation_settings()
+
     def _cut_prompt_changed(self):
         if self._loading_inspector:
             return
@@ -1752,11 +1753,6 @@ class TimelineTab(QWidget):
             output = str(clip.get("output") or "")
             if not output or not Path(output).is_file():
                 return False, f"{name} has no usable output file."
-            if i > 0 and clip.get("generation_mode") == "continue" and bool((clip.get("settings") or {}).get("glue_results", False)):
-                return False, (
-                    f"{name} has 'Glue result to source' enabled. Timeline assembly expects each block "
-                    "to contain only its own generated section; disable Glue and regenerate that continuation clip."
-                )
         return True, ""
 
     def assemble_timeline(self):
@@ -1875,9 +1871,25 @@ class TimelineTab(QWidget):
         return specs
 
     def generate_selected(self):
+        # Guard this synchronous preparation path. Bridge regeneration can spend a
+        # few seconds extracting the destination frame and preparing queue settings;
+        # repeated clicks must not stack duplicate regeneration requests.
+        if getattr(self, "_regenerate_selected_busy", False):
+            return False
+        self._regenerate_selected_busy = True
+        old_button_text = self.generate_selected_btn.text() if hasattr(self, "generate_selected_btn") else "Regenerate selected block"
+        if hasattr(self, "generate_selected_btn"):
+            self.generate_selected_btn.setEnabled(False)
+            self.generate_selected_btn.setText("Preparing regeneration…")
+        QApplication.processEvents()
+
         clip = self._selected_clip()
         idx = self._selected_index()
         if clip is None or idx < 0:
+            self._regenerate_selected_busy = False
+            if hasattr(self, "generate_selected_btn"):
+                self.generate_selected_btn.setText(old_button_text)
+                self._refresh_edit_workflow(self._selected_clip())
             return False
         if str(clip.get("generation_mode") or "") == "source":
             QMessageBox.information(self, "Timeline edit", "The loaded start clip is a source video, not an H3 generation. Choose another block to regenerate it.")
@@ -1920,23 +1932,39 @@ class TimelineTab(QWidget):
             if str(nxt.get("status") or "") != "finished" or bool(nxt.get("stale")) or not next_output.is_file():
                 QMessageBox.warning(self, "Timeline edit", "The next block must have a valid finished result before its first frame can anchor this replacement.")
                 return False
-        if not callable(self.queue_timeline_callback):
-            QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
-            return False
-        result = self.queue_timeline_callback([spec])
-        if result:
-            self._invalidate_assembly("Selected clip regenerated — assemble again when ready.")
-            # A free-ending continuation changes the boundary consumed by the next
-            # continuation clip. The other three edit modes intentionally preserve
-            # the next block via anchoring or a hard cut.
-            if edit_mode == "continue_previous":
-                for j in range(idx + 1, len(self._clips())):
-                    if self._clips()[j].get("generation_mode") != "continue":
-                        break
-                    if self._clips()[j].get("queue_job_id") or self._clips()[j].get("status") in {"pending", "running", "finished"}:
-                        self._clips()[j]["stale"] = True
-            self._refresh_all()
-        return bool(result)
+        try:
+            if not callable(self.queue_timeline_callback):
+                QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
+                return False
+            try:
+                result = self.queue_timeline_callback([spec])
+            except Exception as exc:
+                QMessageBox.critical(self, "Timeline regeneration failed", f"Could not prepare the selected block for regeneration:\n\n{exc}")
+                return False
+            if result:
+                self._invalidate_assembly("Selected clip regenerated — assemble again when ready.")
+                # A free-ending continuation changes the boundary consumed by the next
+                # continuation clip. The other three edit modes intentionally preserve
+                # the next block via anchoring or a hard cut.
+                if edit_mode == "continue_previous":
+                    for j in range(idx + 1, len(self._clips())):
+                        if self._clips()[j].get("generation_mode") != "continue":
+                            break
+                        if self._clips()[j].get("queue_job_id") or self._clips()[j].get("status") in {"pending", "running", "finished"}:
+                            self._clips()[j]["stale"] = True
+                self._refresh_all()
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Timeline regeneration did not queue",
+                    "The selected block was not added to the queue. Check the MiniMax log for the validation message; no duplicate regeneration request was started.",
+                )
+            return bool(result)
+        finally:
+            self._regenerate_selected_busy = False
+            if hasattr(self, "generate_selected_btn"):
+                self.generate_selected_btn.setText(old_button_text)
+                self._refresh_edit_workflow(self._selected_clip())
 
     def generate_timeline(self):
         ok, error = self.validate_timeline()
@@ -1949,9 +1977,9 @@ class TimelineTab(QWidget):
         result = self.queue_timeline_callback(self.generation_specs())
         if result:
             self.project["assembled_output"] = ""
-            self.project["assembly_status"] = "Waiting for timeline clips to finish…" if self.auto_assemble_check.isChecked() else ""
-            self.project["auto_assemble"] = self.auto_assemble_check.isChecked()
-            self.project["auto_assemble_pending"] = self.auto_assemble_check.isChecked()
+            self.project["assembly_status"] = ""
+            self.project["auto_assemble"] = False
+            self.project["auto_assemble_pending"] = False
             self._refresh_all()
         return bool(result)
 
@@ -2014,9 +2042,9 @@ class TimelineTab(QWidget):
         result = self.queue_timeline_callback(specs)
         if result:
             self.project["assembled_output"] = ""
-            self.project["assembly_status"] = "Waiting for HQ timeline clips to finish…" if self.auto_assemble_check.isChecked() else ""
-            self.project["auto_assemble"] = self.auto_assemble_check.isChecked()
-            self.project["auto_assemble_pending"] = self.auto_assemble_check.isChecked()
+            self.project["assembly_status"] = ""
+            self.project["auto_assemble"] = False
+            self.project["auto_assemble_pending"] = False
             self._refresh_all()
         return bool(result)
 
@@ -2046,8 +2074,3 @@ class TimelineTab(QWidget):
                 clip["output"] = output; changed = True
         if changed:
             self._refresh_all()
-        if self.project.get("auto_assemble_pending"):
-            ready, _reason = self._assembly_ready()
-            if ready:
-                self.project["auto_assemble_pending"] = False
-                self.assemble_timeline()
