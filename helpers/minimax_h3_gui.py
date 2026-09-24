@@ -2948,6 +2948,11 @@ class MainWindow(QMainWindow):
                 timeline_number = int(spec.get("timeline_index", pos) or 0) + 1
                 safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", clip_name).strip("_") or f"clip_{timeline_number:03d}"
                 settings["output_name"] = f"timeline_{timeline_number:03d}_{safe_name}.mp4"
+                project_folder = str(
+                    getattr(self.timeline_widget, "project", {}).get("project_folder") or ""
+                ).strip()
+                if project_folder:
+                    settings["output_folder"] = project_folder
 
                 self.apply_settings(settings)
                 before = len(self.queue_jobs)
@@ -3049,11 +3054,10 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        # Timeline assembly is a user-requested final export. Always put it in the
-        # standalone app's main output folder instead of inheriting the directory
-        # of whichever clip happened to be first on the timeline. This makes the
-        # result predictable and easy to find.
-        out_dir = DEFAULT_OUTPUT_DIR
+        # Keep the final assembled video with the Timeline project. Projects made
+        # before project-folder support fall back to the normal standalone output.
+        project_folder = str((project or {}).get("project_folder") or "").strip()
+        out_dir = Path(project_folder) if project_folder else DEFAULT_OUTPUT_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
         base = self._timeline_safe_name((project or {}).get("name") or "MiniMax Timeline") + "_assembled"
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -637,6 +637,10 @@ class TimelineTab(QWidget):
                 clip["name"] = f"Clip {i}"
 
     def _touch_clip(self, index: int, propagate=True):
+        # The initial startup Timeline intentionally has no project folder yet.
+        # On the first real edit, ask where this project belongs before generation
+        # can continue writing clips to the generic main output directory.
+        self._ensure_project_setup_for_first_edit()
         clips = self._clips()
         if not (0 <= index < len(clips)):
             return
@@ -1136,11 +1140,19 @@ class TimelineTab(QWidget):
             # Autosave must never interrupt generation or editing with a modal error.
             pass
 
-    def _new_project_setup_dialog(self):
+    def _new_project_setup_dialog(self, *, first_edit=False):
         dialog = QDialog(self)
         dialog.setWindowTitle("New timeline project")
         dialog.setMinimumWidth(560)
         layout = QVBoxLayout(dialog)
+
+        if first_edit:
+            intro = QLabel(
+                "You started a new project. Please enter a project name and "
+                "(optional) an output folder."
+            )
+            intro.setWordWrap(True)
+            layout.addWidget(intro)
 
         form = QFormLayout()
         name_edit = QLineEdit()
@@ -1206,6 +1218,45 @@ class TimelineTab(QWidget):
                 QMessageBox.critical(dialog, "Project folder", f"Could not create the project folder:\n{project_folder}\n\n{exc}")
                 continue
             return project_name, project_folder
+
+    def _ensure_project_setup_for_first_edit(self):
+        """Ask for project identity the first time the startup Timeline is edited.
+
+        Pressing New already performs this setup. This guard exists for the common
+        case where the user starts editing the default Timeline immediately after
+        opening the app.
+        """
+        current_folder = str(self.project.get("project_folder") or "").strip()
+        if current_folder:
+            return True
+
+        setup = self._new_project_setup_dialog(first_edit=True)
+        if setup is None:
+            return False
+
+        project_name, project_folder = setup
+        self.project["name"] = project_name
+        self.project["project_folder"] = str(project_folder)
+
+        # Keep the recovery file in output/timeline/ as requested. Only its content
+        # changes to reflect the newly named project.
+        try:
+            self._write_project_json(self._autosave_temp_path)
+        except Exception:
+            pass
+
+        # Refresh the visible project name without turning the programmatic update
+        # into another user edit.
+        if hasattr(self, "project_name"):
+            self.project_name.blockSignals(True)
+            try:
+                self.project_name.setText(project_name)
+            finally:
+                self.project_name.blockSignals(False)
+        self.summary_label.setToolTip(
+            f"Project folder: {project_folder}\nRecovery: {self._autosave_temp_path}"
+        )
+        return True
 
     def new_project(self):
         # If the current Timeline contains work, make the close decision explicit.
@@ -1389,6 +1440,8 @@ class TimelineTab(QWidget):
 
     # ------------------------------------------------------------- clip actions
     def add_clip(self):
+        if not self._ensure_project_setup_for_first_edit():
+            return
         clips = self._clips()
         idx = self._selected_index()
         insert_at = len(clips) if idx < 0 else idx + 1
@@ -1406,6 +1459,8 @@ class TimelineTab(QWidget):
         self._refresh_all()
 
     def duplicate_clip(self):
+        if not self._ensure_project_setup_for_first_edit():
+            return
         idx = self._selected_index()
         if idx < 0: return
         if str(self._clips()[idx].get("generation_mode") or "") == "source":
@@ -1862,6 +1917,8 @@ class TimelineTab(QWidget):
 
     def use_current_generation_settings(self):
         """Apply one Generation-tab snapshot globally without touching Timeline content/duration."""
+        if not self._ensure_project_setup_for_first_edit():
+            return False
         settings = self._timeline_global_settings()
         if not settings:
             QMessageBox.warning(self, "Timeline settings", "No Generation-tab settings were available to capture.")
@@ -2041,6 +2098,8 @@ class TimelineTab(QWidget):
         return specs
 
     def generate_selected(self):
+        if not self._ensure_project_setup_for_first_edit():
+            return False
         # Guard this synchronous preparation path. Bridge regeneration can spend a
         # few seconds extracting the destination frame and preparing queue settings;
         # repeated clicks must not stack duplicate regeneration requests.
@@ -2137,6 +2196,8 @@ class TimelineTab(QWidget):
                 self._refresh_edit_workflow(self._selected_clip())
 
     def generate_timeline(self):
+        if not self._ensure_project_setup_for_first_edit():
+            return False
         ok, error = self.validate_timeline()
         if not ok:
             QMessageBox.warning(self, "Timeline not ready", error)
@@ -2161,6 +2222,8 @@ class TimelineTab(QWidget):
         9:16 or 1:1 project stays in that orientation. Explicit 21:9 choices force
         21:9 because those entries already describe their complete output shape.
         """
+        if not self._ensure_project_setup_for_first_edit():
+            return False
         ok, error = self.validate_timeline()
         if not ok:
             QMessageBox.warning(self, "Timeline not ready", error)

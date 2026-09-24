@@ -14,6 +14,31 @@ from runtime import vram_manager as _vram_manager_module
 
 _EXPECTED_VRAM_SIGNATURE = "V11_5_EXTREME_DIFFUSION_SAFE_20260826A"
 
+def _prune_orphan_isolated_dirs(parent: Path, prefixes=("h3_isolated_", "h3_ref_isolated_")) -> int:
+    """Best-effort removal of leftover empty isolated worker folders."""
+    parent = Path(parent)
+    if not parent.is_dir():
+        return 0
+    removed = 0
+    for child in parent.iterdir():
+        try:
+            if not child.is_dir() or not any(child.name.startswith(prefix) for prefix in prefixes):
+                continue
+            try:
+                next(child.iterdir())
+                continue
+            except StopIteration:
+                pass
+            child.rmdir()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    if removed:
+        print(f"[CLEANUP] Removed {removed} empty isolated worker folder(s) from {parent}", flush=True)
+    return removed
+
 def _verify_vram_runtime():
     actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
     if actual != _EXPECTED_VRAM_SIGNATURE:
@@ -29,6 +54,8 @@ def _verify_vram_runtime():
 def main():
     import os, sys, tempfile, subprocess, shutil, time
     from runtime.ffmpeg_tools import ensure_ffmpeg_tools, tool_path
+
+    _prune_orphan_isolated_dirs(ROOT / "output")
 
     ap = argparse.ArgumentParser(description="MiniMax-H3 W4A8 ConvRot standalone generator")
     ap.add_argument("--prompt", default="A cinematic red sports car races through rain-soaked neon streets at night, dynamic tracking camera, realistic reflections and natural engine sound.")
