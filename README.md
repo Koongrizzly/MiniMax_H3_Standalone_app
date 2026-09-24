@@ -18,13 +18,18 @@ It supports :
 - 09/13/26 :
 
   Added support for several int8 models, including the singularity & SparseRef15_Hybrid checkpoints.
-  Slower but better quality, More choice between speed and quality while still trying to make it work on most RTX gpu cards.
+  More choice between speed and quality while still trying to make it work on most RTX gpu cards.
   download these checkpoints wherever you want and load them directly for use in the app. 
 
-  Added support for Sol attention and SLA attention, (only 1 has effect at the same time, i like SLA more, faster and better quality in the test runs that i did)
+  Added support for Sol attention and SLA attention, (only 1 has effect at the same time)
 
   Best quality/speed combination i found : use included speedup lora (use BETA instead of SIMPLE Scheduler for this particular lora) at 10 instead of 4 steps, activate SLA attention + Spectrum forecast in the settings, speed will be almost as fast as using 4 or 6 steps but quality is better.
+
   
+- 08/17/26 : added support for the hybrid models (INT4/W4A8)
+  Folder location now has a toggle 'use hybrid model' and the installer now has option to download the hybrid model.
+  Re-run the installer if you already have the app installed. You can also download the model yourself and simply load it in   the app.
+
   
 - 08/16/26: imported the Framevision music clip creator and converted it for use with MiniMax H3
   
@@ -35,13 +40,8 @@ It supports :
   shotlist creator/director/review tab and much more.
  
   Add an idea, extra details, camera shots, location(s) in the idea tab and a music track and click start
-  to create a full music videoclips with the click of a button.
+  to create a full music videoclip with the click of a button.
   
-  
-- 08/17/26 : added support for the hybrid models (INT4/W4A8)
-  Folder location now has a toggle 'use hybrid model' and the installer now has option to download the hybrid model.
-  Re-run the installer if you already have the app installed. You can also download the model yourself and simply load it in   the app.
-
 
 - Text → video + audio (T2VA)
 
