@@ -46,7 +46,7 @@ FPS = 24.0
 MIN_SEGMENT_SECONDS = 0.3
 # Backward-compatible internal alias; project JSON still uses the existing "segments" key.
 MIN_CUT_SECONDS = MIN_SEGMENT_SECONDS
-TIMELINE_SCHEMA_VERSION = 1
+TIMELINE_SCHEMA_VERSION = 2
 
 
 def _safe_project_name(text: str) -> str:
@@ -826,7 +826,7 @@ class TimelineTab(QWidget):
         self.edit_scroll.setWidget(edit_scroll_contents)
         edit_outer.addWidget(self.edit_scroll, 0)
 
-        self.generate_selected_btn = QPushButton("Regenerate selected block")
+        self.generate_selected_btn = QPushButton("(Re)generate selected block")
         self.generate_selected_btn.setFixedHeight(36)
         self.generate_selected_btn.setToolTip("Regenerate only the selected block using the replacement continuity mode selected above.")
         edit_outer.addWidget(self.generate_selected_btn, 0)
@@ -1384,7 +1384,8 @@ class TimelineTab(QWidget):
             if not isinstance(data, dict) or not isinstance(data.get("clips"), list):
                 raise ValueError("File does not contain a MiniMax timeline project.")
             self.project = data
-            self.project.setdefault("schema_version", TIMELINE_SCHEMA_VERSION)
+            loaded_schema_version = int(self.project.get("schema_version") or 1)
+            self.project["schema_version"] = TIMELINE_SCHEMA_VERSION
             self.project.setdefault("project_id", uuid.uuid4().hex)
             self.project.setdefault("name", Path(name).stem)
             self.project.setdefault("project_folder", str(Path(name).parent))
@@ -1431,6 +1432,43 @@ class TimelineTab(QWidget):
                 if len(clip["segments"]) > 1:
                     merged_prompt = _compiled_prompt(clip)
                     clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": merged_prompt, "weight": 1.0}]
+
+            # Schema v1 could accidentally persist every rendered continuation clip
+            # as stale after deleting an unrelated final clip. There was no stale
+            # reason/fingerprint in that schema, so those saved flags cannot be
+            # distinguished from a real edit after reload. Recover the specific
+            # legacy "mass stale continuation chain" signature once:
+            #   - Clip 1 is still valid
+            #   - every rendered continuation clip from Clip 2 onward is stale
+            #   - every one of those clips still has its rendered output on disk
+            # This is the exact state produced by the old delete-last-clip bug.
+            if loaded_schema_version < 2:
+                clips = self._clips()
+                rendered_continuations = [
+                    c for c in clips[1:]
+                    if str(c.get("generation_mode") or "") == "continue"
+                    and str(c.get("status") or "") == "finished"
+                    and str(c.get("output") or "").strip()
+                ]
+                legacy_mass_stale = bool(rendered_continuations)
+                if clips and bool(clips[0].get("stale")):
+                    legacy_mass_stale = False
+                if legacy_mass_stale:
+                    for c in rendered_continuations:
+                        out_path = Path(str(c.get("output") or "")).expanduser()
+                        if not bool(c.get("stale")) or not out_path.is_file():
+                            legacy_mass_stale = False
+                            break
+                if legacy_mass_stale:
+                    for c in rendered_continuations:
+                        c["stale"] = False
+                    self.project["assembly_status"] = ""
+                    print(
+                        f"[TIMELINE] Recovered {len(rendered_continuations)} legacy stale "
+                        "continuation clip(s) from the old delete-last-clip bug.",
+                        flush=True,
+                    )
+
             self._project_path = Path(name)
             self.selected_clip_id = self._clips()[0]["id"] if self._clips() else None
             self.selected_cut_index = 0
@@ -1491,7 +1529,12 @@ class TimelineTab(QWidget):
         else:
             self.selected_clip_id = None
         self.selected_cut_index = 0
-        self._repair_continuation_chain(mark_stale=True)
+        # Deleting a clip only changes the continuation boundary at the deletion
+        # point and after it. Clips before that point keep exactly the same source
+        # video/latent history and must remain valid. Deleting the final clip
+        # therefore invalidates nothing.
+        stale_from = idx if idx < len(self._clips()) else None
+        self._repair_continuation_chain(mark_stale=True, stale_from=stale_from)
         self._refresh_all()
 
     def move_clip(self, delta):
@@ -1508,15 +1551,31 @@ class TimelineTab(QWidget):
             return
         item = clips.pop(old); clips.insert(new, item)
         self._invalidate_assembly()
-        self._repair_continuation_chain(mark_stale=True)
+        # Reordering only changes continuation ancestry starting at the earliest
+        # position involved in the move. Earlier rendered clips stay valid.
+        self._repair_continuation_chain(mark_stale=True, stale_from=min(old, new))
         self._refresh_all()
 
-    def _repair_continuation_chain(self, mark_stale=False):
+    def _repair_continuation_chain(self, mark_stale=False, stale_from=None):
+        """Repair impossible continuation topology without invalidating unrelated clips.
+
+        ``stale_from`` is the first index whose incoming continuation boundary may
+        have changed. Previously this routine marked every rendered continuation
+        clip stale, which meant deleting Clip 10 incorrectly invalidated Clips 2-9.
+        """
         for i, clip in enumerate(self._clips()):
             if i == 0 and clip.get("generation_mode") == "continue":
                 clip["generation_mode"] = "new"
-                if mark_stale: clip["stale"] = True
-            elif mark_stale and clip.get("generation_mode") == "continue" and clip.get("queue_job_id"):
+                if mark_stale:
+                    clip["stale"] = True
+                continue
+
+            if not mark_stale or stale_from is None or i < int(stale_from):
+                continue
+
+            if clip.get("generation_mode") == "continue" and (
+                clip.get("queue_job_id") or clip.get("status") in {"pending", "running", "finished"}
+            ):
                 clip["stale"] = True
 
     def select_clip(self, clip_id):
