@@ -10,6 +10,11 @@
 
 It supports :
 
+- 09/24/26 :
+  
+  Timeline director
+  create long videos with the help of the timeline director.
+
 - 09/13/26 :
 
   Added support for several int8 models, including the singularity & SparseRef15_Hybrid checkpoints.
