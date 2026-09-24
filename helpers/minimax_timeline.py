@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QSlider,
     QInputDialog,
+    QDialog,
+    QDialogButtonBox,
     QApplication,
 )
 
@@ -492,14 +494,20 @@ class TimelineTab(QWidget):
         self.selected_cut_index = 0
         self._loading_inspector = False
         self._project_path: Path | None = None
+
+        # Timeline recovery paths must exist before _build_ui/_refresh_all because
+        # the summary tooltip already refers to the recovery location during the
+        # first refresh at startup.
+        module_dir = Path(__file__).resolve().parent
+        app_root = module_dir.parent if module_dir.name.lower() == "helpers" else module_dir
+        self._timeline_root = app_root / "output" / "timeline"
+        self._timeline_root.mkdir(parents=True, exist_ok=True)
+        self._autosave_temp_path = self._timeline_root / "minimax_timeline_autosave_temp.json"
+
         self._build_ui()
         self._ensure_initial_clip()
         self._refresh_all(select_first=True)
 
-        # Autosave timeline projects once per minute. Before the user chooses a
-        # project file, keep a quiet recovery copy next to this module; after a
-        # normal Save/Load establishes a project path, autosave writes there.
-        self._autosave_temp_path = Path(__file__).resolve().parent / "minimax_timeline_autosave_temp.json"
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setInterval(60_000)
         self._autosave_timer.timeout.connect(self._autosave_project)
@@ -511,6 +519,7 @@ class TimelineTab(QWidget):
             "schema_version": TIMELINE_SCHEMA_VERSION,
             "project_id": uuid.uuid4().hex,
             "name": "MiniMax Timeline",
+            "project_folder": "",
             "clips": [],
             "assembled_output": "",
             "assembly_status": "",
@@ -978,7 +987,10 @@ class TimelineTab(QWidget):
             "Join the finished timeline clip outputs, in timeline order, into one final MP4."
             if ready else reason
         )
-        self.summary_label.setToolTip(str(self._project_path) if self._project_path else "Autosaving to temporary timeline JSON until you choose Save.")
+        self.summary_label.setToolTip(
+            str(self._project_path) if self._project_path
+            else f"Autosaving recovery project to {self._autosave_temp_path}"
+        )
         self.canvas.set_clips(self._clips(), self.selected_clip_id)
         self._load_inspector()
 
@@ -1124,15 +1136,132 @@ class TimelineTab(QWidget):
             # Autosave must never interrupt generation or editing with a modal error.
             pass
 
+    def _new_project_setup_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("New timeline project")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+
+        form = QFormLayout()
+        name_edit = QLineEdit()
+        name_edit.setText("MiniMax Timeline")
+        name_edit.selectAll()
+
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.setSpacing(6)
+        folder_edit = QLineEdit()
+        folder_edit.setPlaceholderText(
+            f"Leave empty for {self._timeline_root / '<project name>'}"
+        )
+        browse_btn = QPushButton("Browse…")
+
+        def browse_folder():
+            start_dir = folder_edit.text().strip() or str(self._timeline_root)
+            chosen = QFileDialog.getExistingDirectory(
+                dialog, "Choose timeline project folder", start_dir
+            )
+            if chosen:
+                folder_edit.setText(chosen)
+
+        browse_btn.clicked.connect(browse_folder)
+        folder_layout.addWidget(folder_edit, 1)
+        folder_layout.addWidget(browse_btn)
+        form.addRow("Project name:", name_edit)
+        form.addRow("Project folder:", folder_row)
+        layout.addLayout(form)
+
+        note = QLabel(
+            f"Project folders start from {self._timeline_root}. "
+            "If Project folder is left empty, a folder named after the project is created there automatically."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        while True:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            project_name = str(name_edit.text() or "").strip()
+            if not project_name:
+                QMessageBox.warning(dialog, "Project name required", "Enter a name for the new timeline project.")
+                continue
+            folder_text = str(folder_edit.text() or "").strip()
+            if folder_text:
+                project_folder = Path(folder_text).expanduser()
+                if not project_folder.is_absolute():
+                    project_folder = self._timeline_root / project_folder
+            else:
+                project_folder = self._timeline_root / _safe_project_name(project_name)
+            try:
+                project_folder.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Project folder", f"Could not create the project folder:\n{project_folder}\n\n{exc}")
+                continue
+            return project_name, project_folder
+
     def new_project(self):
-        if self._clips() and any(str(s.get("prompt") or "").strip() for c in self._clips() for s in c.get("segments") or []):
-            if QMessageBox.question(self, "New timeline", "Clear the current timeline and start a new project?") != QMessageBox.StandardButton.Yes:
+        # If the current Timeline contains work, make the close decision explicit.
+        # Save Before Close never discards the recovery copy unless the real save
+        # completed successfully; Cancel leaves the current project untouched.
+        has_content = bool(self._clips()) and (
+            len(self._clips()) > 1
+            or any(str(s.get("prompt") or "").strip() for c in self._clips() for s in c.get("segments") or [])
+            or any(str(c.get("output") or "").strip() for c in self._clips())
+        )
+        if has_content:
+            box = QMessageBox(self)
+            box.setWindowTitle("New timeline")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText("Close the current timeline and start a new project?")
+            box.setInformativeText("Save the current project first or discard it.")
+            save_btn = box.addButton("Save before close", QMessageBox.ButtonRole.AcceptRole)
+            discard_btn = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+            cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is cancel_btn or clicked is None:
                 return
+            if clicked is save_btn:
+                if not self.save_project():
+                    return
+            elif clicked is not discard_btn:
+                return
+
+        setup = self._new_project_setup_dialog()
+        if setup is None:
+            return
+        project_name, project_folder = setup
+
+        # The previous recovery file belongs to the project being closed. Once the
+        # user has explicitly saved or discarded it, remove it before starting a
+        # fresh recovery stream for the new project.
+        try:
+            if self._autosave_temp_path.exists():
+                self._autosave_temp_path.unlink()
+        except Exception:
+            pass
+
         self.project = self._new_project_data()
+        self.project["name"] = project_name
+        self.project["project_folder"] = str(project_folder)
         self._project_path = None
         self.selected_clip_id = None
         self.selected_cut_index = 0
         self._ensure_initial_clip()
+        # Write the first recovery snapshot immediately; subsequent autosaves keep
+        # updating the same file under output/timeline/.
+        try:
+            self._write_project_json(self._autosave_temp_path)
+        except Exception:
+            pass
         self._refresh_all(select_first=True)
 
     def save_project(self):
@@ -1147,7 +1276,9 @@ class TimelineTab(QWidget):
         )
 
         if needs_destination:
-            suggested = _safe_project_name(self.project.get("name")).replace(" ", "_") + ".json"
+            suggested_name = _safe_project_name(self.project.get("name")).replace(" ", "_") + ".json"
+            project_folder = str(self.project.get("project_folder") or "").strip()
+            suggested = str((Path(project_folder) if project_folder else self._timeline_root) / suggested_name)
             name, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save MiniMax timeline",
@@ -1156,7 +1287,7 @@ class TimelineTab(QWidget):
             )
             if not name:
                 # User cancelled: keep the recovery autosave untouched.
-                return
+                return False
             chosen_path = Path(name)
         else:
             chosen_path = current_path
@@ -1167,10 +1298,11 @@ class TimelineTab(QWidget):
                 raise OSError(f"Timeline save did not create the requested file:\n{chosen_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Save timeline failed", str(exc))
-            return
+            return False
 
         # Only now commit the real project path.
         self._project_path = chosen_path
+        self.project["project_folder"] = str(chosen_path.parent)
 
         # Delete the temporary recovery copy only after a distinct real save file
         # definitely exists. If cleanup fails, leave it in place; an extra recovery
@@ -1190,6 +1322,7 @@ class TimelineTab(QWidget):
             "Timeline saved",
             f"Timeline project saved to:\n{self._project_path}",
         )
+        return True
 
     def load_project(self):
         name, _ = QFileDialog.getOpenFileName(self, "Load MiniMax timeline", "", "MiniMax Timeline (*.json);;JSON (*.json)")
@@ -1203,6 +1336,7 @@ class TimelineTab(QWidget):
             self.project.setdefault("schema_version", TIMELINE_SCHEMA_VERSION)
             self.project.setdefault("project_id", uuid.uuid4().hex)
             self.project.setdefault("name", Path(name).stem)
+            self.project.setdefault("project_folder", str(Path(name).parent))
             self.project.setdefault("assembled_output", "")
             self.project.setdefault("assembly_status", "")
             self.project["auto_assemble"] = False
