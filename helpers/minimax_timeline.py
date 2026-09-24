@@ -646,6 +646,7 @@ class TimelineTab(QWidget):
             return
         clip = clips[index]
         self._invalidate_assembly()
+        clip.pop("_preserve_downstream_on_finish", None)
         if clip.get("queue_job_id") or clip.get("status") in {"pending", "running", "finished"}:
             clip["stale"] = True
         # Edit topology determines whether the already-rendered next block is
@@ -2025,11 +2026,86 @@ class TimelineTab(QWidget):
         self._touch_clip(idx)
         self.canvas.update()
 
+    def _accept_preserved_downstream_chain(self, anchor_index: int) -> int:
+        """Accept the already-rendered chain after an anchored replacement.
+
+        bridge_both / anchor_next deliberately regenerate one clip *toward* the
+        existing next clip. Once that replacement has actually finished, the
+        existing next result and its unchanged continuation chain are valid
+        again and must not remain stale just because an earlier delete/recreate
+        operation marked them so.
+        """
+        clips = self._clips()
+        if not (0 <= int(anchor_index) < len(clips) - 1):
+            return 0
+        anchor_clip = clips[int(anchor_index)]
+        if str(anchor_clip.get("edit_mode") or "") not in {"bridge_both", "anchor_next"}:
+            return 0
+        if str(anchor_clip.get("status") or "") != "finished":
+            return 0
+        anchor_output = Path(str(anchor_clip.get("output") or ""))
+        if not anchor_output.is_file():
+            return 0
+
+        cleared = 0
+        for j in range(int(anchor_index) + 1, len(clips)):
+            downstream = clips[j]
+            if j > int(anchor_index) + 1 and str(downstream.get("generation_mode") or "") != "continue":
+                break
+            output = Path(str(downstream.get("output") or ""))
+            if str(downstream.get("status") or "") != "finished" or not output.is_file():
+                break
+            if bool(downstream.get("stale")):
+                downstream["stale"] = False
+                cleared += 1
+        return cleared
+
+    def _recover_old_anchor_preserve_state(self) -> int:
+        """Recover projects made before preserve-on-finish was recorded.
+
+        Older builds could regenerate Clip N toward the already-existing
+        Clip N+1 correctly, but leave Clip N+1.. stale forever.  A strong
+        signature is that the anchored replacement's output is newer than the
+        preserved next clip's output.  Recover that already-rendered chain once
+        so the user does not have to regenerate it again just to assemble.
+        """
+        clips = self._clips()
+        total = 0
+        for i in range(len(clips) - 1):
+            clip = clips[i]
+            nxt = clips[i + 1]
+            if str(clip.get("edit_mode") or "") not in {"bridge_both", "anchor_next"}:
+                continue
+            if str(clip.get("status") or "") != "finished" or str(nxt.get("status") or "") != "finished":
+                continue
+            if not bool(nxt.get("stale")):
+                continue
+            cur_out = Path(str(clip.get("output") or ""))
+            next_out = Path(str(nxt.get("output") or ""))
+            if not cur_out.is_file() or not next_out.is_file():
+                continue
+            try:
+                # The preserved target existed first; the replacement was
+                # rendered afterwards specifically to meet it.
+                if cur_out.stat().st_mtime + 0.001 < next_out.stat().st_mtime:
+                    continue
+            except OSError:
+                continue
+            cleared = self._accept_preserved_downstream_chain(i)
+            if cleared:
+                total += cleared
+                clip["_anchor_preserve_recovered"] = True
+        if total:
+            print(f"[TIMELINE] Recovered {total} preserved finished clip(s) from obsolete stale state.", flush=True)
+        return total
+
     # --------------------------------------------------------------- results
     def _assembly_ready(self):
         clips = self._clips()
         if not clips:
             return False, "Timeline has no clips."
+        if self._recover_old_anchor_preserve_state():
+            self._refresh_all()
         for i, clip in enumerate(clips):
             name = str(clip.get("name") or f"Clip {i + 1}")
             if clip.get("stale"):
@@ -2159,87 +2235,158 @@ class TimelineTab(QWidget):
     def generate_selected(self):
         if not self._ensure_project_setup_for_first_edit():
             return False
-        # Guard this synchronous preparation path. Bridge regeneration can spend a
-        # few seconds extracting the destination frame and preparing queue settings;
-        # repeated clicks must not stack duplicate regeneration requests.
+
+        # Guard this synchronous preparation path. Whatever happens after the
+        # button enters "Preparing regeneration…", the finally block below must
+        # restore it. Validation warnings and queue-preparation failures used to
+        # return early before cleanup, leaving Timeline permanently locked until
+        # the app was restarted.
         if getattr(self, "_regenerate_selected_busy", False):
             return False
         self._regenerate_selected_busy = True
-        old_button_text = self.generate_selected_btn.text() if hasattr(self, "generate_selected_btn") else "Regenerate selected block"
+        old_button_text = self.generate_selected_btn.text() if hasattr(self, "generate_selected_btn") else "(Re)generate selected block"
         if hasattr(self, "generate_selected_btn"):
             self.generate_selected_btn.setEnabled(False)
             self.generate_selected_btn.setText("Preparing regeneration…")
         QApplication.processEvents()
 
-        clip = self._selected_clip()
-        idx = self._selected_index()
-        if clip is None or idx < 0:
-            self._regenerate_selected_busy = False
-            if hasattr(self, "generate_selected_btn"):
-                self.generate_selected_btn.setText(old_button_text)
-                self._refresh_edit_workflow(self._selected_clip())
-            return False
-        if str(clip.get("generation_mode") or "") == "source":
-            QMessageBox.information(self, "Timeline edit", "The loaded start clip is a source video, not an H3 generation. Choose another block to regenerate it.")
-            return False
-        prompt = _compiled_prompt(clip)
-        if not prompt:
-            QMessageBox.warning(self, "Timeline not ready", "The selected clip has no prompt.")
-            return False
-        if int(clip.get("frames") or 0) not in self.frame_values:
-            QMessageBox.warning(self, "Timeline not ready", "The selected clip has an invalid H3 frame count.")
-            return False
-        specs = self.generation_specs()
-        spec = specs[idx]
-        spec["timeline_single_regeneration"] = True
-        edit_mode = str(clip.get("edit_mode") or ("continue_previous" if clip.get("generation_mode") == "continue" else "standalone"))
-        use_previous = edit_mode in {"bridge_both", "continue_previous"}
-        use_next = edit_mode in {"bridge_both", "anchor_next"}
-        if bool(clip.get("use_reference_images", False)) and use_previous:
-            QMessageBox.warning(self, "Timeline edit", "Reference images use Ref2VA and cannot continue from the previous block. Choose a non-previous edit mode.")
-            return False
-        spec["edit_mode"] = edit_mode
-        spec["generation_mode"] = "continue" if use_previous else "new"
-        spec["match_next_first_frame"] = bool(use_next)
-
-        if use_previous:
-            if idx == 0:
-                QMessageBox.warning(self, "Timeline edit", "This replacement mode needs a previous block, but the selected block is first.")
-                return False
-            prev = self._clips()[idx - 1]
-            prev_output = Path(str(prev.get("output") or ""))
-            if str(prev.get("status") or "") != "finished" or bool(prev.get("stale")) or not prev_output.is_file():
-                QMessageBox.warning(self, "Timeline edit", "The previous block must have a valid finished result before this replacement can continue from it.")
-                return False
-        if use_next:
-            if idx + 1 >= len(self._clips()):
-                QMessageBox.warning(self, "Timeline edit", "This replacement mode needs a next block, but the selected block is last.")
-                return False
-            nxt = self._clips()[idx + 1]
-            next_output = Path(str(nxt.get("output") or ""))
-            if str(nxt.get("status") or "") != "finished" or bool(nxt.get("stale")) or not next_output.is_file():
-                QMessageBox.warning(self, "Timeline edit", "The next block must have a valid finished result before its first frame can anchor this replacement.")
-                return False
         try:
+            clip = self._selected_clip()
+            idx = self._selected_index()
+            if clip is None or idx < 0:
+                return False
+
+            if str(clip.get("generation_mode") or "") == "source":
+                QMessageBox.information(
+                    self,
+                    "Timeline edit",
+                    "The loaded start clip is a source video, not an H3 generation. Choose another block to regenerate it.",
+                )
+                return False
+
+            prompt = _compiled_prompt(clip)
+            if not prompt:
+                QMessageBox.warning(self, "Timeline not ready", "The selected clip has no prompt.")
+                return False
+            if int(clip.get("frames") or 0) not in self.frame_values:
+                QMessageBox.warning(self, "Timeline not ready", "The selected clip has an invalid H3 frame count.")
+                return False
+
+            specs = self.generation_specs()
+            spec = specs[idx]
+            spec["timeline_single_regeneration"] = True
+            edit_mode = str(
+                clip.get("edit_mode")
+                or ("continue_previous" if clip.get("generation_mode") == "continue" else "standalone")
+            )
+            use_previous = edit_mode in {"bridge_both", "continue_previous"}
+            use_next = edit_mode in {"bridge_both", "anchor_next"}
+
+            if bool(clip.get("use_reference_images", False)) and use_previous:
+                QMessageBox.warning(
+                    self,
+                    "Timeline edit",
+                    "Reference images use Ref2VA and cannot continue from the previous block. Choose a non-previous edit mode.",
+                )
+                return False
+
+            spec["edit_mode"] = edit_mode
+            spec["generation_mode"] = "continue" if use_previous else "new"
+            spec["match_next_first_frame"] = bool(use_next)
+
+            if use_previous:
+                if idx == 0:
+                    QMessageBox.warning(
+                        self,
+                        "Timeline edit",
+                        "This replacement mode needs a previous block, but the selected block is first.",
+                    )
+                    return False
+                prev = self._clips()[idx - 1]
+                prev_output = Path(str(prev.get("output") or ""))
+                if (
+                    str(prev.get("status") or "") != "finished"
+                    or bool(prev.get("stale"))
+                    or not prev_output.is_file()
+                ):
+                    QMessageBox.warning(
+                        self,
+                        "Timeline edit",
+                        "The previous block must have a valid finished result before this replacement can continue from it.",
+                    )
+                    return False
+
+            if use_next:
+                if idx + 1 >= len(self._clips()):
+                    QMessageBox.warning(
+                        self,
+                        "Timeline edit",
+                        "This replacement mode needs a next block, but the selected block is last.",
+                    )
+                    return False
+                nxt = self._clips()[idx + 1]
+                next_output = Path(str(nxt.get("output") or ""))
+
+                # A next block used only as an END ANCHOR does not need to be
+                # current in the continuation chain. Deleting/recreating earlier
+                # clips may legitimately mark it stale, but its saved first frame
+                # is still a perfectly valid visual destination. Require only an
+                # existing finished result file here.
+                if str(nxt.get("status") or "") != "finished" or not next_output.is_file():
+                    QMessageBox.warning(
+                        self,
+                        "Timeline edit",
+                        "The next block must have a finished result file before its first frame can anchor this replacement.",
+                    )
+                    return False
+
             if not callable(self.queue_timeline_callback):
                 QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
                 return False
+
             try:
                 result = self.queue_timeline_callback([spec])
             except Exception as exc:
-                QMessageBox.critical(self, "Timeline regeneration failed", f"Could not prepare the selected block for regeneration:\n\n{exc}")
+                QMessageBox.critical(
+                    self,
+                    "Timeline regeneration failed",
+                    f"Could not prepare the selected block for regeneration:\n\n{exc}",
+                )
                 return False
+
             if result:
                 self._invalidate_assembly("Selected clip regenerated — assemble again when ready.")
-                # A free-ending continuation changes the boundary consumed by the next
-                # continuation clip. The other three edit modes intentionally preserve
-                # the next block via anchoring or a hard cut.
+
+                # A free-ending continuation changes the boundary consumed by the
+                # next continuation clip, so downstream continuation results really
+                # do become stale.
                 if edit_mode == "continue_previous":
                     for j in range(idx + 1, len(self._clips())):
                         if self._clips()[j].get("generation_mode") != "continue":
                             break
-                        if self._clips()[j].get("queue_job_id") or self._clips()[j].get("status") in {"pending", "running", "finished"}:
+                        if (
+                            self._clips()[j].get("queue_job_id")
+                            or self._clips()[j].get("status") in {"pending", "running", "finished"}
+                        ):
                             self._clips()[j]["stale"] = True
+
+                # bridge_both / anchor_next are specifically chosen to PRESERVE the
+                # existing next clip by targeting its exact first frame. If that
+                # next clip was marked stale only because an earlier clip was
+                # deleted/recreated, keeping that stale flag defeats the whole point
+                # of the anchored replacement and makes Assemble Video demand an
+                # unnecessary re-render.
+                #
+                # The next clip's output is not changed here. Once it is accepted as
+                # the destination anchor, its outgoing boundary is also unchanged, so
+                # an existing contiguous finished continuation chain after it remains
+                # valid as well. Clear only clips that still have real finished files.
+                elif edit_mode in {"bridge_both", "anchor_next"}:
+                    # Do not decide this at queue time. The replacement still
+                    # has to render successfully. sync_queue_jobs() will clear
+                    # the preserved chain when this clip reaches "finished".
+                    clip["_preserve_downstream_on_finish"] = True
+
                 self._refresh_all()
             else:
                 QMessageBox.warning(
@@ -2248,6 +2395,7 @@ class TimelineTab(QWidget):
                     "The selected block was not added to the queue. Check the MiniMax log for the validation message; no duplicate regeneration request was started.",
                 )
             return bool(result)
+
         finally:
             self._regenerate_selected_busy = False
             if hasattr(self, "generate_selected_btn"):
@@ -2353,16 +2501,31 @@ class TimelineTab(QWidget):
     def sync_queue_jobs(self, jobs):
         by_id = {str(j.get("id")): j for j in (jobs or []) if j.get("id")}
         changed = False
-        for clip in self._clips():
+        clips = self._clips()
+        for idx, clip in enumerate(clips):
             job_id = clip.get("queue_job_id")
             if not job_id or str(job_id) not in by_id:
                 continue
             job = by_id[str(job_id)]
             state = str(job.get("state") or "pending")
-            if clip.get("status") != state:
+            previous_state = str(clip.get("status") or "")
+            if previous_state != state:
                 clip["status"] = state; changed = True
             output = str(job.get("output") or "")
             if output and clip.get("output") != output:
                 clip["output"] = output; changed = True
+
+            if state == "finished" and bool(clip.get("_preserve_downstream_on_finish")):
+                clip.pop("_preserve_downstream_on_finish", None)
+                cleared = self._accept_preserved_downstream_chain(idx)
+                if cleared:
+                    print(
+                        f"[TIMELINE] Anchored replacement finished; preserved {cleared} existing downstream clip(s).",
+                        flush=True,
+                    )
+                    changed = True
+            elif state in {"failed", "cancelled", "canceled"}:
+                clip.pop("_preserve_downstream_on_finish", None)
+
         if changed:
             self._refresh_all()
