@@ -2967,15 +2967,15 @@ class MainWindow(QMainWindow):
                 job["timeline_clip_id"] = clip_id
                 job["timeline_clip_index"] = pos
                 job["timeline_clip_name"] = clip_name
-                created.append((clip_id, job.get("id"), job.get("output", "")))
+                created.append((clip_id, job.get("id"), job.get("output", ""), job))
 
             # Add timeline metadata to persisted queue state after every generated
             # job has been tagged.
             self._save_queue_state()
             self._refresh_queue_views()
-            for clip_id, job_id, output in created:
+            for clip_id, job_id, output, job_info in created:
                 if getattr(self, "timeline_widget", None) is not None:
-                    self.timeline_widget.mark_queued(clip_id, job_id, output)
+                    self.timeline_widget.mark_queued(clip_id, job_id, output, job_info)
             source_count = sum(1 for spec in specs if str(spec.get("generation_mode") or "") == "source")
             suffix = f" + {source_count} loaded start clip" if source_count == 1 else (f" + {source_count} loaded start clips" if source_count else "")
             self.status.setText(f"Timeline queued: {len(created)} H3 clip(s){suffix}")
@@ -3077,20 +3077,57 @@ class MainWindow(QMainWindow):
         def ffconcat_path(path):
             return str(path.resolve()).replace("\\", "/").replace("'", "\\'")
 
-        concat_path.write_text(
-            "".join(f"file '{ffconcat_path(path)}'\n" for path in outputs),
-            encoding="utf-8",
-        )
+        # The timeline trimmer is non-destructive: in/out points live only in
+        # project JSON.  ffconcat supports per-file inpoint/outpoint directives,
+        # so assembly can honor those ranges without creating trimmed source files.
+        concat_lines = []
+        has_trim = False
+        for clip, path in zip(clips, outputs):
+            concat_lines.append(f"file '{ffconcat_path(path)}'\n")
+            try:
+                trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
+            except Exception:
+                trim_in = 0.0
+            raw_out = clip.get("trim_out")
+            try:
+                trim_out = float(raw_out) if raw_out is not None else None
+            except Exception:
+                trim_out = None
+            if trim_in > 0.001:
+                concat_lines.append(f"inpoint {trim_in:.6f}\n")
+                has_trim = True
+            if trim_out is not None and trim_out > trim_in + 0.001:
+                concat_lines.append(f"outpoint {trim_out:.6f}\n")
+                has_trim = True
+        concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         proc.setProgram(str(ffmpeg_tool_path("ffmpeg.exe")))
-        proc.setArguments([
-            "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
-            "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
-            "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
-            str(final_path),
-        ])
+        if has_trim:
+            # concatdec_select removes GOP pre-roll around non-keyframe in/out points.
+            # Re-encoding is used only when a trim exists; ordinary assembly keeps
+            # the old fast stream-copy path exactly as before.
+            proc.setArguments([
+                "-y", "-copyts", "-vsync", "0",
+                "-segment_time_metadata", "1",
+                "-f", "concat", "-safe", "0", "-i", str(concat_path),
+                "-map", "0:v:0", "-map", "0:a?",
+                "-vf", "select=concatdec_select",
+                "-af", "aselect=concatdec_select",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                str(final_path),
+            ])
+        else:
+            proc.setArguments([
+                "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
+                "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+                "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+                str(final_path),
+            ])
         self._timeline_assembly_proc = proc
         self._timeline_assembly_output = ""
         self._timeline_assembly_concat = concat_path

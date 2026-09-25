@@ -10,7 +10,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSize, QTimer, QRect
+from PySide6.QtCore import Qt, Signal, QSize, QTimer, QRect, QUrl
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QFontMetrics, QImage, QPixmap
 from PySide6.QtWidgets import (
     QWidget,
@@ -44,11 +44,200 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+except Exception:
+    QMediaPlayer = QAudioOutput = QVideoWidget = None
+
 FPS = 24.0
 MIN_SEGMENT_SECONDS = 0.3
 # Backward-compatible internal alias; project JSON still uses the existing "segments" key.
 MIN_CUT_SECONDS = MIN_SEGMENT_SECONDS
 TIMELINE_SCHEMA_VERSION = 3
+
+
+class ClipTrimDialog(QDialog):
+    """Non-destructive in/out editor for an existing rendered timeline clip."""
+
+    def __init__(self, video_path: str, duration: float, trim_in: float = 0.0, trim_out: float | None = None, parent=None):
+        super().__init__(parent)
+        self.video_path = str(video_path)
+        self.duration_seconds = max(0.01, float(duration or 0.01))
+        self._previewing_range = False
+        self._syncing = False
+        self.setWindowTitle("Trim clip")
+        self.resize(760, 610)
+
+        root = QVBoxLayout(self)
+        hint = QLabel("This trim is non-destructive. It changes only playback/assembly; the generated MP4 and generation duration stay unchanged.")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        self.video_widget = None
+        self.player = None
+        self.audio = None
+        if QMediaPlayer is not None and QVideoWidget is not None:
+            self.video_widget = QVideoWidget(self)
+            self.video_widget.setMinimumHeight(330)
+            self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            root.addWidget(self.video_widget, 1)
+            self.player = QMediaPlayer(self)
+            self.audio = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio)
+            self.player.setVideoOutput(self.video_widget)
+            self.player.setSource(QUrl.fromLocalFile(str(Path(self.video_path).resolve())))
+            self.player.positionChanged.connect(self._on_position_changed)
+            self.player.durationChanged.connect(self._on_duration_changed)
+        else:
+            unavailable = QLabel("Video preview is unavailable in this Qt build. Start/end trimming still works.")
+            unavailable.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            unavailable.setMinimumHeight(180)
+            root.addWidget(unavailable, 1)
+
+        self.scrub = QSlider(Qt.Orientation.Horizontal)
+        self.scrub.setRange(0, max(1, int(round(self.duration_seconds * 1000))))
+        self.scrub.sliderMoved.connect(self._seek_ms)
+        root.addWidget(self.scrub)
+
+        time_row = QHBoxLayout()
+        self.position_label = QLabel("0.00s")
+        self.range_label = QLabel()
+        self.range_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        time_row.addWidget(self.position_label)
+        time_row.addStretch(1)
+        time_row.addWidget(self.range_label)
+        root.addLayout(time_row)
+
+        form = QFormLayout()
+        self.start_spin = QDoubleSpinBox()
+        self.end_spin = QDoubleSpinBox()
+        for spin in (self.start_spin, self.end_spin):
+            spin.setDecimals(3)
+            spin.setSingleStep(0.1)
+            spin.setRange(0.0, self.duration_seconds)
+            spin.setSuffix(" s")
+        initial_in = max(0.0, min(float(trim_in or 0.0), self.duration_seconds))
+        initial_out = self.duration_seconds if trim_out is None else max(initial_in, min(float(trim_out), self.duration_seconds))
+        self.start_spin.setValue(initial_in)
+        self.end_spin.setValue(initial_out)
+        self.start_spin.valueChanged.connect(self._range_changed)
+        self.end_spin.valueChanged.connect(self._range_changed)
+        form.addRow("Start", self.start_spin)
+        form.addRow("End", self.end_spin)
+        root.addLayout(form)
+
+        controls = QHBoxLayout()
+        self.play_btn = QPushButton("Play / Pause")
+        self.preview_btn = QPushButton("Preview trim")
+        self.set_start_btn = QPushButton("Set start at current")
+        self.set_end_btn = QPushButton("Set end at current")
+        self.reset_btn = QPushButton("Reset trim")
+        controls.addWidget(self.play_btn)
+        controls.addWidget(self.preview_btn)
+        controls.addWidget(self.set_start_btn)
+        controls.addWidget(self.set_end_btn)
+        controls.addWidget(self.reset_btn)
+        root.addLayout(controls)
+
+        self.play_btn.clicked.connect(self._toggle_play)
+        self.preview_btn.clicked.connect(self._preview_range)
+        self.set_start_btn.clicked.connect(self._set_start_current)
+        self.set_end_btn.clicked.connect(self._set_end_current)
+        self.reset_btn.clicked.connect(self._reset_trim)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._apply)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._range_changed()
+
+    def _current_seconds(self):
+        return (float(self.player.position()) / 1000.0) if self.player is not None else (float(self.scrub.value()) / 1000.0)
+
+    def _seek_ms(self, value):
+        if self.player is not None:
+            self.player.setPosition(int(value))
+        self.position_label.setText(f"{float(value)/1000.0:.2f}s")
+
+    def _on_duration_changed(self, ms):
+        if int(ms or 0) > 0:
+            # Prefer the actual player duration if ffprobe rounded slightly differently.
+            self.scrub.setMaximum(int(ms))
+
+    def _on_position_changed(self, ms):
+        if not self.scrub.isSliderDown():
+            self.scrub.setValue(int(ms))
+        sec = float(ms) / 1000.0
+        self.position_label.setText(f"{sec:.2f}s")
+        if self._previewing_range and sec >= float(self.end_spin.value()) - 0.015:
+            self.player.pause()
+            self.player.setPosition(int(round(float(self.start_spin.value()) * 1000)))
+            self._previewing_range = False
+
+    def _range_changed(self, *_args):
+        if self._syncing:
+            return
+        self._syncing = True
+        start = float(self.start_spin.value())
+        end = float(self.end_spin.value())
+        if end < start:
+            sender = self.sender()
+            if sender is self.start_spin:
+                self.end_spin.setValue(start)
+                end = start
+            else:
+                self.start_spin.setValue(end)
+                start = end
+        self._syncing = False
+        used = max(0.0, end - start)
+        self.range_label.setText(f"Selected: {start:.3f}s → {end:.3f}s   •   used {used:.3f}s")
+
+    def _toggle_play(self):
+        if self.player is None:
+            return
+        self._previewing_range = False
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _preview_range(self):
+        if self.player is None:
+            return
+        if float(self.end_spin.value()) - float(self.start_spin.value()) < 0.04:
+            return
+        self._previewing_range = True
+        self.player.setPosition(int(round(float(self.start_spin.value()) * 1000)))
+        self.player.play()
+
+    def _set_start_current(self):
+        pos = min(self._current_seconds(), float(self.end_spin.value()))
+        self.start_spin.setValue(pos)
+
+    def _set_end_current(self):
+        pos = max(self._current_seconds(), float(self.start_spin.value()))
+        self.end_spin.setValue(pos)
+
+    def _reset_trim(self):
+        self.start_spin.setValue(0.0)
+        self.end_spin.setValue(self.duration_seconds)
+        if self.player is not None:
+            self.player.setPosition(0)
+
+    def _apply(self):
+        if float(self.end_spin.value()) - float(self.start_spin.value()) < 0.04:
+            QMessageBox.warning(self, "Trim clip", "The selected range is too short. Choose a longer in/out range.")
+            return
+        self.accept()
+
+    def trim_values(self):
+        return float(self.start_spin.value()), float(self.end_spin.value())
+
+    def closeEvent(self, event):
+        if self.player is not None:
+            self.player.stop()
+        super().closeEvent(event)
 
 
 def _safe_project_name(text: str) -> str:
@@ -164,6 +353,7 @@ class TimelineCanvas(QWidget):
     clipSelectionRequested = Signal(str, int)
     clipsReordered = Signal(int, int)
     clipFramesChanged = Signal(str, int)
+    clipContextMenuRequested = Signal(str, object)
 
     RULER_H = 30
     CLIP_TOP = 40
@@ -185,6 +375,7 @@ class TimelineCanvas(QWidget):
         self._dragging = False
         self._resizing = False
         self._thumb_cache: dict[str, QImage | None] = {}
+        self._video_meta_cache: dict[str, dict] = {}
         self._thumb_cache_dir = Path(__file__).resolve().parent / "_timeline_thumb_cache"
         self.setMinimumHeight(self.CLIP_TOP + self.CLIP_H + self.BOTTOM_PAD)
         self.setMouseTracking(True)
@@ -267,6 +458,174 @@ class TimelineCanvas(QWidget):
                 if candidate.is_file():
                     return str(candidate)
         return ""
+
+    def _ffprobe_path(self) -> str:
+        try:
+            from runtime.ffmpeg_tools import tool_path as ffmpeg_tool_path
+            for candidate in ("ffprobe.exe", "ffprobe"):
+                try:
+                    resolved = ffmpeg_tool_path(candidate)
+                except Exception:
+                    resolved = None
+                if resolved:
+                    path = Path(str(resolved))
+                    if path.is_file():
+                        return str(path)
+        except Exception:
+            pass
+
+        found = shutil.which("ffprobe.exe") or shutil.which("ffprobe")
+        if found:
+            return found
+
+        here = Path(__file__).resolve().parent
+        roots = [here, *list(here.parents)[:5]]
+        for root in roots:
+            for rel in (
+                Path("presets/bin/ffprobe.exe"), Path("presets/bin/ffprobe"),
+                Path("bin/ffprobe.exe"), Path("bin/ffprobe"),
+                Path("ffprobe.exe"), Path("ffprobe"),
+            ):
+                candidate = root / rel
+                if candidate.is_file():
+                    return str(candidate)
+        return ""
+
+    @staticmethod
+    def _resolution_height_from_text(value) -> int:
+        text = str(value or "")
+        # Covers values such as "1280 × 704", "1280x704" and preset labels
+        # such as "High — 1792 × 768". Use the last WxH pair in the string.
+        pairs = re.findall(r"(\d{2,5})\s*[x×X]\s*(\d{2,5})", text)
+        if not pairs:
+            return 0
+        try:
+            return int(pairs[-1][1])
+        except Exception:
+            return 0
+
+    def _clip_rendered_height(self, clip: dict) -> int:
+        """Best-effort height of the *active rendered clip*.
+
+        Prefer the actual MP4/image dimensions, cached by file timestamp. This
+        makes the HQ badge truthful for older projects too instead of relying on
+        whether the clip happened to be produced through the HQ Restart button.
+        Saved queue metadata is used only as a fallback.
+        """
+        path = self._thumbnail_source_path(clip)
+        if path is not None:
+            try:
+                stat = path.stat()
+                key = f"{path}|{int(stat.st_mtime_ns)}|{int(stat.st_size)}"
+            except Exception:
+                key = str(path)
+            cached = self._video_meta_cache.get(key)
+            if cached is not None:
+                return int(cached.get("height") or 0)
+
+            height = 0
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+                try:
+                    img = QImage(str(path))
+                    if not img.isNull():
+                        height = int(img.height())
+                except Exception:
+                    height = 0
+            else:
+                ffprobe = self._ffprobe_path()
+                if ffprobe:
+                    try:
+                        cp = subprocess.run(
+                            [ffprobe, "-v", "error", "-select_streams", "v:0",
+                             "-show_entries", "stream=height", "-of", "json", str(path)],
+                            capture_output=True, text=True, timeout=8,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        if cp.returncode == 0:
+                            data = json.loads(cp.stdout or "{}")
+                            stream = (data.get("streams") or [{}])[0]
+                            height = int(stream.get("height") or 0)
+                    except Exception:
+                        height = 0
+            self._video_meta_cache[key] = {"height": int(height)}
+            if height:
+                return int(height)
+
+        generated = clip.get("last_generation_info") if isinstance(clip.get("last_generation_info"), dict) else {}
+        for value in (
+            generated.get("resolution"),
+            (generated.get("settings") or {}).get("resolution") if isinstance(generated.get("settings"), dict) else None,
+            (generated.get("settings") or {}).get("widescreen_quality") if isinstance(generated.get("settings"), dict) else None,
+            (clip.get("settings") or {}).get("resolution") if isinstance(clip.get("settings"), dict) else None,
+            (clip.get("settings") or {}).get("widescreen_quality") if isinstance(clip.get("settings"), dict) else None,
+        ):
+            height = self._resolution_height_from_text(value)
+            if height:
+                return height
+        return 0
+
+    @staticmethod
+    def _actual_generation_settings(clip: dict) -> dict:
+        generated = clip.get("last_generation_info") if isinstance(clip.get("last_generation_info"), dict) else {}
+        saved = generated.get("settings") if isinstance(generated.get("settings"), dict) else None
+        if isinstance(saved, dict):
+            return saved
+        settings = clip.get("settings")
+        return settings if isinstance(settings, dict) else {}
+
+    def _status_badges(self, idx: int, clip: dict) -> tuple[list[str], list[str]]:
+        """Return compact left/right badge groups for the active clip."""
+        left: list[str] = []
+        right: list[str] = []
+        settings = self._actual_generation_settings(clip)
+
+        # HQ means actual 704p-or-higher output, independent of how it was made.
+        if self._clip_rendered_height(clip) >= 704:
+            left.append("HQ")
+
+        # Provenance comes from the settings actually saved with the render when
+        # available. Timeline continuation normally uses both latent history and
+        # the exact final RGB frame, hence L and F may intentionally coexist.
+        generated = clip.get("last_generation_info") if isinstance(clip.get("last_generation_info"), dict) else {}
+        latent_used = bool(settings.get("latent_continuation") or generated.get("latent_continuation"))
+        if latent_used:
+            left.append("L")
+
+        frame_used = bool(
+            settings.get("last") or settings.get("first") or
+            settings.get("continue_video") or settings.get("continue_last_result") or
+            str(clip.get("generation_mode") or "") == "continue"
+        )
+        if frame_used:
+            left.append("F")
+
+        audio_used = bool(
+            settings.get("continue_audio_memory") or settings.get("ref_audios") or
+            settings.get("audio") or settings.get("audio_path") or settings.get("input_audio")
+        )
+        if audio_used:
+            left.append("A")
+
+        has_refs = bool(clip.get("use_reference_images", False)) and bool(_reference_entries(clip))
+        if has_refs:
+            right.append("Ref")
+
+        broken = bool(clip.get("stale", False))
+        mode = str(clip.get("generation_mode") or "")
+        if mode == "continue":
+            if idx <= 0:
+                broken = True
+            else:
+                prev = self.clips[idx - 1]
+                prev_path = self._thumbnail_source_path(prev)
+                if bool(prev.get("stale", False)) or prev_path is None:
+                    broken = True
+        elif mode == "source":
+            if self._thumbnail_source_path(clip) is None:
+                broken = True
+        if broken:
+            right.insert(0, "⚠")
+        return left, right
 
     def _thumbnail_source_path(self, clip: dict) -> Path | None:
         source = str(clip.get("output") or clip.get("start_source_video") or "").strip()
@@ -491,23 +850,22 @@ class TimelineCanvas(QWidget):
                 text_left = thumb_rect.right() + 8
                 text_w = max(12, box_left + box_w - text_left - 6)
 
-                # Compact provenance badges below the thumbnail. HQ is persistent
-                # generation provenance; Ref reflects the reference-image mode for
-                # this block so the timeline remains readable at a glance.
+                # Compact status/provenance badges below the thumbnail. They
+                # describe the active rendered clip rather than merely the current
+                # editor settings, so old clips remain truthful after later edits.
                 badge_font = QFont(font)
                 badge_font.setPointSize(max(7, font.pointSize() - 2))
                 badge_font.setBold(True)
                 painter.setFont(badge_font)
                 badge_y = prompt_y + prompt_h + 13
-                if bool(clip.get("hq_generated", False)):
-                    painter.setPen(QColor("#f4f6f8"))
-                    painter.drawText(thumb_rect.left(), badge_y, "HQ")
-                has_refs = bool(clip.get("use_reference_images", False)) and bool(_reference_entries(clip))
-                if has_refs:
-                    ref_text = "Ref"
-                    ref_w = painter.fontMetrics().horizontalAdvance(ref_text)
-                    painter.setPen(QColor("#f4f6f8"))
-                    painter.drawText(thumb_rect.right() - ref_w + 1, badge_y, ref_text)
+                left_badges, right_badges = self._status_badges(idx, clip)
+                painter.setPen(QColor("#f4f6f8"))
+                if left_badges:
+                    painter.drawText(thumb_rect.left(), badge_y, " ".join(left_badges))
+                if right_badges:
+                    right_text = " ".join(right_badges)
+                    right_w = painter.fontMetrics().horizontalAdvance(right_text)
+                    painter.drawText(thumb_rect.right() - right_w + 1, badge_y, right_text)
                 painter.setFont(font)
 
             painter.setPen(QColor("#f4f6f8"))
@@ -525,6 +883,17 @@ class TimelineCanvas(QWidget):
         if not self.clips:
             painter.setPen(muted)
             painter.drawText(28, self.CLIP_TOP + 50, "No clips yet — add a generation clip to start the timeline.")
+
+    def contextMenuEvent(self, event):
+        x = float(event.pos().x())
+        idx, _left, _right = self._clip_at(x)
+        if idx < 0:
+            return super().contextMenuEvent(event)
+        clip_id = str(self.clips[idx].get("id") or "")
+        if not clip_id:
+            return
+        self.clipContextMenuRequested.emit(clip_id, event.globalPos())
+        event.accept()
 
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -654,6 +1023,10 @@ class TimelineTab(QWidget):
         self._timeline_root = app_root / "output" / "timeline"
         self._timeline_root.mkdir(parents=True, exist_ok=True)
         self._autosave_temp_path = self._timeline_root / "minimax_timeline_autosave_temp.json"
+        # Share the application's persistent QFileDialog history file so the
+        # Timeline Load dialog opens where the user last loaded a project, even
+        # after GrizzlyMax has been restarted.
+        self._file_dialog_history_path = app_root / "presets" / "setsave" / "minimax_file_dialog_history.json"
 
         self._build_ui()
         self._ensure_initial_clip()
@@ -752,6 +1125,8 @@ class TimelineTab(QWidget):
             "output": "",
             "hq_generated": False,
             "locked": False,
+            "notes": "",
+            "last_generation_info": {},
         }
 
     def _clips(self):
@@ -1268,6 +1643,7 @@ class TimelineTab(QWidget):
         self.canvas.clipSelectionRequested.connect(self._selection_requested)
         self.canvas.clipsReordered.connect(self._reorder_clips)
         self.canvas.clipFramesChanged.connect(self._canvas_frames_changed)
+        self.canvas.clipContextMenuRequested.connect(self._show_clip_context_menu)
         self.clip_name.textEdited.connect(self._clip_name_changed)
         self.gen_mode.currentIndexChanged.connect(self._mode_changed)
         self.frames_combo.currentIndexChanged.connect(self._frames_changed)
@@ -1713,8 +2089,69 @@ class TimelineTab(QWidget):
         )
         return True
 
+    def _timeline_load_start_dir(self) -> str:
+        """Return the last successfully used Timeline Load folder."""
+        try:
+            path = self._file_dialog_history_path
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    folders = data.get("folders")
+                    if isinstance(folders, dict):
+                        candidate = folders.get("minimax_timeline_load")
+                        if candidate and Path(candidate).is_dir():
+                            return str(Path(candidate))
+        except Exception:
+            pass
+        # Existing project folder is a useful fallback for older installs that
+        # do not have dialog history yet. Otherwise use the Timeline output root.
+        try:
+            if self._project_path and self._project_path.parent.is_dir():
+                return str(self._project_path.parent)
+        except Exception:
+            pass
+        return str(self._timeline_root)
+
+    def _remember_timeline_load_folder(self, selected: str | Path) -> None:
+        """Persist the directory of a successfully selected Timeline JSON."""
+        if not selected:
+            return
+        try:
+            q = Path(str(selected)).expanduser()
+            folder = q if q.is_dir() else q.parent
+            if not folder.is_dir():
+                return
+            path = self._file_dialog_history_path
+            data = {}
+            if path.is_file():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            folders = data.get("folders")
+            if not isinstance(folders, dict):
+                folders = {}
+            folders["minimax_timeline_load"] = str(folder)
+            data["folders"] = folders
+            # Keep compatibility with the rest of GrizzlyMax's file dialogs.
+            data["last_folder"] = str(folder)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            # File-dialog history should never stop a project from loading.
+            pass
+
     def load_project(self):
-        name, _ = QFileDialog.getOpenFileName(self, "Load MiniMax timeline", "", "MiniMax Timeline (*.json);;JSON (*.json)")
+        name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load MiniMax timeline",
+            self._timeline_load_start_dir(),
+            "MiniMax Timeline (*.json);;JSON (*.json)",
+        )
         if not name:
             return
         try:
@@ -1766,6 +2203,8 @@ class TimelineTab(QWidget):
                 clip.setdefault("output", "")
                 clip.setdefault("hq_generated", False)
                 clip.setdefault("locked", False)
+                clip.setdefault("notes", "")
+                clip.setdefault("last_generation_info", {})
                 if not clip.get("segments"):
                     clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
                 for seg in clip["segments"]:
@@ -1811,6 +2250,7 @@ class TimelineTab(QWidget):
                     )
 
             self._project_path = Path(name)
+            self._remember_timeline_load_folder(self._project_path)
             self.selected_clip_id = self._clips()[0]["id"] if self._clips() else None
             self.selected_clip_ids = {str(self.selected_clip_id)} if self.selected_clip_id else set()
             self._selection_anchor_id = str(self.selected_clip_id) if self.selected_clip_id else None
@@ -1856,7 +2296,9 @@ class TimelineTab(QWidget):
         clone["id"] = uuid.uuid4().hex
         clone["name"] = str(clone.get("name") or f"Clip {idx + 1}") + " copy"
         clone["queue_job_id"] = None; clone["output"] = ""; clone["status"] = "draft"; clone["stale"] = False
+        clone.pop("trim_in", None); clone.pop("trim_out", None)
         clone["locked"] = False
+        clone["last_generation_info"] = {}
         for seg in clone.get("segments") or []: seg["id"] = uuid.uuid4().hex
         self._clips().insert(idx + 1, clone)
         self._invalidate_assembly()
@@ -2317,6 +2759,7 @@ class TimelineTab(QWidget):
         clip["start_source_video"] = str(path)
         clip["source_duration_seconds"] = self._probe_start_video_duration(str(path))
         clip["output"] = str(path)
+        clip.pop("trim_in", None); clip.pop("trim_out", None)
         clip["queue_job_id"] = None
         clip["status"] = "finished"
         clip["stale"] = False
@@ -2684,6 +3127,352 @@ class TimelineTab(QWidget):
         if hasattr(self, "assemble_timeline_btn"):
             self.assemble_timeline_btn.setText("Assemble Video")
         self._refresh_all()
+
+    def _clip_by_id(self, clip_id):
+        target = str(clip_id or "")
+        for i, clip in enumerate(self._clips()):
+            if str(clip.get("id") or "") == target:
+                return i, clip
+        return -1, None
+
+    def _show_clip_context_menu(self, clip_id, global_pos):
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None:
+            return
+
+        # Right click makes that block the primary target, but does not destroy an
+        # existing multi-selection when the clicked block is already part of it.
+        clip_id = str(clip_id)
+        if clip_id not in self.selected_clip_ids:
+            self._apply_selection({clip_id}, clip_id, anchor=clip_id)
+        elif self.selected_clip_id != clip_id:
+            self.selected_clip_id = clip_id
+            self._refresh_all()
+
+        menu = QMenu(self)
+        regenerate = menu.addAction("(Re)generate this clip")
+        preview = menu.addAction("Preview clip")
+        trim = menu.addAction("Trim clip…")
+        remove = menu.addAction("Remove clip from timeline")
+        menu.addSeparator()
+        notes = menu.addAction("Add / read notes")
+        info = menu.addAction("Info")
+
+        locked = bool(clip.get("locked", False))
+        source = str(clip.get("generation_mode") or "") == "source"
+        output = str(clip.get("output") or "").strip()
+        output_exists = bool(output and Path(output).is_file())
+        regenerate.setEnabled(not locked and not source)
+        preview.setEnabled(output_exists)
+        trim.setEnabled(output_exists and not locked)
+        remove.setEnabled(not locked)
+
+        chosen = menu.exec(global_pos)
+        if chosen is regenerate:
+            self.selected_clip_id = clip_id
+            self.generate_selected()
+        elif chosen is preview:
+            self._preview_clip_by_id(clip_id)
+        elif chosen is trim:
+            self._trim_clip_by_id(clip_id)
+        elif chosen is remove:
+            self._remove_clip_by_id(clip_id)
+        elif chosen is notes:
+            self._edit_clip_notes(clip_id)
+        elif chosen is info:
+            self._show_clip_info(clip_id)
+
+    def _preview_clip_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        output = str(clip.get("output") or "").strip()
+        if not output or not Path(output).is_file():
+            return False
+        if callable(self.preview_result_callback):
+            return bool(self.preview_result_callback(output, clip.get("queue_job_id")))
+        return False
+
+
+    def _trim_clip_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        output = str(clip.get("output") or "").strip()
+        if not output or not Path(output).is_file():
+            return False
+        details = self._probe_video_details(output)
+        duration = float(details.get("duration") or 0.0)
+        if duration <= 0:
+            duration = _clip_seconds(clip)
+        trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
+        saved_out = clip.get("trim_out")
+        try:
+            trim_out = float(saved_out) if saved_out is not None else duration
+        except Exception:
+            trim_out = duration
+        trim_out = max(trim_in, min(trim_out, duration))
+        dlg = ClipTrimDialog(output, duration, trim_in, trim_out, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        new_in, new_out = dlg.trim_values()
+        # Treat a full-source range as no trim so old/default projects stay clean.
+        full_range = new_in <= 0.001 and abs(new_out - duration) <= 0.02
+        old_in = float(clip.get("trim_in") or 0.0)
+        old_out_raw = clip.get("trim_out")
+        old_out = duration if old_out_raw is None else float(old_out_raw)
+        if abs(old_in - new_in) <= 0.001 and abs(old_out - new_out) <= 0.001:
+            return True
+        self._record_undo_state("Trim clip")
+        if full_range:
+            clip.pop("trim_in", None)
+            clip.pop("trim_out", None)
+        else:
+            clip["trim_in"] = round(new_in, 3)
+            clip["trim_out"] = round(new_out, 3)
+        self._invalidate_assembly("Clip trim changed — assemble again.")
+        self._refresh_all()
+        return True
+
+    def _remove_clip_by_id(self, clip_id):
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None or bool(clip.get("locked", False)):
+            return False
+        name = str(clip.get("name") or f"Clip {idx + 1}")
+        answer = QMessageBox.question(
+            self,
+            "Remove clip from timeline",
+            f"Remove {name} from the timeline?\n\nThe rendered video file will not be deleted from disk.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self._record_undo_state("Remove clip from timeline")
+        removed_id = str(clip.get("id") or "")
+        self._clips().pop(idx)
+        self._renumber_default_names()
+        self._repair_continuation_chain(mark_stale=True, stale_from=(idx if idx < len(self._clips()) else None))
+        self._invalidate_assembly()
+        self.selected_clip_ids.discard(removed_id)
+        if self._clips():
+            fallback_index = min(idx, len(self._clips()) - 1)
+            fallback = self._clips()[fallback_index]
+            self.selected_clip_id = str(fallback.get("id"))
+            self.selected_clip_ids.add(self.selected_clip_id)
+            self._selection_anchor_id = self.selected_clip_id
+        else:
+            self.selected_clip_id = None
+            self.selected_clip_ids.clear()
+            self._selection_anchor_id = None
+            self._ensure_initial_clip()
+        self.selected_cut_index = 0
+        self._refresh_all()
+        return True
+
+    def _edit_clip_notes(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if clip is None:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Notes — {clip.get('name') or 'Timeline clip'}")
+        dlg.resize(620, 420)
+        layout = QVBoxLayout(dlg)
+        hint = QLabel("Director notes are stored with this timeline block and are never sent to MiniMax for generation.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        editor = QPlainTextEdit(dlg)
+        editor.setPlaceholderText("Add continuity reminders, fixes to make later, performance notes, story intent, etc.")
+        editor.setPlainText(str(clip.get("notes") or ""))
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel, parent=dlg)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        value = editor.toPlainText().rstrip()
+        if value == str(clip.get("notes") or ""):
+            return
+        self._record_undo_state("Edit clip notes")
+        clip["notes"] = value
+        self._refresh_all()
+
+    @staticmethod
+    def _format_bytes(value):
+        try:
+            size = float(value)
+        except Exception:
+            return "Unknown"
+        units = ["B", "KB", "MB", "GB", "TB"]
+        for unit in units:
+            if size < 1024.0 or unit == units[-1]:
+                return f"{size:.0f} {unit}" if unit == "B" else f"{size:.2f} {unit}"
+            size /= 1024.0
+        return "Unknown"
+
+    def _probe_video_details(self, output):
+        path = Path(str(output or ""))
+        if not path.is_file():
+            return {}
+        details = {"file_size": path.stat().st_size}
+        try:
+            from runtime.ffmpeg_tools import tool_path as ffmpeg_tool_path
+            exe = str(ffmpeg_tool_path("ffprobe.exe"))
+            cp = subprocess.run(
+                [exe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,r_frame_rate:format=duration", "-of", "json", str(path)],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if cp.returncode == 0:
+                data = json.loads(cp.stdout or "{}")
+                stream = (data.get("streams") or [{}])[0]
+                fmt = data.get("format") or {}
+                details["width"] = int(stream.get("width") or 0)
+                details["height"] = int(stream.get("height") or 0)
+                details["duration"] = float(fmt.get("duration") or 0.0)
+                details["fps"] = str(stream.get("r_frame_rate") or "")
+        except Exception:
+            pass
+        return details
+
+    @staticmethod
+    def _generation_info_from_job(job):
+        if not isinstance(job, dict):
+            return {}
+        info = {}
+        for key in (
+            "id", "job_number", "mode_name", "model_label", "output", "seed", "actual_seed",
+            "resolution", "frames", "steps", "prompt", "created_at", "started_at", "finished_at",
+        ):
+            value = job.get(key)
+            if value is not None:
+                info[key] = copy.deepcopy(value)
+        settings = job.get("settings")
+        if isinstance(settings, dict):
+            try:
+                info["settings"] = json.loads(json.dumps(settings, default=str))
+            except Exception:
+                info["settings"] = {str(k): str(v) for k, v in settings.items()}
+        return info
+
+    @staticmethod
+    def _append_settings_lines(lines, settings):
+        if not isinstance(settings, dict):
+            return
+        preferred = (
+            "model", "model_path", "checkpoint", "checkpoint_path", "hybrid_checkpoint", "aspect", "resolution",
+            "widescreen_quality", "seed", "steps", "cfg", "shift", "audio_shift", "sampler", "scheduler",
+            "lora", "loras", "lora_paths", "lora_strength", "ref_images", "continue_audio_memory", "latent_continuation",
+        )
+        shown = set()
+        for key in preferred:
+            if key not in settings:
+                continue
+            value = settings.get(key)
+            if value in (None, "", [], {}):
+                continue
+            label = key.replace("_", " ").title()
+            lines.append(f"{label}: {value}")
+            shown.add(key)
+        extras = []
+        for key in sorted(settings):
+            if key in shown:
+                continue
+            value = settings.get(key)
+            if value in (None, "", [], {}):
+                continue
+            extras.append(f"{key.replace('_', ' ').title()}: {value}")
+        if extras:
+            lines.append("")
+            lines.append("Other saved settings:")
+            lines.extend(extras)
+
+    def _show_clip_info(self, clip_id):
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None:
+            return
+        output = str(clip.get("output") or "").strip()
+        disk = self._probe_video_details(output)
+        trim_in = float(clip.get("trim_in") or 0.0)
+        trim_out = clip.get("trim_out")
+        if trim_out is not None:
+            try:
+                trim_text = f"{trim_in:.3f}s → {float(trim_out):.3f}s ({max(0.0, float(trim_out)-trim_in):.3f}s used)"
+            except Exception:
+                trim_text = "Invalid trim metadata"
+        else:
+            trim_text = "None"
+        generated = clip.get("last_generation_info") if isinstance(clip.get("last_generation_info"), dict) else {}
+        settings = generated.get("settings") if isinstance(generated.get("settings"), dict) else clip.get("settings", {})
+        prompt = str(generated.get("prompt") or _compiled_reference_prompt(clip) or _compiled_prompt(clip) or "")
+
+        lines = [
+            f"Clip: {clip.get('name') or f'Clip {idx + 1}'}",
+            f"Timeline position: {idx + 1}",
+            f"Status: {clip.get('status') or 'draft'}",
+            f"Locked: {'Yes' if clip.get('locked') else 'No'}",
+            f"HQ: {'Yes' if clip.get('hq_generated') else 'No'}",
+            f"References: {len(_reference_entries(clip))}",
+            f"Assembly trim: {trim_text}",
+        ]
+        if generated:
+            if generated.get("job_number") is not None:
+                lines.append(f"Queue job: {generated.get('job_number')}")
+            if generated.get("model_label"):
+                lines.append(f"Model / checkpoint: {generated.get('model_label')}")
+            seed = generated.get("actual_seed") if generated.get("actual_seed") is not None else generated.get("seed")
+            if seed is not None:
+                lines.append(f"Seed used: {seed}")
+            if generated.get("steps") is not None:
+                lines.append(f"Steps: {generated.get('steps')}")
+            if generated.get("resolution"):
+                lines.append(f"Queued resolution: {generated.get('resolution')}")
+            if generated.get("frames") is not None:
+                lines.append(f"Frames: {generated.get('frames')}")
+        else:
+            lines.append(f"Seed: {(clip.get('settings') or {}).get('seed', 'Unknown')}")
+            lines.append(f"Frames: {clip.get('frames') or 'Unknown'}")
+
+        if output:
+            lines.append("")
+            lines.append(f"Output: {output}")
+            if Path(output).is_file():
+                lines.append(f"Disk size: {self._format_bytes(disk.get('file_size'))}")
+                if disk.get("duration"):
+                    lines.append(f"Actual duration: {disk['duration']:.3f} s")
+                if disk.get("width") and disk.get("height"):
+                    lines.append(f"Actual resolution: {disk['width']} × {disk['height']}")
+                if disk.get("fps"):
+                    lines.append(f"Video frame rate: {disk['fps']}")
+            else:
+                lines.append("Output file: Missing from disk")
+
+        lines.append("")
+        lines.append("Prompt used:" if generated else "Current saved prompt:")
+        lines.append(prompt or "(empty)")
+        lines.append("")
+        lines.append("Generation settings:" if generated else "Current saved generation settings:")
+        self._append_settings_lines(lines, settings)
+
+        notes = str(clip.get("notes") or "").strip()
+        if notes:
+            lines.extend(["", "Director notes:", notes])
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Clip info — {clip.get('name') or f'Clip {idx + 1}'}")
+        dlg.resize(760, 680)
+        layout = QVBoxLayout(dlg)
+        view = QPlainTextEdit(dlg)
+        view.setReadOnly(True)
+        view.setPlainText("\n".join(str(x) for x in lines))
+        layout.addWidget(view, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dlg)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        buttons.clicked.connect(lambda _button: dlg.accept())
+        layout.addWidget(buttons)
+        dlg.exec()
 
     def preview_selected_result(self):
         clip = self._selected_clip()
@@ -3186,13 +3975,19 @@ class TimelineTab(QWidget):
             self._refresh_all()
         return bool(result)
 
-    def mark_queued(self, clip_id, job_id, output=""):
+    def mark_queued(self, clip_id, job_id, output="", job_info=None):
         for clip in self._clips():
             if str(clip.get("id")) == str(clip_id):
                 clip["queue_job_id"] = str(job_id)
                 clip["status"] = "pending"
                 clip["stale"] = False
                 clip["output"] = str(output or "")
+                # A trim belongs to the previous rendered version. A new render
+                # gets a clean full-range assembly state.
+                clip.pop("trim_in", None); clip.pop("trim_out", None)
+                info = self._generation_info_from_job(job_info)
+                if info:
+                    clip["last_generation_info"] = info
                 break
         self._refresh_all()
 
@@ -3212,6 +4007,9 @@ class TimelineTab(QWidget):
             output = str(job.get("output") or "")
             if output and clip.get("output") != output:
                 clip["output"] = output; changed = True
+            job_info = self._generation_info_from_job(job)
+            if job_info and clip.get("last_generation_info") != job_info:
+                clip["last_generation_info"] = job_info; changed = True
 
             if state == "finished" and bool(clip.get("_preserve_downstream_on_finish")):
                 clip.pop("_preserve_downstream_on_finish", None)
