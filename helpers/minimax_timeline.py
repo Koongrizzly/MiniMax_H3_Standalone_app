@@ -1180,10 +1180,15 @@ class TimelineTab(QWidget):
             return
         self._invalidate_assembly()
         clip.pop("_preserve_downstream_on_finish", None)
-        # Retired aggressive stale propagation. Editing a block never invalidates,
-        # disables or hides existing media. Locking is the protection mechanism;
-        # dependency warnings are derived visually when useful.
-        clip["stale"] = False
+        # Stale is now informational only. Editing an already-rendered block marks
+        # *that block only* stale so the orange state warns that its media no longer
+        # matches the current editor values. Never propagate this downstream and
+        # never use it to block preview, trim, generation, or assembly.
+        output = str(clip.get("output") or "").strip()
+        if output and Path(output).is_file():
+            clip["stale"] = True
+        else:
+            clip.setdefault("stale", False)
 
     # --------------------------------------------------------------- undo/redo
     def _history_snapshot(self) -> dict:
@@ -2190,8 +2195,10 @@ class TimelineTab(QWidget):
                 # finished clip stale or require regeneration.
                 clip["settings"]["glue_results"] = False
                 clip.setdefault("status", "draft")
-                # Stale is informational-only legacy metadata; retire old saved flags on load.
-                clip["stale"] = False
+                # Stale is informational only. Preserve it across save/load so an
+                # already-rendered clip whose editor state changed can remain visibly
+                # orange, but never use this flag to block media operations.
+                clip.setdefault("stale", False)
                 clip.setdefault("queue_job_id", None)
                 clip.setdefault("output", "")
                 clip.setdefault("hq_generated", False)
@@ -2380,7 +2387,9 @@ class TimelineTab(QWidget):
         for i, clip in enumerate(self._clips()):
             if i == 0 and clip.get("generation_mode") == "continue":
                 clip["generation_mode"] = "new"
-            clip["stale"] = False
+            # Do not clear informational stale flags here. Reordering/deleting a
+            # different block must not silently erase the user's warning state.
+            clip.setdefault("stale", False)
 
     def _ordered_selected_ids(self):
         return [str(c.get("id")) for c in self._clips() if str(c.get("id")) in self.selected_clip_ids]
@@ -3062,6 +3071,25 @@ class TimelineTab(QWidget):
         if not ready:
             QMessageBox.information(self, "Timeline assembly", reason)
             return False
+
+        stale_clips = [c for c in self._clips() if bool(c.get("stale", False))]
+        if stale_clips:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Stale clips in timeline")
+            count = len(stale_clips)
+            box.setText(f"{count} clip{'s are' if count != 1 else ' is'} marked stale.")
+            box.setInformativeText(
+                "Stale only means the existing render may not match the current clip settings. "
+                "You can still assemble it exactly as it exists on disk."
+            )
+            assemble_anyway = box.addButton("Assemble anyway", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(assemble_anyway)
+            box.exec()
+            if box.clickedButton() is not assemble_anyway:
+                return False
+
         if not callable(self.assemble_timeline_callback):
             QMessageBox.warning(self, "Timeline assembly", "Timeline assembly is not connected to the standalone GUI.")
             return False
@@ -3204,6 +3232,7 @@ class TimelineTab(QWidget):
 
         menu = QMenu(self)
         regenerate = menu.addAction("(Re)generate this clip")
+        low_res_test = menu.addAction("Create low res test")
         preview = menu.addAction("Preview clip")
         open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
@@ -3218,6 +3247,7 @@ class TimelineTab(QWidget):
         preview_path = self._clip_preview_path(clip)
         output_exists = bool(preview_path)
         regenerate.setEnabled(not locked and not source)
+        low_res_test.setEnabled(not locked and not source)
         # Stale is metadata only: preserved media remains previewable/openable.
         preview.setEnabled(output_exists)
         open_folder.setEnabled(output_exists)
@@ -3228,6 +3258,8 @@ class TimelineTab(QWidget):
         if chosen is regenerate:
             self.selected_clip_id = clip_id
             self.generate_selected()
+        elif chosen is low_res_test:
+            self._generate_low_res_test_by_id(clip_id)
         elif chosen is preview:
             self._preview_clip_by_id(clip_id)
         elif chosen is open_folder:
@@ -3242,6 +3274,61 @@ class TimelineTab(QWidget):
             self._edit_clip_notes(clip_id)
         elif chosen is info:
             self._show_clip_info(clip_id)
+
+    def _generate_low_res_test_by_id(self, clip_id):
+        """Regenerate exactly one block at MiniMax's supported 384p test size.
+
+        This is a one-shot per-job override. It deliberately does not change the
+        project's persistent HQ-restart mode or the block's saved normal resolution.
+        """
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None or idx < 0:
+            return False
+        if bool(clip.get("locked", False)):
+            QMessageBox.information(self, "Low res test", "This block is locked. Unlock it before creating a low-res test.")
+            return False
+        if str(clip.get("generation_mode") or "") == "source":
+            QMessageBox.information(self, "Low res test", "A loaded source clip cannot be regenerated as a low-res test.")
+            return False
+        if not callable(self.queue_timeline_callback):
+            QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
+            return False
+
+        ok, error = self._validate_generation_indices([idx])
+        if not ok:
+            QMessageBox.warning(self, "Timeline not ready", error)
+            return False
+
+        specs = self._generation_specs_for_indices([idx])
+        if not specs:
+            return False
+        spec = specs[0]
+
+        settings = clip.get("settings") if isinstance(clip.get("settings"), dict) else {}
+        aspect = str(settings.get("aspect") or spec.get("aspect") or "16:9").strip()
+        if aspect not in {"16:9", "9:16", "1:1", "21:9"}:
+            aspect = "16:9"
+        if aspect == "21:9":
+            override = {"aspect": "21:9", "widescreen_quality": "Low — 896 × 384"}
+        else:
+            override = {"aspect": aspect, "resolution": "736 × 384"}
+
+        # generation_specs() may already contain the project's persistent HQ
+        # override. Replace it on this one spec so the low-res test wins for this
+        # render only, without changing hq_restart_override in the project JSON.
+        spec["timeline_hq_override"] = copy.deepcopy(override)
+        spec["timeline_low_res_test"] = True
+
+        self._record_undo_state("Create low res test")
+        result = self.queue_timeline_callback([spec])
+        if result:
+            clip["hq_generated"] = False
+            self.project["assembled_output"] = ""
+            self.project["assembly_status"] = ""
+            self.project["auto_assemble"] = False
+            self.project["auto_assemble_pending"] = False
+            self._refresh_all()
+        return bool(result)
 
     def _preview_clip_by_id(self, clip_id):
         _idx, clip = self._clip_by_id(clip_id)
