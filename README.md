@@ -7,7 +7,46 @@
 - This project provides a standalone PySide6 GUI for MiniMax H3 video generation without requiring the user to install or launch ComfyUI. A minimal comfyui backend to load the models runs in the background
 ---
 
-It supports :
+Main Features :
+
+- Text → video + audio (T2VA)
+
+- First/last image/video → video + audio (FL2VA)
+
+- Video To Video with sound memory
+
+- 'use last finished job' feature for automation allows you to create unlimited length of footage.
+
+- Reference image/video/audio → video + audio (Ref2VA)
+
+- Up to 30 seconds at 24 FPS by default + experimental : up to 100 seconds ! (tested working on RTX 3090 with low 320p resolution)
+
+- MiniMax H3 4 step LoRA included in the installer (Use 'Beta' instead of 'simple' scheduler when using the EMA speedup lora)
+
+- Built-in generation queue
+
+- Timeline Director
+
+- Music video clip creator
+
+- Preview pane with repeat, fullscreen, slider, zoom & panning. 
+
+- Integrated H3 Prompt Builder with presets
+
+- Automatic VRAM management with override features
+
+- Optional Spectrum Forecasting (use at least 6 steps to avoid bad results)
+
+- Optional SageAttention / SOL / SLA acceleration
+
+- System hud with job progress
+
+- options for extended logging and debugging 
+
+- Automatic setup, first time use downloads ffmpeg bundle and llama server when needed
+
+---
+
 
 - 09/24/26 :
   
@@ -23,12 +62,11 @@ It supports :
 
   Added support for Sol attention and SLA attention, (only 1 has effect at the same time)
 
-  Best quality/speed combination i found : use included speedup lora (use BETA instead of SIMPLE Scheduler for this particular lora) at 10 instead of 4 steps, activate SLA attention + Spectrum forecast in the settings, speed will be almost as fast as using 4 or 6 steps but quality is better.
+  Best quality/speed combination i found : use included speedup lora (use BETA instead of SIMPLE Scheduler for this particular lora) at 9 instead of 4 steps and activate Spectrum forecast in the settings, speed will be almost as fast as using 4 or 6 steps but quality is better.
 
   
 - 08/17/26 : added support for the hybrid models (INT4/W4A8)
   Folder location now has a toggle 'use hybrid model' and the installer now has option to download the hybrid model.
-  Re-run the installer if you already have the app installed. You can also download the model yourself and simply load it in   the app.
 
   
 - 08/16/26:
@@ -47,40 +85,6 @@ It supports :
   Add an idea, extra details, camera shots, location(s) in the idea tab and a music track and click start
   to create a full music videoclip with the click of a button.
   
-
-Features :
-
-- Text → video + audio (T2VA)
-
-- First/last image/video → video + audio (FL2VA)
-
-- Video To Video with sound memory
-
-- 'use last finished job' feature for automation allows you to create unlimited length of footage.
-
-- Reference image/video/audio → video + audio (Ref2VA)
-
-- Up to 30 seconds at 24 FPS by default + experimental : up to 100 seconds ! (tested working on RTX 3090 with low 320p resolution)
-
-- MiniMax H3 4 step LoRA included in the installer (Use 'Beta' instead of 'simple' scheduler when using the EMA speedup lora)
-
-- Built-in generation queue with preview pane
-
-- Integrated H3 Prompt Builder with presets
-
-- Automatic VRAM management with override features
-
-- Optional Spectrum Feature Forecasting (use at least 6 steps to avoid bad results)
-
-- Optional SageAttention acceleration
-
-- Optional Sol Attention acceleration
-
-- System hud with job progress
-
-- options for extended logging and debugging 
-
-- Automatic setup, first time use downloads ffmpeg bundle and llama server when needed
 
 ---
 
@@ -101,13 +105,13 @@ Recent NVIDIA driver with CUDA 13-capable PyTorch support
 
 Miniconda or Anaconda (not included in the installer)
 
-Enough free disk space for the selected models (40+ gigabyte)
+Enough free disk space for the selected models (11+ gigabyte per checkpoint, int8 can be around 20 gigabyte per checkpoint)
 
-Internet connection for the first installation/model download
+Internet connection for the installation/model download(s)
 
 This build was created specifically to make MiniMax H3 practical on consumer RTX hardware.
 
-The included VRAM Manager / VRAM Lab can selectively keep model weights on the GPU and offload them when required. If a job is estimated to fit in dedicated VRAM, VRAM Lab is automatically bypassed so the model can run without unnecessary offloading overhead.
+The included VRAM Manager / VRAM Lab can selectively keep model weights on the GPU and offload them when required. If a job is estimated to fit in dedicated VRAM, VRAM Lab is automatically bypassed so the model can run without unnecessary offloading overhead. Supports rtx cards with as low as 6 gigabyte (test int4 384p first if you have less then 12 gig of vram, 32 gigabyte or more ddr memory is recommended to handle offloading without a generation taking forever to finish)
 
 
 Installation
