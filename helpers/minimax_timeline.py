@@ -610,7 +610,7 @@ class TimelineCanvas(QWidget):
         if has_refs:
             right.append("Ref")
 
-        broken = bool(clip.get("stale", False))
+        broken = False
         mode = str(clip.get("generation_mode") or "")
         if mode == "continue":
             if idx <= 0:
@@ -618,7 +618,7 @@ class TimelineCanvas(QWidget):
             else:
                 prev = self.clips[idx - 1]
                 prev_path = self._thumbnail_source_path(prev)
-                if bool(prev.get("stale", False)) or prev_path is None:
+                if prev_path is None:
                     broken = True
         elif mode == "source":
             if self._thumbnail_source_path(clip) is None:
@@ -1180,19 +1180,10 @@ class TimelineTab(QWidget):
             return
         self._invalidate_assembly()
         clip.pop("_preserve_downstream_on_finish", None)
-        if clip.get("queue_job_id") or clip.get("status") in {"pending", "running", "finished"}:
-            clip["stale"] = True
-        # Edit topology determines whether the already-rendered next block is
-        # intentionally preserved. Only "continue previous -> free ending" creates
-        # a new outgoing boundary that invalidates an existing continuation chain.
-        edit_mode = str(clip.get("edit_mode") or ("continue_previous" if clip.get("generation_mode") == "continue" else "standalone"))
-        preserve_next = edit_mode in {"bridge_both", "anchor_next", "standalone"}
-        if propagate and not preserve_next:
-            for j in range(index + 1, len(clips)):
-                if clips[j].get("generation_mode") != "continue":
-                    break
-                if clips[j].get("queue_job_id") or clips[j].get("status") in {"pending", "running", "finished"}:
-                    clips[j]["stale"] = True
+        # Retired aggressive stale propagation. Editing a block never invalidates,
+        # disables or hides existing media. Locking is the protection mechanism;
+        # dependency warnings are derived visually when useful.
+        clip["stale"] = False
 
     # --------------------------------------------------------------- undo/redo
     def _history_snapshot(self) -> dict:
@@ -1770,14 +1761,15 @@ class TimelineTab(QWidget):
             self.audio_memory_check.setChecked(bool(settings.get("continue_audio_memory", True)))
             self._refresh_edit_workflow(clip)
             state = str(clip.get("status") or "draft").title()
-            if clip.get("stale"): state = "Stale — edited after queue/render"
             if locked: state = f"Locked — {state}"
             self.state_label.setText(state)
             output = str(clip.get("output") or "")
-            output_exists = bool(output and Path(output).is_file())
+            preview_path = self._clip_preview_path(clip)
             self.clip_output_label.setText(output if output else "—")
-            self.preview_clip_btn.setEnabled(output_exists and str(clip.get("status") or "") == "finished")
-            self.open_clip_btn.setEnabled(output_exists)
+            # Stale is metadata only. Preview/open-folder availability depends on
+            # whether preserved media still exists, not on generation validity.
+            self.preview_clip_btn.setEnabled(bool(preview_path))
+            self.open_clip_btn.setEnabled(bool(preview_path))
             self._refresh_settings_summary(clip)
             self._load_prompt_editor()
         finally:
@@ -2198,7 +2190,8 @@ class TimelineTab(QWidget):
                 # finished clip stale or require regeneration.
                 clip["settings"]["glue_results"] = False
                 clip.setdefault("status", "draft")
-                clip.setdefault("stale", False)
+                # Stale is informational-only legacy metadata; retire old saved flags on load.
+                clip["stale"] = False
                 clip.setdefault("queue_job_id", None)
                 clip.setdefault("output", "")
                 clip.setdefault("hq_generated", False)
@@ -2387,17 +2380,7 @@ class TimelineTab(QWidget):
         for i, clip in enumerate(self._clips()):
             if i == 0 and clip.get("generation_mode") == "continue":
                 clip["generation_mode"] = "new"
-                if mark_stale:
-                    clip["stale"] = True
-                continue
-
-            if not mark_stale or stale_from is None or i < int(stale_from):
-                continue
-
-            if clip.get("generation_mode") == "continue" and (
-                clip.get("queue_job_id") or clip.get("status") in {"pending", "running", "finished"}
-            ):
-                clip["stale"] = True
+            clip["stale"] = False
 
     def _ordered_selected_ids(self):
         return [str(c.get("id")) for c in self._clips() if str(c.get("id")) in self.selected_clip_ids]
@@ -2899,10 +2882,10 @@ class TimelineTab(QWidget):
         next_state = "available" if has_next else "none"
         if has_prev:
             prev = self._clips()[idx - 1]
-            prev_state = "ready" if str(prev.get("status") or "") == "finished" and bool(prev.get("output")) and not bool(prev.get("stale")) else "not rendered / stale"
+            prev_state = "ready" if self._clip_preview_path(prev) else "not rendered"
         if has_next:
             nxt = self._clips()[idx + 1]
-            next_state = "ready" if str(nxt.get("status") or "") == "finished" and bool(nxt.get("output")) and not bool(nxt.get("stale")) else "not rendered / stale"
+            next_state = "ready" if self._clip_preview_path(nxt) else "not rendered"
         ref_note = "  •  Ref2VA: previous continuation disabled" if using_refs else ""
         self.edit_selected_label.setText(
             f"{clip.get('name') or f'Clip {idx + 1}'}  •  previous: {prev_state}  •  next: {next_state}{ref_note}"
@@ -2943,8 +2926,8 @@ class TimelineTab(QWidget):
             clip["settings"] = copy.deepcopy(settings)
             clip["settings"]["glue_results"] = False
             if clip.get("queue_job_id") or clip.get("status") in {"pending", "running", "finished"}:
-                clip["stale"] = True
                 changed_finished = True
+            clip["stale"] = False
 
         self._invalidate_assembly(
             "Generation settings changed — regenerate affected clips before assembling."
@@ -3135,6 +3118,76 @@ class TimelineTab(QWidget):
                 return i, clip
         return -1, None
 
+
+    def _clip_preview_path(self, clip: dict) -> str:
+        """Return an existing media path for preview/open-folder operations.
+
+        Preview is deliberately independent of the Timeline stale flag.  A stale
+        render is still valid media and remains inspectable until the file itself
+        is removed.  Older projects/jobs can also have the authoritative path in
+        last_generation_info rather than the mutable block output field, so check
+        both before deciding that no preview exists.
+        """
+        if not isinstance(clip, dict):
+            return ""
+
+        candidates = []
+        def add(value):
+            value = str(value or "").strip().strip('\"')
+            if value and value not in candidates:
+                candidates.append(value)
+
+        add(clip.get("output"))
+        generated = clip.get("last_generation_info")
+        if isinstance(generated, dict):
+            add(generated.get("output"))
+        if str(clip.get("generation_mode") or "") == "source":
+            add(clip.get("start_source_video"))
+
+        bases = []
+        if self._project_path is not None:
+            try:
+                bases.append(Path(self._project_path).resolve().parent)
+            except Exception:
+                bases.append(Path(self._project_path).parent)
+        bases.append(self._timeline_root)
+
+        for raw in candidates:
+            path = Path(raw).expanduser()
+            try:
+                if path.is_file():
+                    return str(path)
+            except OSError:
+                pass
+            if not path.is_absolute():
+                for base in bases:
+                    candidate = base / path
+                    try:
+                        if candidate.is_file():
+                            return str(candidate)
+                    except OSError:
+                        pass
+
+            # Timeline renders are versioned (..._001.mp4, ..._002.mp4, ...).
+            # If an older saved version path disappeared, recover the newest
+            # surviving sibling instead of treating the block as unpreviewable.
+            try:
+                parent = path.parent
+                if parent.is_dir() and path.suffix:
+                    stem = path.stem
+                    base_stem = re.sub(r"_\d{3,}$", "", stem)
+                    matches = sorted(
+                        parent.glob(base_stem + "_*" + path.suffix),
+                        key=lambda x: x.stat().st_mtime if x.is_file() else -1,
+                        reverse=True,
+                    )
+                    for match in matches:
+                        if match.is_file():
+                            return str(match)
+            except (OSError, ValueError):
+                pass
+        return ""
+
     def _show_clip_context_menu(self, clip_id, global_pos):
         idx, clip = self._clip_by_id(clip_id)
         if clip is None:
@@ -3152,18 +3205,22 @@ class TimelineTab(QWidget):
         menu = QMenu(self)
         regenerate = menu.addAction("(Re)generate this clip")
         preview = menu.addAction("Preview clip")
+        open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
         remove = menu.addAction("Remove clip from timeline")
         menu.addSeparator()
+        lock_action = menu.addAction("Unlock clip" if bool(clip.get("locked", False)) else "Lock clip")
         notes = menu.addAction("Add / read notes")
         info = menu.addAction("Info")
 
         locked = bool(clip.get("locked", False))
         source = str(clip.get("generation_mode") or "") == "source"
-        output = str(clip.get("output") or "").strip()
-        output_exists = bool(output and Path(output).is_file())
+        preview_path = self._clip_preview_path(clip)
+        output_exists = bool(preview_path)
         regenerate.setEnabled(not locked and not source)
+        # Stale is metadata only: preserved media remains previewable/openable.
         preview.setEnabled(output_exists)
+        open_folder.setEnabled(output_exists)
         trim.setEnabled(output_exists and not locked)
         remove.setEnabled(not locked)
 
@@ -3173,10 +3230,14 @@ class TimelineTab(QWidget):
             self.generate_selected()
         elif chosen is preview:
             self._preview_clip_by_id(clip_id)
+        elif chosen is open_folder:
+            self._open_clip_folder_by_id(clip_id)
         elif chosen is trim:
             self._trim_clip_by_id(clip_id)
         elif chosen is remove:
             self._remove_clip_by_id(clip_id)
+        elif chosen is lock_action:
+            self._toggle_clip_lock_by_id(clip_id)
         elif chosen is notes:
             self._edit_clip_notes(clip_id)
         elif chosen is info:
@@ -3186,20 +3247,42 @@ class TimelineTab(QWidget):
         _idx, clip = self._clip_by_id(clip_id)
         if not clip:
             return False
-        output = str(clip.get("output") or "").strip()
-        if not output or not Path(output).is_file():
+        output = self._clip_preview_path(clip)
+        if not output:
             return False
         if callable(self.preview_result_callback):
             return bool(self.preview_result_callback(output, clip.get("queue_job_id")))
         return False
 
 
+
+    def _open_clip_folder_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        output = self._clip_preview_path(clip)
+        if not output:
+            return False
+        if callable(self.open_output_callback):
+            return bool(self.open_output_callback(output))
+        return False
+
+    def _toggle_clip_lock_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        currently_locked = bool(clip.get("locked", False))
+        self._record_undo_state("Unlock clip" if currently_locked else "Lock clip")
+        clip["locked"] = not currently_locked
+        self._refresh_all()
+        return True
+
     def _trim_clip_by_id(self, clip_id):
         _idx, clip = self._clip_by_id(clip_id)
         if not clip:
             return False
-        output = str(clip.get("output") or "").strip()
-        if not output or not Path(output).is_file():
+        output = self._clip_preview_path(clip)
+        if not output:
             return False
         details = self._probe_video_details(output)
         duration = float(details.get("duration") or 0.0)
@@ -3478,13 +3561,13 @@ class TimelineTab(QWidget):
         clip = self._selected_clip()
         if not clip:
             return
-        output = str(clip.get("output") or "")
+        output = self._clip_preview_path(clip)
         if callable(self.preview_result_callback) and output:
             self.preview_result_callback(output, clip.get("queue_job_id"))
 
     def open_selected_output(self):
         clip = self._selected_clip()
-        output = str((clip or {}).get("output") or "")
+        output = self._clip_preview_path(clip or {})
         if callable(self.open_output_callback) and output:
             self.open_output_callback(output)
 
@@ -3555,13 +3638,13 @@ class TimelineTab(QWidget):
                 spec["timeline_previous_output"] = str(prev.get("output") or "")
                 spec["timeline_previous_job_id"] = str(prev.get("queue_job_id") or "")
                 spec["timeline_previous_status"] = str(prev.get("status") or "")
-                spec["timeline_previous_stale"] = bool(prev.get("stale"))
+                spec["timeline_previous_stale"] = False
                 spec["timeline_previous_is_source"] = str(prev.get("generation_mode") or "") == "source"
             if i + 1 < len(clips):
                 nxt = clips[i + 1]
                 spec["timeline_next_output"] = str(nxt.get("output") or "")
                 spec["timeline_next_status"] = str(nxt.get("status") or "")
-                spec["timeline_next_stale"] = bool(nxt.get("stale"))
+                spec["timeline_next_stale"] = False
             specs.append(spec)
         return specs
 
@@ -3642,7 +3725,6 @@ class TimelineTab(QWidget):
                 prev_output = Path(str(prev.get("output") or ""))
                 if (
                     str(prev.get("status") or "") != "finished"
-                    or bool(prev.get("stale"))
                     or not prev_output.is_file()
                 ):
                     QMessageBox.warning(
@@ -3701,14 +3783,11 @@ class TimelineTab(QWidget):
                 # next continuation clip, so downstream continuation results really
                 # do become stale.
                 if edit_mode == "continue_previous":
+                    # Existing downstream renders remain usable; do not invalidate them.
                     for j in range(idx + 1, len(self._clips())):
                         if self._clips()[j].get("generation_mode") != "continue":
                             break
-                        if (
-                            self._clips()[j].get("queue_job_id")
-                            or self._clips()[j].get("status") in {"pending", "running", "finished"}
-                        ):
-                            self._clips()[j]["stale"] = True
+                        self._clips()[j]["stale"] = False
 
                 # bridge_both / anchor_next are specifically chosen to PRESERVE the
                 # existing next clip by targeting its exact first frame. If that
