@@ -31,17 +31,24 @@ It supports :
   Re-run the installer if you already have the app installed. You can also download the model yourself and simply load it in   the app.
 
   
-- 08/16/26: imported the Framevision music clip creator and converted it for use with MiniMax H3
+- 08/16/26:
+
+![MiniMax H3 INT4 Standalone](/presets/setsave/2026-09-26%2000_40_12-minimax%20H3%20Standalone.jpg)
+
+  imported the Framevision music clip creator and converted it for use with MiniMax H3
   
-  Built-in mini whisper Cpp support for Lyrics,
+  Built-in mini whisper Cpp support for Lyrics, energy detection for non lyric tracks
 
   smart reference system for backgrounds and characters,
+  Randomizer with option for unlimited amount of reference images
   
   shotlist creator/director/review tab and much more.
  
   Add an idea, extra details, camera shots, location(s) in the idea tab and a music track and click start
   to create a full music videoclip with the click of a button.
   
+
+Features :
 
 - Text → video + audio (T2VA)
 
