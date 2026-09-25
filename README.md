@@ -1,6 +1,5 @@
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026_09_19_10_57_07.jpg)
 
-
 # MiniMax H3 Standalone
 ---
 ---
@@ -13,7 +12,9 @@ It supports :
 - 09/24/26 :
   
   Timeline director
-  create long videos with the help of the timeline director.
+  create full movies with the help of the timeline director.
+  
+![MiniMax H3 INT4 Standalone](/presets/setsave/2026-09-25%2023_13_56-.jpg)
 
 - 09/13/26 :
 
