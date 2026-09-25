@@ -3024,11 +3024,14 @@ class MainWindow(QMainWindow):
         jobs_by_id = {str(j.get("id")): j for j in self.queue_jobs if j.get("id")}
         for index, clip in enumerate(clips, 1):
             output = Path(str(clip.get("output") or ""))
-            if str(clip.get("status") or "") != "finished" or clip.get("stale") or not output.is_file():
+            # Assembly means assembly: dependency/status/stale flags belong to
+            # generation planning, not file concatenation. If a block has a real
+            # video file, use it exactly as it appears in Timeline order.
+            if not output.is_file():
                 QMessageBox.warning(
                     self,
                     "Timeline assembly",
-                    f"Clip {index} is not a current finished result. Regenerate missing/stale clips before assembly.",
+                    f"Clip {index} has no usable output file:\n\n{output}",
                 )
                 return False
             outputs.append(output)

@@ -5,12 +5,13 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QSize, QTimer, QRect
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFontMetrics, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QFontMetrics, QImage, QPixmap
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -40,13 +41,14 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QApplication,
+    QMenu,
 )
 
 FPS = 24.0
 MIN_SEGMENT_SECONDS = 0.3
 # Backward-compatible internal alias; project JSON still uses the existing "segments" key.
 MIN_CUT_SECONDS = MIN_SEGMENT_SECONDS
-TIMELINE_SCHEMA_VERSION = 2
+TIMELINE_SCHEMA_VERSION = 3
 
 
 def _safe_project_name(text: str) -> str:
@@ -158,7 +160,8 @@ def _compiled_reference_prompt(clip: dict) -> str:
 class TimelineCanvas(QWidget):
     """Compact NLE-like overview of MiniMax H3 generation jobs."""
 
-    clipSelected = Signal(str)
+    clipSelected = Signal(str)  # legacy/plain selection compatibility
+    clipSelectionRequested = Signal(str, int)
     clipsReordered = Signal(int, int)
     clipFramesChanged = Signal(str, int)
 
@@ -173,6 +176,7 @@ class TimelineCanvas(QWidget):
         super().__init__(parent)
         self.clips: list[dict] = []
         self.selected_id: str | None = None
+        self.selected_ids: set[str] = set()
         self.pixels_per_second = 38.0
         self.allowed_frames: list[int] = list(range(124, 720, 17))
         self._rects: list[tuple[str, float, float]] = []
@@ -180,7 +184,7 @@ class TimelineCanvas(QWidget):
         self._press_clip_index = -1
         self._dragging = False
         self._resizing = False
-        self._thumb_cache: dict[str, QPixmap | None] = {}
+        self._thumb_cache: dict[str, QImage | None] = {}
         self._thumb_cache_dir = Path(__file__).resolve().parent / "_timeline_thumb_cache"
         self.setMinimumHeight(self.CLIP_TOP + self.CLIP_H + self.BOTTOM_PAD)
         self.setMouseTracking(True)
@@ -193,10 +197,13 @@ class TimelineCanvas(QWidget):
         total = sum(_clip_seconds(c) for c in self.clips)
         return int(max(900, 36 + total * self.pixels_per_second + 36))
 
-    def set_clips(self, clips: list[dict], selected_id: str | None = None):
+    def set_clips(self, clips: list[dict], selected_id: str | None = None, selected_ids=None):
         self.clips = clips
-        if selected_id is not None:
-            self.selected_id = selected_id
+        self.selected_id = selected_id
+        if selected_ids is None:
+            self.selected_ids = {str(selected_id)} if selected_id else set()
+        else:
+            self.selected_ids = {str(x) for x in selected_ids if x}
         self.setMinimumWidth(self._content_width())
         self.resize(self._content_width(), self.minimumHeight())
         self.update()
@@ -224,60 +231,138 @@ class TimelineCanvas(QWidget):
         return min(self.allowed_frames, key=lambda v: abs(v - wanted))
 
     def _ffmpeg_path(self) -> str:
+        # The timeline helper can be imported from several different launch
+        # locations, so do not rely on a single package-relative ffmpeg lookup.
         try:
             from runtime.ffmpeg_tools import tool_path as ffmpeg_tool_path
             for candidate in ("ffmpeg.exe", "ffmpeg"):
-                path = str(ffmpeg_tool_path(candidate))
-                if path and Path(path).is_file():
-                    return path
+                try:
+                    resolved = ffmpeg_tool_path(candidate)
+                except Exception:
+                    resolved = None
+                if resolved:
+                    path = Path(str(resolved))
+                    if path.is_file():
+                        return str(path)
         except Exception:
             pass
+
+        found = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
+        if found:
+            return found
+
+        here = Path(__file__).resolve().parent
+        roots = [here, *list(here.parents)[:5]]
+        relative_candidates = (
+            Path("presets/bin/ffmpeg.exe"),
+            Path("presets/bin/ffmpeg"),
+            Path("bin/ffmpeg.exe"),
+            Path("bin/ffmpeg"),
+            Path("ffmpeg.exe"),
+            Path("ffmpeg"),
+        )
+        for root in roots:
+            for rel in relative_candidates:
+                candidate = root / rel
+                if candidate.is_file():
+                    return str(candidate)
         return ""
 
     def _thumbnail_source_path(self, clip: dict) -> Path | None:
         source = str(clip.get("output") or clip.get("start_source_video") or "").strip()
         if not source:
             return None
-        path = Path(source)
-        return path if path.is_file() else None
+        path = Path(source).expanduser()
+        if path.is_file():
+            return path.resolve()
+        # Older/saved timeline projects can contain relative result paths.
+        for base in (Path.cwd(), Path(__file__).resolve().parent):
+            candidate = (base / path).resolve()
+            if candidate.is_file():
+                return candidate
+        return None
 
-    def _clip_thumbnail(self, clip: dict) -> QPixmap | None:
+    @staticmethod
+    def _load_thumbnail_image(path: Path) -> QImage | None:
+        # Keep the timeline renderer entirely on QImage/raster data. QPixmap is
+        # optimized for screen resources and proved unreliable here even though
+        # Qt reported the extracted thumbnail as valid.
+        try:
+            data = path.read_bytes()
+            if not data:
+                return None
+            image = QImage.fromData(data)
+            if image.isNull() or image.width() < 2 or image.height() < 2:
+                return None
+            return image.convertToFormat(QImage.Format.Format_RGB32)
+        except Exception:
+            return None
+
+    def _clip_thumbnail(self, clip: dict) -> QImage | None:
         path = self._thumbnail_source_path(clip)
         if path is None:
             return None
         try:
             stamp = int(path.stat().st_mtime_ns)
+            file_size = int(path.stat().st_size)
         except Exception:
             stamp = 0
-        cache_key = f"{path}|{stamp}"
+            file_size = 0
+
+        # v4: keep decoded thumbnail pixels entirely in memory.  Previous
+        # versions went through PNG/JPEG/BMP files and Qt image plugins; on the
+        # user's Windows runtime those images reported as valid but painted as
+        # empty rectangles.  FFmpeg now emits an exact THUMB_W x THUMB_H RGB24
+        # frame to stdout and QImage owns a copied raster buffer.
+        cache_key = f"v4raw|{path}|{stamp}|{file_size}|{self.THUMB_W}x{self.THUMB_H}"
         if cache_key in self._thumb_cache:
             return self._thumb_cache[cache_key]
 
-        pix: QPixmap | None = None
+        image: QImage | None = None
         if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
-            raw = QPixmap(str(path))
-            pix = None if raw.isNull() else raw
+            loaded = self._load_thumbnail_image(path)
+            if loaded is not None:
+                image = loaded.scaled(
+                    self.THUMB_W, self.THUMB_H,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                ).copy(0, 0, self.THUMB_W, self.THUMB_H)
         else:
             ffmpeg = self._ffmpeg_path()
             if ffmpeg:
                 try:
-                    self._thumb_cache_dir.mkdir(parents=True, exist_ok=True)
-                    key = hashlib.sha1(str(path).encode("utf-8", errors="ignore")).hexdigest()[:16]
-                    thumb = self._thumb_cache_dir / f"{path.stem}_{stamp}_{key}.png"
-                    if not thumb.is_file():
-                        subprocess.run(
-                            [ffmpeg, "-y", "-i", str(path), "-ss", "0.5", "-frames:v", "1", "-vf", "scale=320:-2:flags=lanczos,format=rgb24", str(thumb)],
-                            capture_output=True,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    vf = (
+                        f"scale={self.THUMB_W}:{self.THUMB_H}:"
+                        "force_original_aspect_ratio=decrease,"
+                        f"pad={self.THUMB_W}:{self.THUMB_H}:(ow-iw)/2:(oh-ih)/2:color=black"
+                    )
+                    proc = subprocess.run(
+                        [
+                            ffmpeg, "-hide_banner", "-loglevel", "error",
+                            "-ss", "0.35", "-i", str(path), "-an",
+                            "-frames:v", "1", "-vf", vf,
+                            "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
+                        ],
+                        capture_output=True,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    expected = self.THUMB_W * self.THUMB_H * 3
+                    if proc.returncode == 0 and len(proc.stdout) >= expected:
+                        raw = proc.stdout[:expected]
+                        # QImage initially references Python's buffer; .copy() is
+                        # essential so the pixels remain valid after this method
+                        # returns and the subprocess/output objects are released.
+                        wrapped = QImage(
+                            raw, self.THUMB_W, self.THUMB_H, self.THUMB_W * 3,
+                            QImage.Format.Format_RGB888,
                         )
-                    if thumb.is_file():
-                        raw = QPixmap(str(thumb))
-                        pix = None if raw.isNull() else raw
+                        if not wrapped.isNull():
+                            image = wrapped.copy()
                 except Exception:
-                    pix = None
+                    image = None
 
-        self._thumb_cache[cache_key] = pix
-        return pix
+        self._thumb_cache[cache_key] = image
+        return image
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -303,7 +388,8 @@ class TimelineCanvas(QWidget):
         x0 = 26.0
         painter.setPen(QPen(border, 1))
         painter.drawLine(int(x0), self.RULER_H - 3, self.width() - 10, self.RULER_H - 3)
-        fm = QFontMetrics(painter.font())
+        font = painter.font()
+        fm = QFontMetrics(font)
         for sec in range(0, int(math.ceil(total_seconds)) + ruler_step, ruler_step):
             x = x0 + sec * self.pixels_per_second
             painter.drawLine(int(x), self.RULER_H - 8, int(x), self.RULER_H - 2)
@@ -333,19 +419,32 @@ class TimelineCanvas(QWidget):
             width = max(74.0, duration * self.pixels_per_second)
             left, right = cursor, cursor + width
             self._rects.append((str(clip.get("id")), left, right))
-            selected = str(clip.get("id")) == self.selected_id
+            clip_id = str(clip.get("id"))
+            selected = clip_id in self.selected_ids or clip_id == self.selected_id
+            primary_selected = clip_id == self.selected_id
             status = "stale" if clip.get("stale") else str(clip.get("status") or "draft")
             fill = state_colors.get(status, panel)
             painter.setBrush(QBrush(fill))
-            painter.setPen(QPen(accent if selected else border, 2 if selected else 1))
+            painter.setPen(QPen(accent if selected else border, 3 if primary_selected else (2 if selected else 1)))
             painter.drawRoundedRect(int(left), self.CLIP_TOP, int(width - 4), self.CLIP_H, 5, 5)
 
             # Clip header.
             painter.setPen(accent_text if selected else text)
             name = str(clip.get("name") or f"Clip {idx + 1}")
-            name_width = int(max(20, width - 18))
+            name_width = int(max(20, width - (58 if bool(clip.get("locked", False)) else 18)))
+            info_width = int(max(20, width - 18))
             elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, name_width)
             painter.drawText(int(left + 8), self.CLIP_TOP + 18, elided)
+            if bool(clip.get("locked", False)):
+                lock_font = QFont(font)
+                lock_font.setPointSize(max(7, font.pointSize() - 2))
+                lock_font.setBold(True)
+                painter.setFont(lock_font)
+                lock_text = "LOCK"
+                lock_w = painter.fontMetrics().horizontalAdvance(lock_text)
+                painter.setPen(QColor("#f4d35e"))
+                painter.drawText(int(right - lock_w - 10), self.CLIP_TOP + 18, lock_text)
+                painter.setFont(font)
             if clip.get("generation_mode") == "source":
                 mode = "▣ Loaded start clip"
             else:
@@ -356,7 +455,7 @@ class TimelineCanvas(QWidget):
             refs_info = f"  •  Ref2VA ×{ref_count}" if ref_count else ""
             info = f"{mode}  •  {int(clip.get('frames') or 0)}f  •  {duration:.2f}s{bridge}{refs_info}"
             painter.setPen(muted if not selected else accent_text)
-            painter.drawText(int(left + 8), self.CLIP_TOP + 38, fm.elidedText(info, Qt.TextElideMode.ElideRight, name_width))
+            painter.drawText(int(left + 8), self.CLIP_TOP + 38, fm.elidedText(info, Qt.TextElideMode.ElideRight, info_width))
 
             # Show a compact prompt preview. If an output clip already exists, also
             # draw a small thumbnail so timeline blocks are visually recognizable.
@@ -375,19 +474,41 @@ class TimelineCanvas(QWidget):
 
             text_left = box_left + 6
             text_w = max(12, box_w - 12)
-            pix = self._clip_thumbnail(clip)
-            if pix is not None and box_w >= 70:
+            image = self._clip_thumbnail(clip)
+            if image is not None and box_w >= 70:
                 thumb_rect = QRect(box_left + 4, prompt_y + 3, self.THUMB_W, self.THUMB_H)
-                scaled = pix.scaled(thumb_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 painter.fillRect(thumb_rect, QColor("#223548"))
-                draw_x = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
-                draw_y = thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2
-                draw_rect = QRect(draw_x, draw_y, scaled.width(), scaled.height())
-                painter.drawPixmap(draw_rect, scaled, scaled.rect())
+                # The v4 extractor already returns an exact THUMB_W x THUMB_H
+                # raster. Paint it 1:1: no Qt-side resize and no source-rect
+                # overloads are involved.
+                painter.drawImage(thumb_rect.x(), thumb_rect.y(), image)
                 painter.setPen(QPen(QColor("#8ea7bf"), 1))
+                # drawRect() uses both the current pen and brush. The prompt
+                # preview left a solid blue brush active, which was filling this
+                # rectangle *after* drawImage() and hiding the thumbnail.
+                painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(thumb_rect)
                 text_left = thumb_rect.right() + 8
                 text_w = max(12, box_left + box_w - text_left - 6)
+
+                # Compact provenance badges below the thumbnail. HQ is persistent
+                # generation provenance; Ref reflects the reference-image mode for
+                # this block so the timeline remains readable at a glance.
+                badge_font = QFont(font)
+                badge_font.setPointSize(max(7, font.pointSize() - 2))
+                badge_font.setBold(True)
+                painter.setFont(badge_font)
+                badge_y = prompt_y + prompt_h + 13
+                if bool(clip.get("hq_generated", False)):
+                    painter.setPen(QColor("#f4f6f8"))
+                    painter.drawText(thumb_rect.left(), badge_y, "HQ")
+                has_refs = bool(clip.get("use_reference_images", False)) and bool(_reference_entries(clip))
+                if has_refs:
+                    ref_text = "Ref"
+                    ref_w = painter.fontMetrics().horizontalAdvance(ref_text)
+                    painter.setPen(QColor("#f4f6f8"))
+                    painter.drawText(thumb_rect.right() - ref_w + 1, badge_y, ref_text)
+                painter.setFont(font)
 
             painter.setPen(QColor("#f4f6f8"))
             text_rect = QRect(text_left, prompt_y + 2, text_w, prompt_h - 4)
@@ -412,13 +533,27 @@ class TimelineCanvas(QWidget):
         idx, left, right = self._clip_at(x)
         if idx < 0:
             return
+        clip = self.clips[idx]
+        clip_id = str(clip.get("id"))
+        modifiers = event.modifiers()
+        try:
+            modifier_value = int(modifiers.value)
+        except Exception:
+            modifier_value = int(modifiers)
+        self.clipSelectionRequested.emit(clip_id, modifier_value)
+
+        # Ctrl/Shift clicks are selection gestures, not resize/reorder gestures.
+        # Locked clips can be selected but cannot be structurally dragged/resized.
+        modified_click = modifiers != Qt.KeyboardModifier.NoModifier
+        locked = bool(clip.get("locked", False))
         self._press_x = x
-        self._press_clip_index = idx
+        self._press_clip_index = -1 if modified_click or locked else idx
         self._dragging = False
-        self._resizing = (right - x) <= 10 and len(self.clips) > 0 and str(self.clips[idx].get("generation_mode") or "") != "source"
-        clip_id = str(self.clips[idx].get("id"))
-        self.selected_id = clip_id
-        self.clipSelected.emit(clip_id)
+        self._resizing = (
+            not modified_click and not locked and (right - x) <= 10
+            and len(self.clips) > 0
+            and str(clip.get("generation_mode") or "") != "source"
+        )
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -491,9 +626,25 @@ class TimelineTab(QWidget):
         self.frame_values = sorted({int(v) for v in (frame_values or range(124, 720, 17))})
         self.project = self._new_project_data()
         self.selected_clip_id: str | None = None
+        self.selected_clip_ids: set[str] = set()
+        self._selection_anchor_id: str | None = None
         self.selected_cut_index = 0
         self._loading_inspector = False
         self._project_path: Path | None = None
+
+        # Session-wide Timeline edit history. Snapshots contain the complete project
+        # model (including clip output paths/job ids), so Undo/Redo restores the
+        # rendered clip version that belonged to that edit state instead of only
+        # restoring the visible prompt/settings widgets. Video files themselves are
+        # not duplicated; the Timeline already keeps previous renders on disk.
+        self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
+        self._history_restoring = False
+        self._history_coalesce_key: str | None = None
+        self._history_coalesce_timer = QTimer(self)
+        self._history_coalesce_timer.setSingleShot(True)
+        self._history_coalesce_timer.setInterval(700)
+        self._history_coalesce_timer.timeout.connect(self._end_history_coalesce)
 
         # Timeline recovery paths must exist before _build_ui/_refresh_all because
         # the summary tooltip already refers to the recovery location during the
@@ -526,6 +677,7 @@ class TimelineTab(QWidget):
             "auto_assemble": False,
             "auto_assemble_pending": False,
             "global_generation_settings": {},
+            "hq_restart_override": {},
         }
 
     def _capture_settings(self):
@@ -598,6 +750,8 @@ class TimelineTab(QWidget):
             "stale": False,
             "queue_job_id": None,
             "output": "",
+            "hq_generated": False,
+            "locked": False,
         }
 
     def _clips(self):
@@ -609,6 +763,8 @@ class TimelineTab(QWidget):
             clip["name"] = "Clip 1"
             self._clips().append(clip)
             self.selected_clip_id = clip["id"]
+            self.selected_clip_ids = {str(clip["id"])}
+            self._selection_anchor_id = str(clip["id"])
 
     def _selected_index(self):
         for i, c in enumerate(self._clips()):
@@ -645,6 +801,8 @@ class TimelineTab(QWidget):
         if not (0 <= index < len(clips)):
             return
         clip = clips[index]
+        if bool(clip.get("locked", False)):
+            return
         self._invalidate_assembly()
         clip.pop("_preserve_downstream_on_finish", None)
         if clip.get("queue_job_id") or clip.get("status") in {"pending", "running", "finished"}:
@@ -660,6 +818,115 @@ class TimelineTab(QWidget):
                     break
                 if clips[j].get("queue_job_id") or clips[j].get("status") in {"pending", "running", "finished"}:
                     clips[j]["stale"] = True
+
+    # --------------------------------------------------------------- undo/redo
+    def _history_snapshot(self) -> dict:
+        return {
+            "project": copy.deepcopy(self.project),
+            "selected_clip_id": self.selected_clip_id,
+            "selected_cut_index": int(self.selected_cut_index or 0),
+        }
+
+    @staticmethod
+    def _history_same(a: dict, b: dict) -> bool:
+        return (
+            isinstance(a, dict)
+            and isinstance(b, dict)
+            and a.get("project") == b.get("project")
+            and a.get("selected_clip_id") == b.get("selected_clip_id")
+            and int(a.get("selected_cut_index") or 0) == int(b.get("selected_cut_index") or 0)
+        )
+
+    def _end_history_coalesce(self):
+        self._history_coalesce_key = None
+
+    def _record_undo_state(self, label: str, *, coalesce_key: str | None = None):
+        """Store the state immediately before a user edit.
+
+        Repeated text/spin edits can be coalesced for a short interval, while
+        structural actions always create their own undo step. Any new edit clears
+        Redo, matching normal editor behaviour.
+        """
+        if self._history_restoring:
+            return
+        key = str(coalesce_key) if coalesce_key else None
+        if key and key == self._history_coalesce_key:
+            self._history_coalesce_timer.start()
+            return
+
+        snap = self._history_snapshot()
+        if not self._undo_stack or not self._history_same(self._undo_stack[-1].get("snapshot", {}), snap):
+            self._undo_stack.append({"label": str(label or "Edit"), "snapshot": snap})
+        self._redo_stack.clear()
+        self._history_coalesce_key = key
+        if key:
+            self._history_coalesce_timer.start()
+        else:
+            self._history_coalesce_timer.stop()
+        self._update_history_buttons()
+
+    def _reset_history(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._history_coalesce_key = None
+        self._history_coalesce_timer.stop()
+        self._update_history_buttons()
+
+    def _update_history_buttons(self):
+        if not hasattr(self, "undo_btn"):
+            return
+        self.undo_btn.setEnabled(bool(self._undo_stack))
+        self.redo_btn.setEnabled(bool(self._redo_stack))
+        if self._undo_stack:
+            self.undo_btn.setToolTip(f"Undo: {self._undo_stack[-1].get('label') or 'last Timeline edit'}")
+        else:
+            self.undo_btn.setToolTip("Nothing to undo in this Timeline session.")
+        if self._redo_stack:
+            self.redo_btn.setToolTip(f"Redo: {self._redo_stack[-1].get('label') or 'last undone Timeline edit'}")
+        else:
+            self.redo_btn.setToolTip("Nothing to redo in this Timeline session.")
+
+    def _restore_history_snapshot(self, snap: dict):
+        self._history_restoring = True
+        self._history_coalesce_key = None
+        self._history_coalesce_timer.stop()
+        try:
+            self.project = copy.deepcopy(snap.get("project") or self._new_project_data())
+            self.selected_clip_id = snap.get("selected_clip_id")
+            self.selected_clip_ids = {str(self.selected_clip_id)} if self.selected_clip_id else set()
+            self._selection_anchor_id = str(self.selected_clip_id) if self.selected_clip_id else None
+            self.selected_cut_index = int(snap.get("selected_cut_index") or 0)
+            self._refresh_all(select_first=True)
+        finally:
+            self._history_restoring = False
+        self._update_history_buttons()
+
+    def undo_timeline(self):
+        self._end_history_coalesce()
+        current = self._history_snapshot()
+        # Skip accidental no-op entries (for example a cancelled file picker).
+        while self._undo_stack and self._history_same(self._undo_stack[-1].get("snapshot", {}), current):
+            self._undo_stack.pop()
+        if not self._undo_stack:
+            self._update_history_buttons()
+            return False
+        entry = self._undo_stack.pop()
+        self._redo_stack.append({"label": entry.get("label") or "Edit", "snapshot": current})
+        self._restore_history_snapshot(entry["snapshot"])
+        return True
+
+    def redo_timeline(self):
+        self._end_history_coalesce()
+        current = self._history_snapshot()
+        while self._redo_stack and self._history_same(self._redo_stack[-1].get("snapshot", {}), current):
+            self._redo_stack.pop()
+        if not self._redo_stack:
+            self._update_history_buttons()
+            return False
+        entry = self._redo_stack.pop()
+        self._undo_stack.append({"label": entry.get("label") or "Edit", "snapshot": current})
+        self._restore_history_snapshot(entry["snapshot"])
+        return True
 
     def initialize_from_current_settings(self):
         """Populate the initial clip after the main window finished building.
@@ -692,12 +959,28 @@ class TimelineTab(QWidget):
         self.new_btn = QPushButton("New")
         self.save_btn = QPushButton("Save")
         self.load_btn = QPushButton("Load")
+        self.undo_btn = QPushButton("↶ Undo")
+        self.redo_btn = QPushButton("↷ Redo")
+        self.undo_btn.setEnabled(False)
+        self.redo_btn.setEnabled(False)
         self.add_clip_btn = QPushButton("+ Clip")
         self.dup_clip_btn = QPushButton("Duplicate")
         self.del_clip_btn = QPushButton("Delete")
+        self.lock_clip_btn = QPushButton("Lock selected")
+        self.lock_clip_btn.setToolTip("Lock selected timeline blocks so generation and editing actions cannot replace them.")
+        self.selection_btn = QPushButton("Selection")
+        self.selection_menu = QMenu(self.selection_btn)
+        self.select_all_action = self.selection_menu.addAction("Select all")
+        self.select_from_action = self.selection_menu.addAction("Select from here")
+        self.select_to_action = self.selection_menu.addAction("Select to here")
+        self.select_missing_action = self.selection_menu.addAction("Select all missing")
+        self.select_stale_action = self.selection_menu.addAction("Select stale")
+        self.selection_menu.addSeparator()
+        self.clear_selection_action = self.selection_menu.addAction("Clear selection")
+        self.selection_btn.setMenu(self.selection_menu)
         self.left_btn = QPushButton("◀")
         self.right_btn = QPushButton("▶")
-        for w in (self.new_btn, self.save_btn, self.load_btn, self.add_clip_btn, self.dup_clip_btn, self.del_clip_btn, self.left_btn, self.right_btn):
+        for w in (self.new_btn, self.save_btn, self.load_btn, self.undo_btn, self.redo_btn, self.add_clip_btn, self.dup_clip_btn, self.del_clip_btn, self.lock_clip_btn, self.selection_btn, self.left_btn, self.right_btn):
             toolbar.addWidget(w)
         toolbar.addSpacing(10)
         toolbar.addWidget(QLabel("Zoom"))
@@ -718,8 +1001,20 @@ class TimelineTab(QWidget):
         self.generate_timeline_btn = QPushButton("▶ Generate Timeline")
         self.generate_timeline_btn.setMinimumHeight(36)
         self.generate_timeline_btn.setToolTip(
-            "Queue every clip on this timeline as a separate MiniMax H3 generation in timeline order."
+            "Choose which part of the timeline to generate."
         )
+        self.generate_timeline_menu = QMenu(self.generate_timeline_btn)
+        self.generate_all_action = self.generate_timeline_menu.addAction("Generate all clips")
+        self.generate_missing_action = self.generate_timeline_menu.addAction("Generate all missing clips")
+        self.generate_selected_only_action = self.generate_timeline_menu.addAction("Generate selected clips only")
+        self.generate_from_selected_action = self.generate_timeline_menu.addAction("Start generate from selected block")
+        self.generate_timeline_menu.addSeparator()
+        self.generate_cancel_action = self.generate_timeline_menu.addAction("Cancel")
+        self.generate_timeline_btn.setMenu(self.generate_timeline_menu)
+        self.generate_all_action.triggered.connect(lambda: self.generate_timeline("all"))
+        self.generate_missing_action.triggered.connect(lambda: self.generate_timeline("missing"))
+        self.generate_selected_only_action.triggered.connect(lambda: self.generate_timeline("selected_only"))
+        self.generate_from_selected_action.triggered.connect(lambda: self.generate_timeline("selected_onward"))
         self.hq_restart_btn = QPushButton("HQ restart")
         self.hq_restart_btn.setMinimumHeight(36)
         self.hq_restart_btn.setToolTip(
@@ -948,7 +1243,8 @@ class TimelineTab(QWidget):
         self.new_btn.clicked.connect(self.new_project)
         self.save_btn.clicked.connect(self.save_project)
         self.load_btn.clicked.connect(self.load_project)
-        self.generate_timeline_btn.clicked.connect(self.generate_timeline)
+        self.undo_btn.clicked.connect(self.undo_timeline)
+        self.redo_btn.clicked.connect(self.redo_timeline)
         self.hq_restart_btn.clicked.connect(self.hq_restart)
         self.generate_selected_btn.clicked.connect(self.generate_selected)
         self.assemble_timeline_btn.clicked.connect(self.assemble_timeline)
@@ -958,10 +1254,18 @@ class TimelineTab(QWidget):
         self.add_clip_btn.clicked.connect(self.add_clip)
         self.dup_clip_btn.clicked.connect(self.duplicate_clip)
         self.del_clip_btn.clicked.connect(self.delete_clip)
+        self.lock_clip_btn.clicked.connect(self.toggle_lock_selected)
+        self.select_all_action.triggered.connect(self.select_all_clips)
+        self.select_from_action.triggered.connect(self.select_from_here)
+        self.select_to_action.triggered.connect(self.select_to_here)
+        self.select_missing_action.triggered.connect(self.select_all_missing)
+        self.select_stale_action.triggered.connect(self.select_all_stale)
+        self.clear_selection_action.triggered.connect(self.clear_selection)
         self.left_btn.clicked.connect(lambda: self.move_clip(-1))
         self.right_btn.clicked.connect(lambda: self.move_clip(1))
         self.zoom_slider.valueChanged.connect(self.canvas.set_zoom)
         self.canvas.clipSelected.connect(self.select_clip)
+        self.canvas.clipSelectionRequested.connect(self._selection_requested)
         self.canvas.clipsReordered.connect(self._reorder_clips)
         self.canvas.clipFramesChanged.connect(self._canvas_frames_changed)
         self.clip_name.textEdited.connect(self._clip_name_changed)
@@ -978,25 +1282,50 @@ class TimelineTab(QWidget):
 
     # -------------------------------------------------------------- refreshers
     def _refresh_all(self, *, select_first=False):
+        self._update_history_buttons()
+        valid_ids = {str(c.get("id")) for c in self._clips()}
+        self.selected_clip_ids = {str(x) for x in self.selected_clip_ids if str(x) in valid_ids}
         if select_first and self._clips() and not self.selected_clip_id:
-            self.selected_clip_id = self._clips()[0]["id"]
-        if self.selected_clip_id and not any(c.get("id") == self.selected_clip_id for c in self._clips()):
-            self.selected_clip_id = self._clips()[0]["id"] if self._clips() else None
+            self.selected_clip_id = str(self._clips()[0]["id"])
+        if self.selected_clip_id and str(self.selected_clip_id) not in valid_ids:
+            self.selected_clip_id = next(iter(self.selected_clip_ids), None)
+        if self.selected_clip_id:
+            self.selected_clip_ids.add(str(self.selected_clip_id))
+        elif self.selected_clip_ids:
+            self.selected_clip_id = next((str(c.get("id")) for c in self._clips() if str(c.get("id")) in self.selected_clip_ids), None)
+        if select_first and self.selected_clip_id:
+            self.selected_clip_ids.add(str(self.selected_clip_id))
+            self._selection_anchor_id = str(self.selected_clip_id)
         total = sum(_clip_seconds(c) for c in self._clips())
-        self.summary_label.setText(f"{len(self._clips())} clips  •  {total:.2f}s  •  {round(total * FPS)} timeline frames")
+        selection_suffix = f"  •  {len(self.selected_clip_ids)} selected" if len(self.selected_clip_ids) > 1 else ""
+        locked_count = sum(1 for c in self._clips() if bool(c.get("locked", False)))
+        lock_suffix = f"  •  {locked_count} locked" if locked_count else ""
+        self.summary_label.setText(f"{len(self._clips())} clips  •  {total:.2f}s  •  {round(total * FPS)} timeline frames{selection_suffix}{lock_suffix}")
         self.generate_timeline_btn.setEnabled(bool(self._clips()))
         self.hq_restart_btn.setEnabled(bool(self._clips()))
         ready, reason = self._assembly_ready()
-        self.assemble_timeline_btn.setEnabled(bool(self._clips()))
+        self.assemble_timeline_btn.setEnabled(
+            bool(self._clips()) and not bool(getattr(self, "_timeline_assemble_click_busy", False))
+        )
         self.assemble_timeline_btn.setToolTip(
-            "Join the finished timeline clip outputs, in timeline order, into one final MP4."
+            "Assemble every Timeline block that has an existing output file, in Timeline order. Stale status is ignored."
             if ready else reason
         )
         self.summary_label.setToolTip(
             str(self._project_path) if self._project_path
             else f"Autosaving recovery project to {self._autosave_temp_path}"
         )
-        self.canvas.set_clips(self._clips(), self.selected_clip_id)
+        self.canvas.set_clips(self._clips(), self.selected_clip_id, self.selected_clip_ids)
+        selected_clips = [c for c in self._clips() if str(c.get("id")) in self.selected_clip_ids]
+        any_selected = bool(selected_clips)
+        all_locked = any_selected and all(bool(c.get("locked", False)) for c in selected_clips)
+        self.lock_clip_btn.setEnabled(any_selected)
+        self.lock_clip_btn.setText("Unlock selected" if all_locked else "Lock selected")
+        self.del_clip_btn.setEnabled(any(not bool(c.get("locked", False)) for c in selected_clips))
+        primary = self._selected_clip()
+        primary_locked = bool((primary or {}).get("locked", False))
+        self.left_btn.setEnabled(bool(primary) and not primary_locked)
+        self.right_btn.setEnabled(bool(primary) and not primary_locked)
         self._load_inspector()
 
     def _load_inspector(self):
@@ -1025,6 +1354,7 @@ class TimelineTab(QWidget):
                 self.cut_prompt.clear()
                 return
             settings = clip.setdefault("settings", {})
+            locked = bool(clip.get("locked", False))
             self.clip_name.setText(str(clip.get("name") or ""))
             selected_index = self._selected_index()
             self._populate_generation_modes(selected_index, str(clip.get("generation_mode") or "new"))
@@ -1034,9 +1364,12 @@ class TimelineTab(QWidget):
             self.start_source_label.setVisible(is_source)
             if hasattr(self.clip_form, "setRowVisible"):
                 self.clip_form.setRowVisible(self.start_source_label, is_source)
-            self.prompt_box.setEnabled(enabled and not is_source)
-            self.references_box.setEnabled(enabled and not is_source)
-            self.settings_box.setEnabled(enabled and not is_source)
+            editable = enabled and not is_source and not locked
+            self.clip_name.setEnabled(enabled and not locked)
+            self.gen_mode.setEnabled(enabled and not locked)
+            self.prompt_box.setEnabled(editable)
+            self.references_box.setEnabled(editable)
+            self.settings_box.setEnabled(editable)
             self.use_refs_check.blockSignals(True)
             self.use_refs_check.setChecked(bool(clip.get("use_reference_images", False)))
             self.use_refs_check.blockSignals(False)
@@ -1047,7 +1380,7 @@ class TimelineTab(QWidget):
             # A loaded start video is already the first timeline result; it needs no H3 prompt or generation settings.
             for w in (self.frames_combo, self.seed_spin, self.steps_spin, self.scheduler_combo,
                       self.audio_memory_check, self.cut_prompt):
-                w.setEnabled(enabled and not is_source)
+                w.setEnabled(editable)
             fidx = self.frames_combo.findData(int(clip.get("frames") or 243))
             if fidx >= 0: self.frames_combo.setCurrentIndex(fidx)
             self.seed_spin.setValue(int(settings.get("seed", -1)))
@@ -1062,6 +1395,7 @@ class TimelineTab(QWidget):
             self._refresh_edit_workflow(clip)
             state = str(clip.get("status") or "draft").title()
             if clip.get("stale"): state = "Stale — edited after queue/render"
+            if locked: state = f"Locked — {state}"
             self.state_label.setText(state)
             output = str(clip.get("output") or "")
             output_exists = bool(output and Path(output).is_file())
@@ -1306,8 +1640,11 @@ class TimelineTab(QWidget):
         self.project["project_folder"] = str(project_folder)
         self._project_path = None
         self.selected_clip_id = None
+        self.selected_clip_ids = set()
+        self._selection_anchor_id = None
         self.selected_cut_index = 0
         self._ensure_initial_clip()
+        self._reset_history()
         # Write the first recovery snapshot immediately; subsequent autosaves keep
         # updating the same file under output/timeline/.
         try:
@@ -1395,6 +1732,7 @@ class TimelineTab(QWidget):
             self.project["auto_assemble"] = False
             self.project["auto_assemble_pending"] = False
             self.project.setdefault("global_generation_settings", {})
+            self.project.setdefault("hq_restart_override", {})
             for clip in self.project.get("clips") or []:
                 legacy_match = bool(clip.get("match_next_first_frame", False))
                 if not clip.get("edit_mode"):
@@ -1426,6 +1764,8 @@ class TimelineTab(QWidget):
                 clip.setdefault("stale", False)
                 clip.setdefault("queue_job_id", None)
                 clip.setdefault("output", "")
+                clip.setdefault("hq_generated", False)
+                clip.setdefault("locked", False)
                 if not clip.get("segments"):
                     clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
                 for seg in clip["segments"]:
@@ -1472,7 +1812,10 @@ class TimelineTab(QWidget):
 
             self._project_path = Path(name)
             self.selected_clip_id = self._clips()[0]["id"] if self._clips() else None
+            self.selected_clip_ids = {str(self.selected_clip_id)} if self.selected_clip_id else set()
+            self._selection_anchor_id = str(self.selected_clip_id) if self.selected_clip_id else None
             self.selected_cut_index = 0
+            self._reset_history()
             self._refresh_all(select_first=True)
         except Exception as exc:
             QMessageBox.critical(self, "Load timeline failed", str(exc))
@@ -1481,6 +1824,7 @@ class TimelineTab(QWidget):
     def add_clip(self):
         if not self._ensure_project_setup_for_first_edit():
             return
+        self._record_undo_state("Add clip")
         clips = self._clips()
         idx = self._selected_index()
         insert_at = len(clips) if idx < 0 else idx + 1
@@ -1493,6 +1837,8 @@ class TimelineTab(QWidget):
         clips.insert(insert_at, clip)
         self._invalidate_assembly()
         self.selected_clip_id = clip["id"]
+        self.selected_clip_ids = {str(clip["id"])}
+        self._selection_anchor_id = str(clip["id"])
         self.selected_cut_index = 0
         self._renumber_default_names()
         self._refresh_all()
@@ -1505,51 +1851,83 @@ class TimelineTab(QWidget):
         if str(self._clips()[idx].get("generation_mode") or "") == "source":
             QMessageBox.information(self, "Timeline", "The loaded start clip is a source video and cannot be duplicated as a generation block.")
             return
+        self._record_undo_state("Duplicate clip")
         clone = copy.deepcopy(self._clips()[idx])
         clone["id"] = uuid.uuid4().hex
         clone["name"] = str(clone.get("name") or f"Clip {idx + 1}") + " copy"
         clone["queue_job_id"] = None; clone["output"] = ""; clone["status"] = "draft"; clone["stale"] = False
+        clone["locked"] = False
         for seg in clone.get("segments") or []: seg["id"] = uuid.uuid4().hex
         self._clips().insert(idx + 1, clone)
         self._invalidate_assembly()
         self.selected_clip_id = clone["id"]
+        self.selected_clip_ids = {str(clone["id"])}
+        self._selection_anchor_id = str(clone["id"])
         self._refresh_all()
 
     def delete_clip(self):
-        idx = self._selected_index()
-        if idx < 0: return
-        clip = self._clips()[idx]
-        has_content = any(str(s.get("prompt") or "").strip() for s in clip.get("segments") or [])
-        if has_content and QMessageBox.question(self, "Delete clip", f"{clip.get('name')} contains prompt text. Delete it anyway?") != QMessageBox.StandardButton.Yes:
+        indices = self._selected_indices()
+        if not indices:
             return
-        self._clips().pop(idx)
+        unlocked = [i for i in indices if not bool(self._clips()[i].get("locked", False))]
+        if not unlocked:
+            QMessageBox.information(self, "Delete clip", "The selected block(s) are locked. Unlock them before deleting.")
+            return
+        named = [str(self._clips()[i].get("name") or f"Clip {i + 1}") for i in unlocked]
+        has_content = any(
+            any(str(seg.get("prompt") or "").strip() for seg in self._clips()[i].get("segments") or [])
+            for i in unlocked
+        )
+        locked_skipped = len(indices) - len(unlocked)
+        if has_content or locked_skipped:
+            if len(unlocked) > 1:
+                msg = f"Delete {len(unlocked)} selected unlocked blocks?"
+            else:
+                msg = f"Delete {named[0]}?"
+            if locked_skipped:
+                msg += f"\n\n{locked_skipped} locked selected block(s) will be kept."
+            if QMessageBox.question(self, "Delete clip", msg) != QMessageBox.StandardButton.Yes:
+                return
+        self._record_undo_state("Delete clips" if len(unlocked) > 1 else "Delete clip")
+        first = min(unlocked)
+        removed_ids = {str(self._clips()[i].get("id")) for i in unlocked}
+        for i in sorted(unlocked, reverse=True):
+            self._clips().pop(i)
+        self.selected_clip_ids -= removed_ids
         self._invalidate_assembly()
         self._renumber_default_names()
         if self._clips():
-            self.selected_clip_id = self._clips()[min(idx, len(self._clips()) - 1)]["id"]
+            fallback = self._clips()[min(first, len(self._clips()) - 1)]
+            self.selected_clip_id = str(fallback.get("id"))
+            self.selected_clip_ids = {self.selected_clip_id}
+            self._selection_anchor_id = self.selected_clip_id
         else:
             self.selected_clip_id = None
+            self.selected_clip_ids = set()
+            self._selection_anchor_id = None
         self.selected_cut_index = 0
-        # Deleting a clip only changes the continuation boundary at the deletion
-        # point and after it. Clips before that point keep exactly the same source
-        # video/latent history and must remain valid. Deleting the final clip
-        # therefore invalidates nothing.
-        stale_from = idx if idx < len(self._clips()) else None
+        stale_from = first if first < len(self._clips()) else None
         self._repair_continuation_chain(mark_stale=True, stale_from=stale_from)
         self._refresh_all()
 
     def move_clip(self, delta):
         idx = self._selected_index()
         target = idx + int(delta)
-        if idx < 0 or not (0 <= target < len(self._clips())): return
+        if idx < 0 or bool((self._selected_clip() or {}).get("locked", False)) or not (0 <= target < len(self._clips())): return
         self._reorder_clips(idx, target)
 
     def _reorder_clips(self, old, new):
         clips = self._clips()
         if not (0 <= old < len(clips) and 0 <= new < len(clips)): return
+        if bool(clips[old].get("locked", False)):
+            return
+        lo, hi = sorted((old, new))
+        if any(bool(clips[i].get("locked", False)) for i in range(lo, hi + 1) if i != old):
+            return
         # A user-loaded start video is the root of the chain and must remain first.
         if clips and str(clips[0].get("generation_mode") or "") == "source" and (old == 0 or new == 0):
             return
+        self._record_undo_state("Reorder clips")
         item = clips.pop(old); clips.insert(new, item)
         self._invalidate_assembly()
         # Reordering only changes continuation ancestry starting at the earliest
@@ -1579,12 +1957,111 @@ class TimelineTab(QWidget):
             ):
                 clip["stale"] = True
 
-    def select_clip(self, clip_id):
-        self.selected_clip_id = str(clip_id)
+    def _ordered_selected_ids(self):
+        return [str(c.get("id")) for c in self._clips() if str(c.get("id")) in self.selected_clip_ids]
+
+    def _selected_indices(self):
+        return [i for i, c in enumerate(self._clips()) if str(c.get("id")) in self.selected_clip_ids]
+
+    def _apply_selection(self, ids, primary=None, *, anchor=None):
+        valid = {str(c.get("id")) for c in self._clips()}
+        self.selected_clip_ids = {str(x) for x in ids if str(x) in valid}
+        if primary is not None and str(primary) in self.selected_clip_ids:
+            self.selected_clip_id = str(primary)
+        elif self.selected_clip_ids:
+            self.selected_clip_id = next((str(c.get("id")) for c in self._clips() if str(c.get("id")) in self.selected_clip_ids), None)
+        else:
+            self.selected_clip_id = None
+        if anchor is not None:
+            self._selection_anchor_id = str(anchor) if str(anchor) in valid else None
+        elif not self.selected_clip_ids:
+            self._selection_anchor_id = None
         self.selected_cut_index = 0
-        self.canvas.selected_id = self.selected_clip_id
-        self.canvas.update()
-        self._load_inspector()
+        self._refresh_all()
+
+    def select_clip(self, clip_id):
+        # Legacy/plain selection path.
+        clip_id = str(clip_id)
+        self._apply_selection({clip_id}, clip_id, anchor=clip_id)
+
+    def _selection_requested(self, clip_id, modifiers_value=0):
+        clip_id = str(clip_id)
+        ctrl = bool(int(modifiers_value) & int(Qt.KeyboardModifier.ControlModifier.value))
+        shift = bool(int(modifiers_value) & int(Qt.KeyboardModifier.ShiftModifier.value))
+        clips = self._clips()
+        ids = [str(c.get("id")) for c in clips]
+        if clip_id not in ids:
+            return
+
+        if shift:
+            anchor = self._selection_anchor_id or self.selected_clip_id or clip_id
+            try:
+                a = ids.index(str(anchor)); b = ids.index(clip_id)
+            except ValueError:
+                a = b = ids.index(clip_id)
+            lo, hi = sorted((a, b))
+            range_ids = set(ids[lo:hi + 1])
+            if ctrl:
+                range_ids |= set(self.selected_clip_ids)
+            self._apply_selection(range_ids, clip_id, anchor=anchor)
+            return
+
+        if ctrl:
+            new_ids = set(self.selected_clip_ids)
+            if clip_id in new_ids:
+                new_ids.remove(clip_id)
+                primary = self.selected_clip_id if self.selected_clip_id in new_ids else None
+            else:
+                new_ids.add(clip_id)
+                primary = clip_id
+            self._apply_selection(new_ids, primary, anchor=clip_id if clip_id in new_ids else self._selection_anchor_id)
+            return
+
+        self._apply_selection({clip_id}, clip_id, anchor=clip_id)
+
+    def select_all_clips(self):
+        ids = [str(c.get("id")) for c in self._clips()]
+        self._apply_selection(ids, self.selected_clip_id or (ids[0] if ids else None), anchor=self.selected_clip_id or (ids[0] if ids else None))
+
+    def select_from_here(self):
+        idx = self._selected_index()
+        if idx < 0:
+            return
+        ids = [str(c.get("id")) for c in self._clips()[idx:]]
+        self._apply_selection(ids, self.selected_clip_id, anchor=self.selected_clip_id)
+
+    def select_to_here(self):
+        idx = self._selected_index()
+        if idx < 0:
+            return
+        ids = [str(c.get("id")) for c in self._clips()[:idx + 1]]
+        self._apply_selection(ids, self.selected_clip_id, anchor=self.selected_clip_id)
+
+    def select_all_missing(self):
+        ids = [str(c.get("id")) for c in self._clips() if not self._clip_has_usable_output(c)]
+        self._apply_selection(ids, ids[0] if ids else None, anchor=ids[0] if ids else None)
+
+    def select_all_stale(self):
+        ids = [str(c.get("id")) for c in self._clips() if bool(c.get("stale", False))]
+        self._apply_selection(ids, ids[0] if ids else None, anchor=ids[0] if ids else None)
+
+    def clear_selection(self):
+        self._apply_selection(set(), None, anchor=None)
+
+    def toggle_lock_selected(self):
+        selected = [c for c in self._clips() if str(c.get("id")) in self.selected_clip_ids]
+        if not selected:
+            return False
+        unlock = all(bool(c.get("locked", False)) for c in selected)
+        self._record_undo_state("Unlock clips" if unlock else "Lock clips")
+        for clip in selected:
+            clip["locked"] = not unlock
+        self._refresh_all()
+        return True
+
+    def _selected_clip_locked(self):
+        clip = self._selected_clip()
+        return bool((clip or {}).get("locked", False))
 
     # ---------------------------------------------------------- inspector slots
     def _project_name_changed(self, text):
@@ -1593,7 +2070,8 @@ class TimelineTab(QWidget):
     def _clip_name_changed(self, text):
         if self._loading_inspector: return
         clip = self._selected_clip()
-        if not clip: return
+        if not clip or bool(clip.get("locked", False)): return
+        self._record_undo_state("Rename clip", coalesce_key=f"clip-name:{clip.get('id')}")
         clip["name"] = text
         self.canvas.update()
 
@@ -1687,9 +2165,10 @@ class TimelineTab(QWidget):
         if self._loading_inspector:
             return
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip or str(clip.get("generation_mode") or "") == "source":
+        if not clip or bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
             return
         enabled = bool(enabled)
+        self._record_undo_state("Toggle reference images")
         clip["use_reference_images"] = enabled
         self.use_refs_warning.setVisible(enabled)
         self.use_refs_guide.setVisible(enabled)
@@ -1704,7 +2183,7 @@ class TimelineTab(QWidget):
 
     def _add_reference_images(self):
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip or str(clip.get("generation_mode") or "") == "source":
+        if not clip or bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
             return
         refs = _reference_entries(clip)
         remaining = 5 - len(refs)
@@ -1717,6 +2196,7 @@ class TimelineTab(QWidget):
         )
         if not names:
             return
+        self._record_undo_state("Add reference images")
         added = 0
         existing = {str(Path(r["path"]).resolve()) for r in refs if Path(r["path"]).exists()}
         for name in names:
@@ -1742,12 +2222,13 @@ class TimelineTab(QWidget):
 
     def _remove_reference_image(self, ref_index: int):
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip:
+        if not clip or bool(clip.get("locked", False)):
             return
         refs = _reference_entries(clip)
         if not (0 <= ref_index < len(refs)):
             return
         old_count = len(refs)
+        self._record_undo_state("Remove reference image")
         refs.pop(ref_index)
         clip["reference_images"] = refs
         # Ref2VA Picture numbering is positional. Renumber Subject tokens in the
@@ -1773,12 +2254,15 @@ class TimelineTab(QWidget):
 
     def _reference_name_changed(self, ref_index: int, text: str):
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip:
+        if not clip or bool(clip.get("locked", False)):
             return
         refs = _reference_entries(clip)
         if not (0 <= ref_index < len(refs)):
             return
         value = str(text or "").strip() or Path(refs[ref_index]["path"]).stem
+        if value == str(refs[ref_index].get("name") or ""):
+            return
+        self._record_undo_state("Rename reference image")
         refs[ref_index]["name"] = value
         clip["reference_images"] = refs
         self._touch_clip(idx, propagate=False)
@@ -1844,11 +2328,12 @@ class TimelineTab(QWidget):
         if self._loading_inspector:
             return
         idx = self._selected_index(); clip = self._selected_clip()
-        if not clip:
+        if not clip or bool(clip.get("locked", False)):
             return
         mode = str(self.gen_mode.currentData() or "new")
         if idx == 0 and mode == "source":
             previous_mode = str(clip.get("generation_mode") or "new")
+            self._record_undo_state("Load start clip")
             if not self._choose_start_video(clip):
                 self._loading_inspector = True
                 try:
@@ -1860,6 +2345,7 @@ class TimelineTab(QWidget):
             return
         # Switching back from a loaded start clip turns block 1 into a normal draft generation.
         if idx == 0 and str(clip.get("generation_mode") or "") == "source" and mode == "new":
+            self._record_undo_state("Change generation mode")
             clip["generation_mode"] = "new"
             clip["start_source_video"] = ""
             clip["source_duration_seconds"] = 0.0
@@ -1870,6 +2356,8 @@ class TimelineTab(QWidget):
             self._touch_clip(idx)
             self._refresh_all()
             return
+        if mode != str(clip.get("generation_mode") or "new"):
+            self._record_undo_state("Change generation mode")
         clip["generation_mode"] = mode
         self._touch_clip(idx)
         self._refresh_all()
@@ -1877,9 +2365,10 @@ class TimelineTab(QWidget):
     def _frames_changed(self):
         if self._loading_inspector: return
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip: return
+        if not clip or bool(clip.get("locked", False)): return
         frames = int(self.frames_combo.currentData() or clip.get("frames") or 243)
         if frames != int(clip.get("frames") or 0):
+            self._record_undo_state("Change clip duration")
             clip["frames"] = frames
             clip.setdefault("settings", {})["frames"] = frames
             clip["settings"]["experimental_long_duration"] = frames > 719
@@ -1889,6 +2378,11 @@ class TimelineTab(QWidget):
     def _canvas_frames_changed(self, clip_id, frames):
         for i, clip in enumerate(self._clips()):
             if str(clip.get("id")) == str(clip_id):
+                if bool(clip.get("locked", False)):
+                    break
+                if int(frames) == int(clip.get("frames") or 0):
+                    break
+                self._record_undo_state("Resize clip")
                 clip["frames"] = int(frames)
                 clip.setdefault("settings", {})["frames"] = int(frames)
                 clip["settings"]["experimental_long_duration"] = int(frames) > 719
@@ -1899,7 +2393,8 @@ class TimelineTab(QWidget):
     def _settings_changed(self, *args):
         if self._loading_inspector: return
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip: return
+        if not clip or bool(clip.get("locked", False)): return
+        self._record_undo_state("Change clip settings", coalesce_key=f"settings:{clip.get('id')}")
         s = clip.setdefault("settings", {})
         s["seed"] = self.seed_spin.value(); s["steps"] = self.steps_spin.value(); s["scheduler"] = self.scheduler_combo.currentText()
         s["glue_results"] = False
@@ -1912,6 +2407,13 @@ class TimelineTab(QWidget):
         idx = self._selected_index()
         if clip is None or idx < 0:
             self.edit_selected_label.setText("Select a block to choose how it should be regenerated.")
+            for b in buttons:
+                b.setEnabled(False)
+            self.generate_selected_btn.setEnabled(False)
+            return
+
+        if bool(clip.get("locked", False)):
+            self.edit_selected_label.setText("Locked block — unlock it before changing regeneration mode or recreating it.")
             for b in buttons:
                 b.setEnabled(False)
             self.generate_selected_btn.setEnabled(False)
@@ -1967,9 +2469,12 @@ class TimelineTab(QWidget):
         if self._loading_inspector or button is None:
             return
         clip = self._selected_clip()
-        if not clip:
+        if not clip or bool(clip.get("locked", False)):
             return
         mode = str(button.property("edit_mode") or "standalone")
+        if mode == str(clip.get("edit_mode") or ""):
+            return
+        self._record_undo_state("Change regeneration mode")
         clip["edit_mode"] = mode
         # This is an edit strategy, not a content change. Choosing it must not
         # stale the clip or mutate the normal first-time creation workflow.
@@ -1984,10 +2489,11 @@ class TimelineTab(QWidget):
             QMessageBox.warning(self, "Timeline settings", "No Generation-tab settings were available to capture.")
             return False
 
+        self._record_undo_state("Use current Generation settings")
         self.project["global_generation_settings"] = copy.deepcopy(settings)
         changed_finished = False
         for idx, clip in enumerate(self._clips()):
-            if str(clip.get("generation_mode") or "") == "source":
+            if bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
                 continue
             # Preserve all Timeline-owned values. Queue-time logic will add the
             # block's frames, prompt, refs and continuation source separately.
@@ -2012,8 +2518,9 @@ class TimelineTab(QWidget):
         if self._loading_inspector:
             return
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip:
+        if not clip or bool(clip.get("locked", False)):
             return
+        self._record_undo_state("Edit prompt", coalesce_key=f"prompt:{clip.get('id')}")
         segments = clip.setdefault("segments", [])
         if not segments:
             segments.append({"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0})
@@ -2101,23 +2608,30 @@ class TimelineTab(QWidget):
 
     # --------------------------------------------------------------- results
     def _assembly_ready(self):
+        """Assembly is intentionally independent from Timeline dependency state.
+
+        "Stale" only means a generated clip may no longer match the current
+        continuation plan. It must never prevent the user from concatenating
+        files that already exist. Assembly therefore checks only whether every
+        visible Timeline block has a real output file.
+        """
         clips = self._clips()
         if not clips:
             return False, "Timeline has no clips."
-        if self._recover_old_anchor_preserve_state():
-            self._refresh_all()
         for i, clip in enumerate(clips):
             name = str(clip.get("name") or f"Clip {i + 1}")
-            if clip.get("stale"):
-                return False, f"{name} is stale and must be regenerated first."
-            if str(clip.get("status") or "") != "finished":
-                return False, f"{name} has not finished generating."
             output = str(clip.get("output") or "")
             if not output or not Path(output).is_file():
                 return False, f"{name} has no usable output file."
         return True, ""
 
     def assemble_timeline(self):
+        # Assembly is a read-only operation on the Timeline project. Repeated
+        # clicks while FFmpeg is being started/running are ignored so the action
+        # cannot trigger duplicate requests or interact with edit-state logic.
+        if getattr(self, "_timeline_assemble_click_busy", False):
+            return False
+
         ready, reason = self._assembly_ready()
         if not ready:
             QMessageBox.information(self, "Timeline assembly", reason)
@@ -2125,12 +2639,28 @@ class TimelineTab(QWidget):
         if not callable(self.assemble_timeline_callback):
             QMessageBox.warning(self, "Timeline assembly", "Timeline assembly is not connected to the standalone GUI.")
             return False
+
+        self._timeline_assemble_click_busy = True
         self.project["assembly_status"] = "Assembling…"
         self.project["assembled_output"] = ""
+        self.assemble_timeline_btn.setEnabled(False)
+        self.assemble_timeline_btn.setText("Assembling…")
         self._refresh_all()
-        result = self.assemble_timeline_callback(copy.deepcopy(self.project))
-        if not result and self.project.get("assembly_status") == "Assembling…":
-            self.project["assembly_status"] = "Assembly did not start."
+        try:
+            result = self.assemble_timeline_callback(copy.deepcopy(self.project))
+        except Exception as exc:
+            self._timeline_assemble_click_busy = False
+            self.project["assembly_status"] = f"Assembly failed: {exc}"
+            self.assemble_timeline_btn.setText("Assemble Video")
+            self._refresh_all()
+            QMessageBox.critical(self, "Timeline assembly failed", str(exc))
+            return False
+
+        if not result:
+            self._timeline_assemble_click_busy = False
+            if self.project.get("assembly_status") == "Assembling…":
+                self.project["assembly_status"] = "Assembly did not start."
+            self.assemble_timeline_btn.setText("Assemble Video")
             self._refresh_all()
         return bool(result)
 
@@ -2142,11 +2672,17 @@ class TimelineTab(QWidget):
     def mark_assembly_finished(self, output):
         self.project["assembled_output"] = str(output or "")
         self.project["assembly_status"] = "Finished"
+        self._timeline_assemble_click_busy = False
+        if hasattr(self, "assemble_timeline_btn"):
+            self.assemble_timeline_btn.setText("Assemble Video")
         self._refresh_all()
 
     def mark_assembly_failed(self, message):
         self.project["assembled_output"] = ""
         self.project["assembly_status"] = "Assembly failed: " + str(message or "Unknown error")
+        self._timeline_assemble_click_busy = False
+        if hasattr(self, "assemble_timeline_btn"):
+            self.assemble_timeline_btn.setText("Assemble Video")
         self._refresh_all()
 
     def preview_selected_result(self):
@@ -2210,11 +2746,19 @@ class TimelineTab(QWidget):
     def generation_specs(self):
         specs = []
         clips = self._clips()
+        hq_override = self.project.get("hq_restart_override") or {}
+        if not isinstance(hq_override, dict):
+            hq_override = {}
         for i, clip in enumerate(clips):
             spec = copy.deepcopy(clip)
             spec["timeline_index"] = i
             spec["compiled_prompt"] = _compiled_reference_prompt(clip)
             spec["timeline_reference_images"] = _reference_entries(clip)
+            # HQ restart is a project-level generation mode. Once selected, keep
+            # using the same override for later single-clip regenerations and
+            # subsequent timeline generation, including after save/reload.
+            if hq_override and str(clip.get("generation_mode") or "") != "source":
+                spec["timeline_hq_override"] = copy.deepcopy(hq_override)
             # Edit/replacement topology is used only by Regenerate selected block.
             spec["match_next_first_frame"] = False
             if i > 0:
@@ -2254,6 +2798,9 @@ class TimelineTab(QWidget):
             clip = self._selected_clip()
             idx = self._selected_index()
             if clip is None or idx < 0:
+                return False
+            if bool(clip.get("locked", False)):
+                QMessageBox.information(self, "Timeline edit", "This block is locked. Unlock it before regenerating it.")
                 return False
 
             if str(clip.get("generation_mode") or "") == "source":
@@ -2344,6 +2891,7 @@ class TimelineTab(QWidget):
                 QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
                 return False
 
+            self._record_undo_state("Regenerate selected clip")
             try:
                 result = self.queue_timeline_callback([spec])
             except Exception as exc:
@@ -2355,6 +2903,9 @@ class TimelineTab(QWidget):
                 return False
 
             if result:
+                active_hq = self.project.get("hq_restart_override") or {}
+                if isinstance(active_hq, dict) and active_hq:
+                    clip["hq_generated"] = True
                 self._invalidate_assembly("Selected clip regenerated — assemble again when ready.")
 
                 # A free-ending continuation changes the boundary consumed by the
@@ -2402,18 +2953,152 @@ class TimelineTab(QWidget):
                 self.generate_selected_btn.setText(old_button_text)
                 self._refresh_edit_workflow(self._selected_clip())
 
-    def generate_timeline(self):
+    def _clip_has_usable_output(self, clip: dict) -> bool:
+        """Return True only when this block already has a video that can be reused."""
+        if str(clip.get("generation_mode") or "") == "source":
+            source = str(clip.get("start_source_video") or clip.get("output") or "")
+            return bool(source and Path(source).is_file())
+        output = str(clip.get("output") or "")
+        return bool(output and Path(output).is_file())
+
+    def _validate_generation_indices(self, indices: list[int]):
+        """Validate only blocks that are part of this Generate Timeline request.
+
+        This deliberately does not validate unrelated earlier blocks for
+        'start from selected'. A selected continuation block is allowed to run
+        without its previous block; _generation_specs_for_indices() detaches the
+        first queued block when no usable predecessor exists.
+        """
+        clips = self._clips()
+        if not clips:
+            return False, "Timeline has no clips."
+        if not indices:
+            return False, "There are no clips to generate for this selection."
+
+        for i in indices:
+            if i < 0 or i >= len(clips):
+                continue
+            clip = clips[i]
+            mode = str(clip.get("generation_mode") or "new")
+            name = str(clip.get("name") or f"Clip {i + 1}")
+            if mode == "source":
+                source = str(clip.get("start_source_video") or clip.get("output") or "")
+                if not source or not Path(source).is_file():
+                    return False, f"{name} is a loaded start clip, but its video file is missing."
+                continue
+            prompt = _compiled_prompt(clip)
+            if not prompt:
+                return False, f"{name} has no prompt."
+            if bool(clip.get("use_reference_images", False)):
+                refs = _reference_entries(clip)
+                if not refs:
+                    return False, f"{name} has reference mode enabled but no reference images."
+                if len(refs) > 5:
+                    return False, f"{name} has more than 5 reference images."
+                missing = [r["path"] for r in refs if not Path(r["path"]).is_file()]
+                if missing:
+                    return False, f"{name} has a missing reference image: {missing[0]}"
+                if mode == "continue":
+                    return False, f"{name} uses reference images and cannot Continue Previous Clip."
+            if int(clip.get("frames") or 0) not in self.frame_values:
+                return False, f"{name} has an invalid H3 frame count."
+        return True, ""
+
+    def _generation_specs_for_indices(self, indices: list[int]) -> list[dict]:
+        """Build a queue batch for an arbitrary subset of Timeline blocks.
+
+        Original timeline_index values are preserved so queue/result mapping
+        still targets the correct blocks. If the first selected continuation
+        block has no usable predecessor outside the batch, generate it as a
+        standalone start for this run instead of refusing to queue the batch.
+        """
+        all_specs = self.generation_specs()
+        wanted = {int(i) for i in indices}
+        specs = [copy.deepcopy(all_specs[i]) for i in indices if 0 <= i < len(all_specs)]
+        clips = self._clips()
+
+        for spec in specs:
+            i = int(spec.get("timeline_index", -1))
+            if i <= 0 or str(spec.get("generation_mode") or "") != "continue":
+                continue
+            prev_index = i - 1
+            # If the predecessor is also part of this queue batch, normal queue
+            # chaining can connect the jobs in sequence. If it is not in this
+            # batch, only keep Continue mode when a real previous video exists.
+            if prev_index in wanted:
+                continue
+            previous = clips[prev_index] if 0 <= prev_index < len(clips) else None
+            if previous is not None and self._clip_has_usable_output(previous):
+                continue
+            spec["generation_mode"] = "new"
+            spec["edit_mode"] = "standalone"
+            spec["timeline_previous_output"] = ""
+            spec["timeline_previous_job_id"] = ""
+            spec["timeline_previous_status"] = ""
+            spec["timeline_previous_stale"] = False
+            spec["timeline_previous_is_source"] = False
+            spec["timeline_detached_start"] = True
+        return specs
+
+    def generate_timeline(self, mode="all"):
         if not self._ensure_project_setup_for_first_edit():
-            return False
-        ok, error = self.validate_timeline()
-        if not ok:
-            QMessageBox.warning(self, "Timeline not ready", error)
             return False
         if not callable(self.queue_timeline_callback):
             QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
             return False
-        result = self.queue_timeline_callback(self.generation_specs())
+
+        clips = self._clips()
+        if mode == "missing":
+            indices = [i for i, clip in enumerate(clips) if not bool(clip.get("locked", False)) and not self._clip_has_usable_output(clip)]
+            if not indices:
+                if any(bool(c.get("locked", False)) and not self._clip_has_usable_output(c) for c in clips):
+                    QMessageBox.information(self, "Generate Timeline", "There are no unlocked missing clips to generate. Locked missing clips were left untouched.")
+                else:
+                    QMessageBox.information(self, "Generate Timeline", "All timeline clips already have usable output files.")
+                return False
+            undo_label = "Generate missing timeline clips"
+        elif mode == "selected_only":
+            selected_indices = self._selected_indices()
+            if not selected_indices:
+                QMessageBox.information(self, "Generate Timeline", "Select one or more timeline blocks first.")
+                return False
+            indices = [i for i in selected_indices if not bool(clips[i].get("locked", False))]
+            if not indices:
+                QMessageBox.information(self, "Generate Timeline", "All selected clips are locked. Unlock at least one selected clip to generate it.")
+                return False
+            undo_label = "Generate selected timeline clips"
+        elif mode == "selected_onward":
+            selected = self._selected_index()
+            if selected < 0:
+                QMessageBox.information(self, "Generate Timeline", "Select a timeline block first.")
+                return False
+            indices = [i for i in range(selected, len(clips)) if not bool(clips[i].get("locked", False))]
+            undo_label = "Generate timeline from selected block"
+        else:
+            indices = [i for i, clip in enumerate(clips) if not bool(clip.get("locked", False))]
+            undo_label = "Generate all timeline clips"
+
+        if not indices:
+            QMessageBox.information(self, "Generate Timeline", "There are no unlocked clips to generate for this selection.")
+            return False
+        ok, error = self._validate_generation_indices(indices)
+        if not ok:
+            QMessageBox.warning(self, "Timeline not ready", error)
+            return False
+
+        specs = self._generation_specs_for_indices(indices)
+        if not specs:
+            QMessageBox.information(self, "Generate Timeline", "There are no clips to generate for this selection.")
+            return False
+
+        self._record_undo_state(undo_label)
+        result = self.queue_timeline_callback(specs)
         if result:
+            active_hq = self.project.get("hq_restart_override") or {}
+            if isinstance(active_hq, dict) and active_hq:
+                for i in indices:
+                    if 0 <= i < len(clips) and str(clips[i].get("generation_mode") or "") != "source":
+                        clips[i]["hq_generated"] = True
             self.project["assembled_output"] = ""
             self.project["assembly_status"] = ""
             self.project["auto_assemble"] = False
@@ -2431,7 +3116,11 @@ class TimelineTab(QWidget):
         """
         if not self._ensure_project_setup_for_first_edit():
             return False
-        ok, error = self.validate_timeline()
+        unlocked_indices = [i for i, clip in enumerate(self._clips()) if not bool(clip.get("locked", False))]
+        if not unlocked_indices:
+            QMessageBox.information(self, "HQ restart", "Every timeline block is locked. Unlock the blocks you want to recreate in HQ.")
+            return False
+        ok, error = self._validate_generation_indices(unlocked_indices)
         if not ok:
             QMessageBox.warning(self, "Timeline not ready", error)
             return False
@@ -2475,12 +3164,21 @@ class TimelineTab(QWidget):
         else:
             override = {"aspect": "21:9", "widescreen_quality": "High — 1792 × 768"}
 
-        specs = self.generation_specs()
+        specs = self._generation_specs_for_indices(unlocked_indices)
         for spec in specs:
             spec["timeline_hq_override"] = copy.deepcopy(override)
 
+        self._record_undo_state("HQ restart")
         result = self.queue_timeline_callback(specs)
         if result:
+            # Persist the chosen HQ mode at project level. This is saved in the
+            # timeline JSON and is automatically re-applied by generation_specs()
+            # for later single-clip regeneration after an app restart.
+            self.project["hq_restart_override"] = copy.deepcopy(override)
+            for i in unlocked_indices:
+                clip = self._clips()[i]
+                if str(clip.get("generation_mode") or "") != "source":
+                    clip["hq_generated"] = True
             self.project["assembled_output"] = ""
             self.project["assembly_status"] = ""
             self.project["auto_assemble"] = False
