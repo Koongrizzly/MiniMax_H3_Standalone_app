@@ -11,7 +11,6 @@ It supports :
 
 - 09/24/26 :
   
-  Timeline director
   create full movies with the help of the timeline director.
   
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026-09-25%2023_13_56-.jpg)
