@@ -1237,9 +1237,10 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout(bar); controls.setContentsMargins(8, 8, 8, 8)
         self.gen = QPushButton("Generate"); self.gen.setObjectName("primary"); self.gen.clicked.connect(self._main_generate_action)
         self.cancel = QPushButton("Cancel"); self.cancel.clicked.connect(self.cancel_job); self.cancel.setEnabled(False)
+        self.info_btn = QPushButton("Info"); self.info_btn.clicked.connect(self.open_feature_list)
         val = QPushButton("Validate install"); val.clicked.connect(self.validate_install)
         self.openout = QPushButton("Open output folder"); self.openout.clicked.connect(self.open_output_folder)
-        controls.addWidget(self.gen); controls.addWidget(self.cancel); controls.addStretch(); controls.addWidget(val); controls.addWidget(self.openout)
+        controls.addWidget(self.gen); controls.addWidget(self.cancel); controls.addStretch(); controls.addWidget(self.info_btn); controls.addWidget(val); controls.addWidget(self.openout)
         outer.addWidget(bar, 0)
         self.setCentralWidget(root)
         self._add_tooltips()
@@ -4038,6 +4039,7 @@ class MainWindow(QMainWindow):
         self.builder_transfer_btn.setToolTip("Copy the finished H3 prompt into the Generation tab. Supported aspect ratio and nearest approved frame preset are transferred too.")
         self.gen.setToolTip("Add the current generation settings as a queue job. If nothing is running it starts immediately; otherwise it waits in Pending. This button remains available on every tab.")
         self.cancel.setToolTip("Cancel the currently running queue job completely. Use the Queue tab context menu to cancel and move it back to Pending instead.")
+        self.info_btn.setToolTip("Open the GrizzlyMax feature list in your default web browser.")
         self.openout.setToolTip("Open the configured output folder in Windows Explorer.")
 
     def _update_font_size_label(self, value):
@@ -4158,6 +4160,17 @@ class MainWindow(QMainWindow):
     def current_output_dir(self) -> Path:
         p = self.output_folder.path()
         return Path(p).expanduser() if p else DEFAULT_OUTPUT_DIR
+
+    def open_feature_list(self):
+        path = ROOT / "assets" / "feature_list.html"
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "Info",
+                f"Feature list not found:\n{path}",
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def open_output_folder(self):
         p = self.current_output_dir(); p.mkdir(parents=True, exist_ok=True)
