@@ -1127,6 +1127,7 @@ class TimelineTab(QWidget):
             "locked": False,
             "notes": "",
             "last_generation_info": {},
+            "alternate_candidates": [],
         }
 
     def _clips(self):
@@ -1406,6 +1407,15 @@ class TimelineTab(QWidget):
         runbar.addWidget(self.hq_restart_btn)
         runbar.addWidget(self.assemble_timeline_btn)
         runbar.addWidget(self.use_generation_settings_btn)
+        self.generation_resolution_label = QLabel("Resolution: —")
+        self.generation_resolution_label.setToolTip(
+            "Resolution currently captured for new Timeline generations. "
+            "Press 'Use current Generation settings' to refresh it from the Generation tab."
+        )
+        self.generation_resolution_label.setStyleSheet(
+            "QLabel { color: #82e7ff; font-weight: 600; padding: 0 8px; }"
+        )
+        runbar.addWidget(self.generation_resolution_label)
         runbar.addStretch(1)
         root.addLayout(runbar)
 
@@ -1655,6 +1665,7 @@ class TimelineTab(QWidget):
     # -------------------------------------------------------------- refreshers
     def _refresh_all(self, *, select_first=False):
         self._update_history_buttons()
+        self._refresh_generation_resolution_label()
         valid_ids = {str(c.get("id")) for c in self._clips()}
         self.selected_clip_ids = {str(x) for x in self.selected_clip_ids if str(x) in valid_ids}
         if select_first and self._clips() and not self.selected_clip_id:
@@ -2205,6 +2216,7 @@ class TimelineTab(QWidget):
                 clip.setdefault("locked", False)
                 clip.setdefault("notes", "")
                 clip.setdefault("last_generation_info", {})
+                clip.setdefault("alternate_candidates", [])
                 if not clip.get("segments"):
                     clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
                 for seg in clip["segments"]:
@@ -2299,6 +2311,7 @@ class TimelineTab(QWidget):
         clone.pop("trim_in", None); clone.pop("trim_out", None)
         clone["locked"] = False
         clone["last_generation_info"] = {}
+        clone["alternate_candidates"] = []
         for seg in clone.get("segments") or []: seg["id"] = uuid.uuid4().hex
         self._clips().insert(idx + 1, clone)
         self._invalidate_assembly()
@@ -2915,6 +2928,44 @@ class TimelineTab(QWidget):
         # stale the clip or mutate the normal first-time creation workflow.
         self.canvas.update()
 
+    @staticmethod
+    def _generation_resolution_text(settings: dict) -> str:
+        """Resolve the actual MiniMax output dimensions from a captured settings dict."""
+        if not isinstance(settings, dict) or not settings:
+            return "—"
+        aspect = str(settings.get("aspect") or "16:9").strip()
+        if aspect == "21:9":
+            value = str(settings.get("widescreen_quality") or "").strip()
+            match = re.search(r"(\d+)\s*[×xX]\s*(\d+)", value)
+            if match:
+                return f"{int(match.group(1))} × {int(match.group(2))}"
+            return "—"
+
+        value = str(settings.get("resolution") or "").strip()
+        match = re.search(r"(\d+)\s*[×xX]\s*(\d+)", value)
+        if not match:
+            return "—"
+        w, h = int(match.group(1)), int(match.group(2))
+        # The Generation tab deliberately labels this preset 1280 × 720 for
+        # familiarity, while MiniMax actually generates on its valid 32px grid.
+        if (w, h) == (1280, 720):
+            w, h = 1280, 704
+        if aspect == "9:16":
+            w, h = h, w
+        elif aspect == "1:1":
+            edge = h
+            if (w, h) == (1280, 704):
+                edge = 704
+            w, h = edge, edge
+        return f"{w} × {h}"
+
+    def _refresh_generation_resolution_label(self):
+        label = getattr(self, "generation_resolution_label", None)
+        if label is None:
+            return
+        settings = self.project.get("global_generation_settings", {}) if isinstance(self.project, dict) else {}
+        label.setText(f"Resolution: {self._generation_resolution_text(settings)}")
+
     def use_current_generation_settings(self):
         """Apply one Generation-tab snapshot globally without touching Timeline content/duration."""
         if not self._ensure_project_setup_for_first_edit():
@@ -2926,6 +2977,7 @@ class TimelineTab(QWidget):
 
         self._record_undo_state("Use current Generation settings")
         self.project["global_generation_settings"] = copy.deepcopy(settings)
+        self._refresh_generation_resolution_label()
         changed_finished = False
         for idx, clip in enumerate(self._clips()):
             if bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
@@ -3232,7 +3284,12 @@ class TimelineTab(QWidget):
 
         menu = QMenu(self)
         regenerate = menu.addAction("(Re)generate this clip")
+        regenerate_alternate = menu.addAction("Regenerate as alternate")
         low_res_test = menu.addAction("Create low res test")
+
+        candidates_menu = menu.addMenu("Alternate candidates")
+        self._populate_candidate_menu(candidates_menu, clip_id, clip)
+
         preview = menu.addAction("Preview clip")
         open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
@@ -3247,6 +3304,7 @@ class TimelineTab(QWidget):
         preview_path = self._clip_preview_path(clip)
         output_exists = bool(preview_path)
         regenerate.setEnabled(not locked and not source)
+        regenerate_alternate.setEnabled(not locked and not source and output_exists)
         low_res_test.setEnabled(not locked and not source)
         # Stale is metadata only: preserved media remains previewable/openable.
         preview.setEnabled(output_exists)
@@ -3258,6 +3316,8 @@ class TimelineTab(QWidget):
         if chosen is regenerate:
             self.selected_clip_id = clip_id
             self.generate_selected()
+        elif chosen is regenerate_alternate:
+            self._generate_alternate_by_id(clip_id)
         elif chosen is low_res_test:
             self._generate_low_res_test_by_id(clip_id)
         elif chosen is preview:
@@ -3275,11 +3335,123 @@ class TimelineTab(QWidget):
         elif chosen is info:
             self._show_clip_info(clip_id)
 
+    @staticmethod
+    def _candidate_snapshot_from_active(clip: dict) -> dict:
+        """Capture the current active render so it can be swapped back later."""
+        data = {
+            "candidate_id": uuid.uuid4().hex,
+            "output": str(clip.get("output") or ""),
+            "queue_job_id": clip.get("queue_job_id"),
+            "status": str(clip.get("status") or "finished"),
+            "last_generation_info": copy.deepcopy(clip.get("last_generation_info") or {}),
+            "hq_generated": bool(clip.get("hq_generated", False)),
+            "stale": bool(clip.get("stale", False)),
+        }
+        if "trim_in" in clip:
+            data["trim_in"] = clip.get("trim_in")
+        if "trim_out" in clip:
+            data["trim_out"] = clip.get("trim_out")
+        return data
+
+    @staticmethod
+    def _candidate_label(candidate: dict, number: int) -> str:
+        state = str(candidate.get("status") or "").strip().lower()
+        path = Path(str(candidate.get("output") or ""))
+        info = candidate.get("last_generation_info") if isinstance(candidate.get("last_generation_info"), dict) else {}
+        resolution = str(info.get("resolution") or "").strip()
+        seed = info.get("actual_seed", info.get("seed"))
+        bits = [f"Candidate {number}"]
+        if resolution:
+            bits.append(resolution)
+        if seed not in (None, ""):
+            bits.append(f"seed {seed}")
+        if state and state != "finished":
+            bits.append(state)
+        elif path.name:
+            bits.append(path.name)
+        return " — ".join(bits)
+
+    def _populate_candidate_menu(self, menu, clip_id, clip):
+        active = self._clip_preview_path(clip)
+        active_name = Path(active).name if active else "no active render"
+        active_action = menu.addAction(f"Active — {active_name}")
+        active_action.setEnabled(False)
+        menu.addSeparator()
+
+        candidates = clip.get("alternate_candidates") if isinstance(clip.get("alternate_candidates"), list) else []
+        if not candidates:
+            empty = menu.addAction("No alternate candidates yet")
+            empty.setEnabled(False)
+            return
+        for n, candidate in enumerate(candidates, 1):
+            if not isinstance(candidate, dict):
+                continue
+            action = menu.addAction(self._candidate_label(candidate, n))
+            output = str(candidate.get("output") or "")
+            ready = str(candidate.get("status") or "") == "finished" and bool(output) and Path(output).is_file()
+            action.setEnabled(ready)
+            action.triggered.connect(lambda _checked=False, cid=str(clip_id), cand_id=str(candidate.get("candidate_id") or ""): self._activate_candidate(cid, cand_id))
+
+    def _generate_alternate_by_id(self, clip_id):
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None or idx < 0:
+            return False
+        if bool(clip.get("locked", False)):
+            QMessageBox.information(self, "Alternate candidate", "This block is locked. Unlock it before creating an alternate.")
+            return False
+        if str(clip.get("generation_mode") or "") == "source":
+            QMessageBox.information(self, "Alternate candidate", "A loaded source clip cannot be regenerated as an alternate.")
+            return False
+        if not self._clip_preview_path(clip):
+            QMessageBox.information(self, "Alternate candidate", "Create the first render normally before adding alternate candidates.")
+            return False
+        self.selected_clip_id = str(clip_id)
+        return self._generate_selected_impl(alternate_candidate=True)
+
+    def _activate_candidate(self, clip_id, candidate_id):
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None:
+            return False
+        candidates = clip.get("alternate_candidates") if isinstance(clip.get("alternate_candidates"), list) else []
+        target_index = next((i for i, c in enumerate(candidates) if isinstance(c, dict) and str(c.get("candidate_id") or "") == str(candidate_id)), -1)
+        if target_index < 0:
+            return False
+        target = candidates[target_index]
+        output = str(target.get("output") or "")
+        if str(target.get("status") or "") != "finished" or not output or not Path(output).is_file():
+            QMessageBox.warning(self, "Alternate candidate", "That candidate is not a finished render on disk yet.")
+            return False
+
+        self._record_undo_state("Switch alternate candidate")
+        current = self._candidate_snapshot_from_active(clip)
+        # The chosen candidate becomes active; the previous active render takes
+        # its place in the alternate list so switching never destroys a render.
+        candidates[target_index] = current
+        clip["alternate_candidates"] = candidates
+        clip["output"] = output
+        clip["queue_job_id"] = target.get("queue_job_id")
+        clip["status"] = str(target.get("status") or "finished")
+        clip["last_generation_info"] = copy.deepcopy(target.get("last_generation_info") or {})
+        clip["hq_generated"] = bool(target.get("hq_generated", False))
+        clip["stale"] = bool(target.get("stale", False))
+        if "trim_in" in target:
+            clip["trim_in"] = target.get("trim_in")
+        else:
+            clip.pop("trim_in", None)
+        if "trim_out" in target:
+            clip["trim_out"] = target.get("trim_out")
+        else:
+            clip.pop("trim_out", None)
+        self._invalidate_assembly("Active clip candidate changed — assemble again.")
+        self._refresh_all()
+        return True
+
     def _generate_low_res_test_by_id(self, clip_id):
         """Regenerate exactly one block at MiniMax's supported 384p test size.
 
-        This is a one-shot per-job override. It deliberately does not change the
-        project's persistent HQ-restart mode or the block's saved normal resolution.
+        This deliberately reuses the exact same single-block regeneration path
+        as (Re)generate this clip.  Resolution is the only one-shot difference,
+        so continuation clips at the end of a timeline behave identically.
         """
         idx, clip = self._clip_by_id(clip_id)
         if clip is None or idx < 0:
@@ -3290,22 +3462,9 @@ class TimelineTab(QWidget):
         if str(clip.get("generation_mode") or "") == "source":
             QMessageBox.information(self, "Low res test", "A loaded source clip cannot be regenerated as a low-res test.")
             return False
-        if not callable(self.queue_timeline_callback):
-            QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
-            return False
-
-        ok, error = self._validate_generation_indices([idx])
-        if not ok:
-            QMessageBox.warning(self, "Timeline not ready", error)
-            return False
-
-        specs = self._generation_specs_for_indices([idx])
-        if not specs:
-            return False
-        spec = specs[0]
 
         settings = clip.get("settings") if isinstance(clip.get("settings"), dict) else {}
-        aspect = str(settings.get("aspect") or spec.get("aspect") or "16:9").strip()
+        aspect = str(settings.get("aspect") or "16:9").strip()
         if aspect not in {"16:9", "9:16", "1:1", "21:9"}:
             aspect = "16:9"
         if aspect == "21:9":
@@ -3313,22 +3472,13 @@ class TimelineTab(QWidget):
         else:
             override = {"aspect": aspect, "resolution": "736 × 384"}
 
-        # generation_specs() may already contain the project's persistent HQ
-        # override. Replace it on this one spec so the low-res test wins for this
-        # render only, without changing hq_restart_override in the project JSON.
-        spec["timeline_hq_override"] = copy.deepcopy(override)
-        spec["timeline_low_res_test"] = True
-
-        self._record_undo_state("Create low res test")
-        result = self.queue_timeline_callback([spec])
-        if result:
-            clip["hq_generated"] = False
-            self.project["assembled_output"] = ""
-            self.project["assembly_status"] = ""
-            self.project["auto_assemble"] = False
-            self.project["auto_assemble_pending"] = False
-            self._refresh_all()
-        return bool(result)
+        # Right-click already makes this block primary, but set it explicitly so
+        # this helper is also correct if called from elsewhere later.
+        self.selected_clip_id = str(clip_id)
+        return self._generate_selected_impl(
+            one_shot_resolution_override=override,
+            low_res_test=True,
+        )
 
     def _preview_clip_by_id(self, clip_id):
         _idx, clip = self._clip_by_id(clip_id)
@@ -3736,6 +3886,17 @@ class TimelineTab(QWidget):
         return specs
 
     def generate_selected(self):
+        """Regenerate the selected block using its normal saved/current resolution."""
+        return self._generate_selected_impl()
+
+    def _generate_selected_impl(self, one_shot_resolution_override=None, low_res_test=False, alternate_candidate=False):
+        """Shared single-block regeneration path.
+
+        ``one_shot_resolution_override`` changes only the queued job; it does not
+        mutate the block's saved settings or the project's HQ restart override.
+        This keeps normal regeneration and low-res testing on exactly the same
+        continuation/predecessor logic.
+        """
         if not self._ensure_project_setup_for_first_edit():
             return False
 
@@ -3800,6 +3961,17 @@ class TimelineTab(QWidget):
             spec["generation_mode"] = "continue" if use_previous else "new"
             spec["match_next_first_frame"] = bool(use_next)
 
+            # One-shot render overrides (currently used by Create low res test)
+            # must be applied *after* the normal single-clip continuation spec is
+            # built.  That way the only difference from (Re)generate is resolution.
+            if isinstance(one_shot_resolution_override, dict) and one_shot_resolution_override:
+                spec["timeline_hq_override"] = copy.deepcopy(one_shot_resolution_override)
+            if low_res_test:
+                spec["timeline_low_res_test"] = True
+            if alternate_candidate:
+                spec["timeline_alternate_candidate"] = True
+                spec["timeline_alternate_candidate_id"] = uuid.uuid4().hex
+
             if use_previous:
                 if idx == 0:
                     QMessageBox.warning(
@@ -3849,7 +4021,10 @@ class TimelineTab(QWidget):
                 QMessageBox.warning(self, "Timeline", "The timeline is not connected to the MiniMax queue.")
                 return False
 
-            self._record_undo_state("Regenerate selected clip")
+            self._record_undo_state(
+                "Regenerate as alternate" if alternate_candidate else
+                ("Create low res test" if low_res_test else "Regenerate selected clip")
+            )
             try:
                 result = self.queue_timeline_callback([spec])
             except Exception as exc:
@@ -3861,15 +4036,25 @@ class TimelineTab(QWidget):
                 return False
 
             if result:
-                active_hq = self.project.get("hq_restart_override") or {}
-                if isinstance(active_hq, dict) and active_hq:
-                    clip["hq_generated"] = True
-                self._invalidate_assembly("Selected clip regenerated — assemble again when ready.")
+                if not alternate_candidate:
+                    if low_res_test:
+                        # This queued render intentionally overrides HQ only for this
+                        # job.  Do not change the project's persistent HQ mode.
+                        clip["hq_generated"] = False
+                    else:
+                        active_hq = self.project.get("hq_restart_override") or {}
+                        if isinstance(active_hq, dict) and active_hq:
+                            clip["hq_generated"] = True
+                    self._invalidate_assembly(
+                        "Low-res test queued — assemble again when ready."
+                        if low_res_test else
+                        "Selected clip regenerated — assemble again when ready."
+                    )
 
                 # A free-ending continuation changes the boundary consumed by the
                 # next continuation clip, so downstream continuation results really
                 # do become stale.
-                if edit_mode == "continue_previous":
+                if not alternate_candidate and edit_mode == "continue_previous":
                     # Existing downstream renders remain usable; do not invalidate them.
                     for j in range(idx + 1, len(self._clips())):
                         if self._clips()[j].get("generation_mode") != "continue":
@@ -4142,18 +4327,32 @@ class TimelineTab(QWidget):
         return bool(result)
 
     def mark_queued(self, clip_id, job_id, output="", job_info=None):
+        is_alternate = bool(isinstance(job_info, dict) and job_info.get("timeline_alternate_candidate"))
+        alternate_id = str((job_info or {}).get("timeline_alternate_candidate_id") or uuid.uuid4().hex) if is_alternate else ""
         for clip in self._clips():
             if str(clip.get("id")) == str(clip_id):
-                clip["queue_job_id"] = str(job_id)
-                clip["status"] = "pending"
-                clip["stale"] = False
-                clip["output"] = str(output or "")
-                # A trim belongs to the previous rendered version. A new render
-                # gets a clean full-range assembly state.
-                clip.pop("trim_in", None); clip.pop("trim_out", None)
                 info = self._generation_info_from_job(job_info)
-                if info:
-                    clip["last_generation_info"] = info
+                if is_alternate:
+                    candidates = clip.setdefault("alternate_candidates", [])
+                    candidates.append({
+                        "candidate_id": alternate_id,
+                        "queue_job_id": str(job_id),
+                        "status": "pending",
+                        "output": str(output or ""),
+                        "last_generation_info": info,
+                        "hq_generated": bool((job_info or {}).get("timeline_hq_override")),
+                        "stale": False,
+                    })
+                else:
+                    clip["queue_job_id"] = str(job_id)
+                    clip["status"] = "pending"
+                    clip["stale"] = False
+                    clip["output"] = str(output or "")
+                    # A trim belongs to the previous rendered version. A new render
+                    # gets a clean full-range assembly state.
+                    clip.pop("trim_in", None); clip.pop("trim_out", None)
+                    if info:
+                        clip["last_generation_info"] = info
                 break
         self._refresh_all()
 
@@ -4162,32 +4361,51 @@ class TimelineTab(QWidget):
         changed = False
         clips = self._clips()
         for idx, clip in enumerate(clips):
-            job_id = clip.get("queue_job_id")
-            if not job_id or str(job_id) not in by_id:
-                continue
-            job = by_id[str(job_id)]
-            state = str(job.get("state") or "pending")
-            previous_state = str(clip.get("status") or "")
-            if previous_state != state:
-                clip["status"] = state; changed = True
-            output = str(job.get("output") or "")
-            if output and clip.get("output") != output:
-                clip["output"] = output; changed = True
-            job_info = self._generation_info_from_job(job)
-            if job_info and clip.get("last_generation_info") != job_info:
-                clip["last_generation_info"] = job_info; changed = True
+            job_id = str(clip.get("queue_job_id") or "")
+            if job_id and job_id in by_id:
+                job = by_id[job_id]
+                state = str(job.get("state") or "pending")
+                previous_state = str(clip.get("status") or "")
+                if previous_state != state:
+                    clip["status"] = state; changed = True
+                output = str(job.get("output") or "")
+                if output and clip.get("output") != output:
+                    clip["output"] = output; changed = True
+                job_info = self._generation_info_from_job(job)
+                if job_info and clip.get("last_generation_info") != job_info:
+                    clip["last_generation_info"] = job_info; changed = True
 
-            if state == "finished" and bool(clip.get("_preserve_downstream_on_finish")):
-                clip.pop("_preserve_downstream_on_finish", None)
-                cleared = self._accept_preserved_downstream_chain(idx)
-                if cleared:
-                    print(
-                        f"[TIMELINE] Anchored replacement finished; preserved {cleared} existing downstream clip(s).",
-                        flush=True,
-                    )
-                    changed = True
-            elif state in {"failed", "cancelled", "canceled"}:
-                clip.pop("_preserve_downstream_on_finish", None)
+                if state == "finished" and bool(clip.get("_preserve_downstream_on_finish")):
+                    clip.pop("_preserve_downstream_on_finish", None)
+                    cleared = self._accept_preserved_downstream_chain(idx)
+                    if cleared:
+                        print(
+                            f"[TIMELINE] Anchored replacement finished; preserved {cleared} existing downstream clip(s).",
+                            flush=True,
+                        )
+                        changed = True
+                elif state in {"failed", "cancelled", "canceled"}:
+                    clip.pop("_preserve_downstream_on_finish", None)
+
+            # Alternate candidates have their own queue jobs and must never
+            # overwrite the active render while they are generating.
+            candidates = clip.get("alternate_candidates") if isinstance(clip.get("alternate_candidates"), list) else []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                alt_job_id = str(candidate.get("queue_job_id") or "")
+                if not alt_job_id or alt_job_id not in by_id:
+                    continue
+                alt_job = by_id[alt_job_id]
+                alt_state = str(alt_job.get("state") or "pending")
+                if str(candidate.get("status") or "") != alt_state:
+                    candidate["status"] = alt_state; changed = True
+                alt_output = str(alt_job.get("output") or "")
+                if alt_output and str(candidate.get("output") or "") != alt_output:
+                    candidate["output"] = alt_output; changed = True
+                alt_info = self._generation_info_from_job(alt_job)
+                if alt_info and candidate.get("last_generation_info") != alt_info:
+                    candidate["last_generation_info"] = alt_info; changed = True
 
         if changed:
             self._refresh_all()

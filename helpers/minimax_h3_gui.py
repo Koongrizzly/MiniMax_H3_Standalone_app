@@ -2884,23 +2884,42 @@ class MainWindow(QMainWindow):
                         # continuation above. Audio memory remains independent; turning
                         # it on never disables the visual latent + final-frame path.
                     else:
-                        # Full timeline generation normally uses the existing queue
-                        # dependency chain. If Clip 1 is a user-loaded start video,
-                        # there is no queue job for it, so continue explicitly from
-                        # that source file instead.
-                        if pos == 0:
-                            QMessageBox.warning(self, "Timeline", "A continued clip cannot be the first timeline item.")
-                            return False
-                        if bool(spec.get("timeline_previous_is_source", False)):
-                            prev_output = str(spec.get("timeline_previous_output") or "")
-                            if not prev_output or not Path(prev_output).is_file():
-                                QMessageBox.warning(self, "Timeline", f"{clip_name} cannot find the loaded start clip to continue from.")
-                                return False
+                        # Batch position is NOT timeline position.  When generating
+                        # only missing/selected/later clips, the first queued job can
+                        # be Clip 3, Clip 8, etc.  In that case continue explicitly
+                        # from the already-rendered predecessor instead of treating
+                        # this job as "the first timeline item".
+                        prev_output = str(spec.get("timeline_previous_output") or "")
+                        prev_exists = bool(prev_output and Path(prev_output).is_file())
+                        previous_timeline_index = timeline_index - 1
+                        batch_timeline_indices = {
+                            int(x.get("timeline_index", n) or 0)
+                            for n, x in enumerate(specs)
+                            if str(x.get("generation_mode") or "new") != "source"
+                        }
+                        predecessor_is_in_this_batch = previous_timeline_index in batch_timeline_indices
+
+                        if predecessor_is_in_this_batch and pos > 0:
+                            # The predecessor was queued immediately/earlier in this
+                            # same Timeline request, so the normal queue dependency
+                            # chain is the strongest continuation source.
+                            settings["continue_last_result"] = True
+                            settings["continue_video"] = ""
+                        elif prev_exists:
+                            # Partial batch: predecessor already exists on disk.
+                            # Pin continuation to that exact timeline result instead
+                            # of whichever unrelated queue job happens to be newest.
                             settings["continue_last_result"] = False
                             settings["continue_video"] = prev_output
                         else:
-                            settings["continue_last_result"] = True
+                            # _generation_specs_for_indices normally converts this
+                            # case to a detached "new" spec before we get here.
+                            # Keep this final fallback permissive rather than aborting
+                            # a whole batch because an old project still says Continue.
+                            settings["mode"] = 0
+                            settings["continue_last_result"] = False
                             settings["continue_video"] = ""
+                            settings["latent_continuation"] = False
                     settings["last"] = ""
                 else:
                     # Start a fresh dependency chain. A captured manual source
@@ -2967,6 +2986,9 @@ class MainWindow(QMainWindow):
                 job["timeline_clip_id"] = clip_id
                 job["timeline_clip_index"] = pos
                 job["timeline_clip_name"] = clip_name
+                if bool(spec.get("timeline_alternate_candidate", False)):
+                    job["timeline_alternate_candidate"] = True
+                    job["timeline_alternate_candidate_id"] = str(spec.get("timeline_alternate_candidate_id") or "")
                 created.append((clip_id, job.get("id"), job.get("output", ""), job))
 
             # Add timeline metadata to persisted queue state after every generated
@@ -3038,15 +3060,46 @@ class MainWindow(QMainWindow):
             job = jobs_by_id.get(str(clip.get("queue_job_id") or ""))
             if job and job.get("resolution"):
                 resolutions.add(str(job.get("resolution")))
+        normalize_mixed_resolution = False
+        target_resolution = None
         if len(resolutions) > 1:
-            QMessageBox.warning(
-                self,
-                "Timeline assembly",
-                "The timeline contains clips with different output resolutions:\n\n"
-                + "\n".join(sorted(resolutions))
-                + "\n\nUse one resolution across the timeline before assembling.",
+            # Mixed resolutions are a warning, never a hard blocker.  The user
+            # remains in control: if they choose Assemble anyway, FFmpeg scales
+            # the lower-resolution clips to the largest resolution already in
+            # this timeline while leaving every source MP4 untouched.
+            parsed_resolutions = []
+            for value in sorted(resolutions):
+                match = re.search(r"(\d+)\s*[x×]\s*(\d+)", str(value), re.IGNORECASE)
+                if match:
+                    w, h = int(match.group(1)), int(match.group(2))
+                    if w > 0 and h > 0:
+                        parsed_resolutions.append((w * h, w, h, str(value)))
+            if parsed_resolutions:
+                _, target_w, target_h, _ = max(parsed_resolutions, key=lambda item: (item[0], item[1], item[2]))
+                target_resolution = (target_w, target_h)
+
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Timeline assembly")
+            box.setText("The timeline contains clips with different output resolutions:")
+            target_text = (
+                f"\n\nThe assembled video will use {target_resolution[0]} × {target_resolution[1]}; "
+                "lower-resolution clips will be scaled for the final video."
+                if target_resolution else
+                "\n\nThe clips will be normalized during assembly."
             )
-            return False
+            box.setInformativeText(
+                "\n".join(sorted(resolutions))
+                + target_text
+                + "\n\nThe original clip files will not be changed."
+            )
+            assemble_anyway = box.addButton("Assemble anyway", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(assemble_anyway)
+            box.exec()
+            if box.clickedButton() is not assemble_anyway:
+                return False
+            normalize_mixed_resolution = True
 
         if not ffmpeg_tools_ready():
             self._ensure_ffmpeg_async()
@@ -3104,23 +3157,39 @@ class MainWindow(QMainWindow):
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         proc.setProgram(str(ffmpeg_tool_path("ffmpeg.exe")))
-        if has_trim:
-            # concatdec_select removes GOP pre-roll around non-keyframe in/out points.
-            # Re-encoding is used only when a trim exists; ordinary assembly keeps
-            # the old fast stream-copy path exactly as before.
-            proc.setArguments([
-                "-y", "-copyts", "-vsync", "0",
-                "-segment_time_metadata", "1",
-                "-f", "concat", "-safe", "0", "-i", str(concat_path),
-                "-map", "0:v:0", "-map", "0:a?",
-                "-vf", "select=concatdec_select",
-                "-af", "aselect=concatdec_select",
+        if has_trim or normalize_mixed_resolution:
+            # Trims and mixed-resolution timelines require a video re-encode.
+            # For mixed resolutions, scale/pad every decoded frame to the chosen
+            # final canvas. This only affects the assembled result; sources remain
+            # untouched. Ordinary same-resolution, untrimmed assembly still uses
+            # the original fast stream-copy path.
+            video_filters = []
+            audio_filters = []
+            args = ["-y"]
+            if has_trim:
+                args += ["-copyts", "-vsync", "0", "-segment_time_metadata", "1"]
+                video_filters.append("select=concatdec_select")
+                audio_filters.append("aselect=concatdec_select")
+            args += ["-f", "concat", "-safe", "0", "-i", str(concat_path),
+                     "-map", "0:v:0", "-map", "0:a?"]
+            if normalize_mixed_resolution and target_resolution:
+                target_w, target_h = target_resolution
+                video_filters.append(
+                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+                )
+            if video_filters:
+                args += ["-vf", ",".join(video_filters)]
+            if audio_filters:
+                args += ["-af", ",".join(audio_filters)]
+            args += [
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-c:a", "aac", "-b:a", "192k",
                 "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
                 str(final_path),
-            ])
+            ]
+            proc.setArguments(args)
         else:
             proc.setArguments([
                 "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
