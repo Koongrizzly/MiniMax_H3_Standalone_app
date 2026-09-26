@@ -246,6 +246,7 @@ def _safe_project_name(text: str) -> str:
 
 
 def _clip_seconds(clip: dict) -> float:
+    """Generation/source duration. Do not shorten this for assembly trims."""
     if str(clip.get("generation_mode") or "") == "source":
         try:
             duration = float(clip.get("source_duration_seconds") or 0.0)
@@ -254,6 +255,31 @@ def _clip_seconds(clip: dict) -> float:
         except Exception:
             pass
     return max(1, int(clip.get("frames") or 124)) / FPS
+
+
+def _clip_timeline_seconds(clip: dict) -> float:
+    """Visible/effective timeline duration after a non-destructive trim.
+
+    Generation duration remains owned by _clip_seconds(); this function is only
+    for timeline geometry, ruler positions and review/summary timing.
+    """
+    source_duration = _clip_seconds(clip)
+    try:
+        trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
+    except Exception:
+        trim_in = 0.0
+    trim_out_raw = clip.get("trim_out")
+    if trim_out_raw is None:
+        return source_duration
+    try:
+        trim_out = float(trim_out_raw)
+    except Exception:
+        return source_duration
+    # trim_out is captured from the actual rendered media and can differ by a
+    # few frames from the requested generation duration, so trust the saved
+    # trim range itself rather than clamping it to the requested frame count.
+    used = trim_out - trim_in
+    return max(0.04, used) if used > 0.0 else source_duration
 
 
 def _segment_seconds(clip: dict) -> list[float]:
@@ -385,7 +411,7 @@ class TimelineCanvas(QWidget):
         return QSize(max(900, self._content_width()), self.CLIP_TOP + self.CLIP_H + self.BOTTOM_PAD)
 
     def _content_width(self) -> int:
-        total = sum(_clip_seconds(c) for c in self.clips)
+        total = sum(_clip_timeline_seconds(c) for c in self.clips)
         return int(max(900, 36 + total * self.pixels_per_second + 36))
 
     def set_clips(self, clips: list[dict], selected_id: str | None = None, selected_ids=None):
@@ -736,7 +762,7 @@ class TimelineCanvas(QWidget):
         accent_text = palette.color(palette.ColorRole.HighlightedText)
         painter.fillRect(self.rect(), bg)
 
-        total_seconds = max(1.0, sum(_clip_seconds(c) for c in self.clips))
+        total_seconds = max(1.0, sum(_clip_timeline_seconds(c) for c in self.clips))
         ruler_step = 1
         if self.pixels_per_second < 25:
             ruler_step = 10
@@ -774,7 +800,8 @@ class TimelineCanvas(QWidget):
         }
 
         for idx, clip in enumerate(self.clips):
-            duration = _clip_seconds(clip)
+            source_duration = _clip_seconds(clip)
+            duration = _clip_timeline_seconds(clip)
             width = max(74.0, duration * self.pixels_per_second)
             left, right = cursor, cursor + width
             self._rects.append((str(clip.get("id")), left, right))
@@ -812,7 +839,11 @@ class TimelineCanvas(QWidget):
             bridge = "  •  ⇥ Next frame" if edit_mode in {"bridge_both", "anchor_next"} else ""
             ref_count = len(_reference_entries(clip)) if bool(clip.get("use_reference_images", False)) else 0
             refs_info = f"  •  Ref2VA ×{ref_count}" if ref_count else ""
-            info = f"{mode}  •  {int(clip.get('frames') or 0)}f  •  {duration:.2f}s{bridge}{refs_info}"
+            if clip.get("trim_out") is not None:
+                duration_text = f"{duration:.2f}s used"
+            else:
+                duration_text = f"{duration:.2f}s"
+            info = f"{mode}  •  {int(clip.get('frames') or 0)}f  •  {duration_text}{bridge}{refs_info}"
             painter.setPen(muted if not selected else accent_text)
             painter.drawText(int(left + 8), self.CLIP_TOP + 38, fm.elidedText(info, Qt.TextElideMode.ElideRight, info_width))
 
@@ -1679,7 +1710,7 @@ class TimelineTab(QWidget):
         if select_first and self.selected_clip_id:
             self.selected_clip_ids.add(str(self.selected_clip_id))
             self._selection_anchor_id = str(self.selected_clip_id)
-        total = sum(_clip_seconds(c) for c in self._clips())
+        total = sum(_clip_timeline_seconds(c) for c in self._clips())
         selection_suffix = f"  •  {len(self.selected_clip_ids)} selected" if len(self.selected_clip_ids) > 1 else ""
         locked_count = sum(1 for c in self._clips() if bool(c.get("locked", False)))
         lock_suffix = f"  •  {locked_count} locked" if locked_count else ""
@@ -3170,14 +3201,27 @@ class TimelineTab(QWidget):
             self._refresh_all()
         return bool(result)
 
+    def mark_assembly_queued(self, output, job_id=None):
+        self.project["assembled_output"] = str(output or "")
+        self.project["assembly_status"] = "Queued for assembly"
+        self.project["assembly_queue_job_id"] = str(job_id or "")
+        self._timeline_assemble_click_busy = True
+        if hasattr(self, "assemble_timeline_btn"):
+            self.assemble_timeline_btn.setText("Assembly queued…")
+        self._refresh_all()
+
     def mark_assembly_started(self, output):
         self.project["assembled_output"] = str(output or "")
         self.project["assembly_status"] = "Assembling…"
+        self._timeline_assemble_click_busy = True
+        if hasattr(self, "assemble_timeline_btn"):
+            self.assemble_timeline_btn.setText("Assembling…")
         self._refresh_all()
 
     def mark_assembly_finished(self, output):
         self.project["assembled_output"] = str(output or "")
         self.project["assembly_status"] = "Finished"
+        self.project["assembly_queue_job_id"] = ""
         self._timeline_assemble_click_busy = False
         if hasattr(self, "assemble_timeline_btn"):
             self.assemble_timeline_btn.setText("Assemble Video")
@@ -3186,6 +3230,7 @@ class TimelineTab(QWidget):
     def mark_assembly_failed(self, message):
         self.project["assembled_output"] = ""
         self.project["assembly_status"] = "Assembly failed: " + str(message or "Unknown error")
+        self.project["assembly_queue_job_id"] = ""
         self._timeline_assemble_click_busy = False
         if hasattr(self, "assemble_timeline_btn"):
             self.assemble_timeline_btn.setText("Assemble Video")
@@ -3352,6 +3397,58 @@ class TimelineTab(QWidget):
         if "trim_out" in clip:
             data["trim_out"] = clip.get("trim_out")
         return data
+
+    def _archive_active_candidate_before_replacement(self, clip: dict, replacement_output: str = "") -> bool:
+        """Preserve the current active render before a normal regeneration replaces it.
+
+        This makes ordinary retries participate in the same A/B history as explicit
+        ``Regenerate as alternate`` jobs.  Only a real media file is archived and
+        the same file is never inserted twice.
+        """
+        if not isinstance(clip, dict) or str(clip.get("generation_mode") or "") == "source":
+            return False
+
+        active = self._clip_preview_path(clip)
+        if not active:
+            return False
+        active_path = Path(str(active))
+        if not active_path.is_file():
+            return False
+
+        try:
+            active_key = str(active_path.resolve()).lower()
+        except Exception:
+            active_key = str(active_path).lower()
+
+        if replacement_output:
+            try:
+                replacement_key = str(Path(str(replacement_output)).resolve()).lower()
+            except Exception:
+                replacement_key = str(replacement_output).lower()
+            if replacement_key == active_key:
+                return False
+
+        candidates = clip.setdefault("alternate_candidates", [])
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_output = str(candidate.get("output") or "")
+            if not candidate_output:
+                continue
+            try:
+                candidate_key = str(Path(candidate_output).resolve()).lower()
+            except Exception:
+                candidate_key = candidate_output.lower()
+            if candidate_key == active_key:
+                return False
+
+        snapshot = self._candidate_snapshot_from_active(clip)
+        snapshot["output"] = str(active_path)
+        # An existing playable render is a finished candidate even when the block
+        # itself is currently marked stale/informational.
+        snapshot["status"] = "finished"
+        candidates.append(snapshot)
+        return True
 
     @staticmethod
     def _candidate_label(candidate: dict, number: int) -> str:
@@ -4344,12 +4441,19 @@ class TimelineTab(QWidget):
                         "stale": False,
                     })
                 else:
+                    # Normal regeneration used to overwrite the active attempt and
+                    # leave Undo as the only route back. Preserve the currently
+                    # playable render as an alternate *before* replacing its queue
+                    # metadata/output. This applies to ordinary retries as well as
+                    # batch/HQ/low-res recreations.
+                    self._archive_active_candidate_before_replacement(clip, str(output or ""))
                     clip["queue_job_id"] = str(job_id)
                     clip["status"] = "pending"
                     clip["stale"] = False
                     clip["output"] = str(output or "")
-                    # A trim belongs to the previous rendered version. A new render
-                    # gets a clean full-range assembly state.
+                    # A trim belongs to the previous rendered version. It was copied
+                    # into the archived candidate above; the new render starts with a
+                    # clean full-range assembly state.
                     clip.pop("trim_in", None); clip.pop("trim_out", None)
                     if info:
                         clip["last_generation_info"] = info
@@ -4359,6 +4463,37 @@ class TimelineTab(QWidget):
     def sync_queue_jobs(self, jobs):
         by_id = {str(j.get("id")): j for j in (jobs or []) if j.get("id")}
         changed = False
+
+        # Keep queued Timeline assembly state synchronized with the normal queue,
+        # including after queue reload/recovery. Assembly is not a clip-generation
+        # dependency; this only drives the button/status/result path.
+        assembly_job_id = str(self.project.get("assembly_queue_job_id") or "")
+        if assembly_job_id and assembly_job_id in by_id:
+            assembly_job = by_id[assembly_job_id]
+            assembly_state = str(assembly_job.get("state") or "pending")
+            assembly_output = str(assembly_job.get("output") or "")
+            if assembly_output and self.project.get("assembled_output") != assembly_output:
+                self.project["assembled_output"] = assembly_output; changed = True
+            if assembly_state in {"pending", "interrupted"}:
+                wanted = "Queued for assembly"
+                self._timeline_assemble_click_busy = True
+                if self.project.get("assembly_status") != wanted:
+                    self.project["assembly_status"] = wanted; changed = True
+            elif assembly_state == "running":
+                wanted = "Assembling…"
+                self._timeline_assemble_click_busy = True
+                if self.project.get("assembly_status") != wanted:
+                    self.project["assembly_status"] = wanted; changed = True
+            elif assembly_state == "finished":
+                self._timeline_assemble_click_busy = False
+                if self.project.get("assembly_status") != "Finished":
+                    self.project["assembly_status"] = "Finished"; changed = True
+            elif assembly_state in {"failed", "cancelled", "canceled"}:
+                self._timeline_assemble_click_busy = False
+                wanted = "Assembly failed: " + str(assembly_job.get("error") or assembly_job.get("cancel_reason") or assembly_state)
+                if self.project.get("assembly_status") != wanted:
+                    self.project["assembly_status"] = wanted; changed = True
+
         clips = self._clips()
         for idx, clip in enumerate(clips):
             job_id = str(clip.get("queue_job_id") or "")

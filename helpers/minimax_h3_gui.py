@@ -2057,6 +2057,8 @@ class MainWindow(QMainWindow):
         return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
     def _short_model(self, job):
+        if job.get("job_type") == "timeline_assembly":
+            return "Timeline assembly"
         return job.get("model_label") or ("Ref2VA INT4" if job.get("mode")==2 else "FL2VA INT4")
 
     def _probe_clip_duration(self, output_path, frames=None):
@@ -2274,6 +2276,14 @@ class MainWindow(QMainWindow):
         elif section=="running" and act==requeue: self._stop_running_job("requeue")
         elif section=="running" and act==cancel: self._stop_running_job("cancel")
         elif section=="pending" and act==delete:
+            if job.get("job_type") == "timeline_assembly":
+                try:
+                    concat = Path(str(job.get("timeline_assembly_concat") or ""))
+                    if concat.is_file(): concat.unlink()
+                except Exception:
+                    pass
+                if getattr(self, "timeline_widget", None) is not None:
+                    self.timeline_widget.mark_assembly_failed("Removed from queue")
             self.queue_jobs=[j for j in self.queue_jobs if j.get("id")!=job.get("id")]; self._save_queue_state(); self._refresh_queue_views()
         elif section=="finished" and 'play' in locals() and act==play: self._load_preview(job,autoplay=True)
         elif section=="finished" and 'delete_disk' in locals() and act==delete_disk: self._delete_job_output(job)
@@ -2355,6 +2365,15 @@ class MainWindow(QMainWindow):
 
         # Remove pending work first so the normal process-finished callback cannot
         # immediately advance to another queued job while the active process stops.
+        pending_assemblies = [j for j in self.queue_jobs if j.get("state") == "pending" and j.get("job_type") == "timeline_assembly"]
+        for assembly_job in pending_assemblies:
+            try:
+                concat = Path(str(assembly_job.get("timeline_assembly_concat") or ""))
+                if concat.is_file(): concat.unlink()
+            except Exception:
+                pass
+        if pending_assemblies and getattr(self, "timeline_widget", None) is not None:
+            self.timeline_widget.mark_assembly_failed("Cancelled")
         self.queue_jobs = [j for j in self.queue_jobs if j.get("state") != "pending"]
         self._save_queue_state()
         self._refresh_queue_views()
@@ -2628,10 +2647,23 @@ class MainWindow(QMainWindow):
         # instead of waiting for its next periodic refresh.
         if hasattr(self, "system_hud"):
             self.system_hud.refresh()
-        self.proc=QProcess(self); self.proc.setWorkingDirectory(str(ROOT)); self.proc.setProgram(str(PYTHON)); self.proc.setArguments(run_args); self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc=QProcess(self); self.proc.setWorkingDirectory(str(ROOT))
+        queue_program = str(job.get("queue_program") or "").strip()
+        self.proc.setProgram(queue_program if queue_program else str(PYTHON))
+        self.proc.setArguments(run_args); self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._process_output); self.proc.finished.connect(self._finished)
         self._start_job_log_file(job)
-        self.cancel.setEnabled(True); self.gen.setEnabled(True); self.status.setText("Queue: generating…"); self.append_log(f"\n=== QUEUE START ===\nOutput: {job.get('output')}\n"); self._save_queue_state(); self._refresh_queue_views(); self.proc.start()
+        self.cancel.setEnabled(True); self.gen.setEnabled(True)
+        if job.get("job_type") == "timeline_assembly":
+            job["phase"] = "Assembling timeline"
+            if getattr(self, "timeline_widget", None) is not None:
+                self.timeline_widget.mark_assembly_started(job.get("output"))
+            self.status.setText("Queue: assembling timeline…")
+            self.append_log(f"\n=== QUEUE START: TIMELINE ASSEMBLY ===\nOutput: {job.get('output')}\n")
+        else:
+            self.status.setText("Queue: generating…")
+            self.append_log(f"\n=== QUEUE START ===\nOutput: {job.get('output')}\n")
+        self._save_queue_state(); self._refresh_queue_views(); self.proc.start()
 
     def _stop_running_job(self, action):
         if not self.proc or self.proc.state()==QProcess.ProcessState.NotRunning: return
@@ -3037,10 +3069,6 @@ class MainWindow(QMainWindow):
         if not clips:
             QMessageBox.warning(self, "Timeline assembly", "The timeline has no clips to assemble.")
             return False
-        if self._timeline_assembly_proc and self._timeline_assembly_proc.state() != QProcess.ProcessState.NotRunning:
-            QMessageBox.information(self, "Timeline assembly", "A timeline assembly is already running.")
-            return False
-
         outputs = []
         resolutions = set()
         jobs_by_id = {str(j.get("id")): j for j in self.queue_jobs if j.get("id")}
@@ -3131,12 +3159,14 @@ class MainWindow(QMainWindow):
             return str(path.resolve()).replace("\\", "/").replace("'", "\\'")
 
         # The timeline trimmer is non-destructive: in/out points live only in
-        # project JSON.  ffconcat supports per-file inpoint/outpoint directives,
-        # so assembly can honor those ranges without creating trimmed source files.
-        concat_lines = []
+        # project JSON.  Do not rely on concat-demuxer inpoint/outpoint here:
+        # those directives are timestamp/keyframe sensitive and can leak source
+        # preroll into the assembled result.  When a trim is present we instead
+        # open every source as its own input with an exact seek/duration and then
+        # concatenate reset-timestamp streams in a filter graph.
+        trim_specs = []
         has_trim = False
         for clip, path in zip(clips, outputs):
-            concat_lines.append(f"file '{ffconcat_path(path)}'\n")
             try:
                 trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
             except Exception:
@@ -3146,120 +3176,178 @@ class MainWindow(QMainWindow):
                 trim_out = float(raw_out) if raw_out is not None else None
             except Exception:
                 trim_out = None
-            if trim_in > 0.001:
-                concat_lines.append(f"inpoint {trim_in:.6f}\n")
-                has_trim = True
-            if trim_out is not None and trim_out > trim_in + 0.001:
-                concat_lines.append(f"outpoint {trim_out:.6f}\n")
-                has_trim = True
+            source_duration = float(self._probe_clip_duration(str(path), clip.get("frames")) or 0.0)
+            if source_duration > 0:
+                trim_in = min(trim_in, max(0.0, source_duration - 0.001))
+                if trim_out is None:
+                    trim_out = source_duration
+                else:
+                    trim_out = min(max(trim_out, trim_in + 0.001), source_duration)
+            elif trim_out is None:
+                trim_out = trim_in + max(0.001, float(clip.get('frames') or 24) / 24.0)
+            effective_duration = max(0.001, float(trim_out) - trim_in)
+            trimmed = trim_in > 0.001 or (source_duration > 0 and trim_out < source_duration - 0.02)
+            has_trim = has_trim or trimmed
+            trim_specs.append((clip, path, trim_in, trim_out, effective_duration))
+
+        # The concat recipe remains useful for the unchanged fast stream-copy path.
+        concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        proc = QProcess(self)
-        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        proc.setProgram(str(ffmpeg_tool_path("ffmpeg.exe")))
         if has_trim or normalize_mixed_resolution:
-            # Trims and mixed-resolution timelines require a video re-encode.
-            # For mixed resolutions, scale/pad every decoded frame to the chosen
-            # final canvas. This only affects the assembled result; sources remain
-            # untouched. Ordinary same-resolution, untrimmed assembly still uses
-            # the original fast stream-copy path.
-            video_filters = []
-            audio_filters = []
+            # Re-encode only when Timeline editing actually requires it.  Each clip
+            # is an independent input so trim-in is exact and cannot be defeated by
+            # concat-demuxer timestamps/keyframes.  Sources remain untouched.
             args = ["-y"]
-            if has_trim:
-                args += ["-copyts", "-vsync", "0", "-segment_time_metadata", "1"]
-                video_filters.append("select=concatdec_select")
-                audio_filters.append("aselect=concatdec_select")
-            args += ["-f", "concat", "-safe", "0", "-i", str(concat_path),
-                     "-map", "0:v:0", "-map", "0:a?"]
-            if normalize_mixed_resolution and target_resolution:
-                target_w, target_h = target_resolution
-                video_filters.append(
-                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
-                )
-            if video_filters:
-                args += ["-vf", ",".join(video_filters)]
-            if audio_filters:
-                args += ["-af", ",".join(audio_filters)]
+            input_meta = []
+
+            def _input_has_audio(path):
+                try:
+                    exe = ffmpeg_tool_path("ffprobe.exe")
+                    out = subprocess.check_output(
+                        [str(exe), "-v", "error", "-select_streams", "a:0",
+                         "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+                        text=True, stderr=subprocess.DEVNULL, timeout=4.0,
+                    ).strip()
+                    return bool(out)
+                except Exception:
+                    return False
+
+            for _clip, path, trim_in, trim_out, effective_duration in trim_specs:
+                # Input-side seek is accurate during transcoding: FFmpeg seeks to a
+                # nearby keyframe then decodes/discards until the requested time.
+                if trim_in > 0.001:
+                    args += ["-ss", f"{trim_in:.6f}"]
+                args += ["-t", f"{effective_duration:.6f}", "-i", str(path)]
+                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path)))
+
+            filter_parts = []
+            concat_inputs = []
+            synthetic_audio_inputs = []
+            # Add silent audio inputs only for rare source clips without audio so
+            # one silent file cannot make the whole concat graph invalid.
+            for i, path, effective_duration, has_audio in input_meta:
+                vchain = f"[{i}:v:0]setpts=PTS-STARTPTS"
+                if normalize_mixed_resolution and target_resolution:
+                    tw, th = target_resolution
+                    vchain += (
+                        f",scale={tw}:{th}:force_original_aspect_ratio=decrease"
+                        f",pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2"
+                    )
+                vlabel = f"v{i}"
+                filter_parts.append(vchain + f"[{vlabel}]")
+                concat_inputs.append(f"[{vlabel}]")
+                if has_audio:
+                    alabel = f"a{i}"
+                    filter_parts.append(f"[{i}:a:0]asetpts=PTS-STARTPTS[{alabel}]")
+                    concat_inputs.append(f"[{alabel}]")
+                else:
+                    # Synthetic audio is appended after all media inputs.  Record
+                    # the duration now and add the lavfi inputs before filter use.
+                    synthetic_audio_inputs.append((i, effective_duration))
+                    concat_inputs.append(None)
+
+            # Append any needed silent audio sources and fill their concat labels.
+            next_input = len(input_meta)
+            for clip_i, duration in synthetic_audio_inputs:
+                args += ["-f", "lavfi", "-t", f"{duration:.6f}", "-i", "anullsrc=r=48000:cl=stereo"]
+                alabel = f"a{clip_i}"
+                filter_parts.append(f"[{next_input}:a:0]asetpts=PTS-STARTPTS[{alabel}]")
+                # Each clip contributes video then audio, so audio slot is 2*i+1.
+                concat_inputs[2 * clip_i + 1] = f"[{alabel}]"
+                next_input += 1
+
+            filter_parts.append(
+                "".join(concat_inputs) + f"concat=n={len(input_meta)}:v=1:a=1[vout][aout]"
+            )
             args += [
+                "-filter_complex", ";".join(filter_parts),
+                "-map", "[vout]", "-map", "[aout]",
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-c:a", "aac", "-b:a", "192k",
-                "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
                 str(final_path),
             ]
-            proc.setArguments(args)
         else:
-            proc.setArguments([
+            args = [
                 "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
                 "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
                 "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
                 str(final_path),
-            ])
-        self._timeline_assembly_proc = proc
-        self._timeline_assembly_output = ""
-        self._timeline_assembly_concat = concat_path
-        if getattr(self, "timeline_widget", None) is not None:
-            self.timeline_widget.mark_assembly_started(str(final_path))
-        self.status.setText("Timeline: assembling final video…")
-        self.append_log(f"\n=== TIMELINE ASSEMBLY ===\nClips: {len(outputs)}\nOutput: {final_path}\n")
+            ]
 
-        def read_output():
-            text = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-            if text:
-                self._timeline_assembly_output = (self._timeline_assembly_output + text)[-16000:]
-                self.append_log(text)
-
-        def finished(code, _status):
-            read_output()
-            try:
-                if self._timeline_assembly_concat and Path(self._timeline_assembly_concat).is_file():
-                    Path(self._timeline_assembly_concat).unlink()
-            except Exception:
-                pass
-            self._timeline_assembly_concat = None
-            self._timeline_assembly_proc = None
-            ok = int(code) == 0 and final_path.is_file() and final_path.stat().st_size > 0
-            if ok:
-                if getattr(self, "timeline_widget", None) is not None:
-                    self.timeline_widget.mark_assembly_finished(str(final_path))
-                self.status.setText(f"Timeline assembly finished: {final_path.name}")
-                self.append_log(f"=== TIMELINE ASSEMBLY FINISHED ===\n{final_path}\n")
-                QMessageBox.information(
-                    self,
-                    "Timeline assembly finished",
-                    f"The timeline was assembled successfully.\n\nSaved to:\n{final_path}",
-                )
-            else:
-                try:
-                    if final_path.is_file():
-                        final_path.unlink()
-                except Exception:
-                    pass
-                lines = [x.strip() for x in self._timeline_assembly_output.replace("\r", "\n").splitlines() if x.strip()]
-                detail = lines[-1] if lines else f"FFmpeg exited with code {code}."
-                if getattr(self, "timeline_widget", None) is not None:
-                    self.timeline_widget.mark_assembly_failed(detail)
-                self.status.setText("Timeline assembly failed")
-                QMessageBox.critical(self, "Timeline assembly failed", detail)
-
-        proc.readyReadStandardOutput.connect(read_output)
-        proc.finished.connect(finished)
-        proc.start()
-        if not proc.waitForStarted(3000):
-            detail = proc.errorString() or "Could not start FFmpeg."
+        # Assembly is a first-class queue job.  This gives it the same persistent
+        # Pending/Running/Finished lifecycle, cancellation controls and finished-
+        # result autoplay behavior as normal MiniMax renders.
+        active_assembly = next((
+            j for j in self.queue_jobs
+            if j.get("job_type") == "timeline_assembly"
+            and j.get("state") in ("pending", "running")
+            and str(j.get("timeline_project_id") or "") == str((project or {}).get("project_id") or (project or {}).get("id") or (project or {}).get("project_folder") or "")
+        ), None)
+        if active_assembly is not None:
             try:
                 if concat_path.is_file():
                     concat_path.unlink()
             except Exception:
                 pass
-            self._timeline_assembly_proc = None
-            self._timeline_assembly_concat = None
-            if getattr(self, "timeline_widget", None) is not None:
-                self.timeline_widget.mark_assembly_failed(detail)
-            QMessageBox.critical(self, "Timeline assembly failed", detail)
+            QMessageBox.information(self, "Timeline assembly", "This timeline already has an assembly job in the queue.")
             return False
+
+        project_key = str((project or {}).get("project_id") or (project or {}).get("id") or (project or {}).get("project_folder") or "")
+        if target_resolution:
+            queue_resolution = f"{target_resolution[0]} × {target_resolution[1]}"
+        elif len(resolutions) == 1:
+            queue_resolution = next(iter(resolutions))
+        else:
+            queue_resolution = "Timeline"
+        job = {
+            "id": uuid.uuid4().hex,
+            "job_number": self._take_next_job_number(),
+            "job_type": "timeline_assembly",
+            "timeline_project_id": project_key,
+            "state": "pending",
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "elapsed": 0,
+            "mode": -1,
+            "mode_name": "Timeline assembly",
+            "model_label": "Timeline assembly",
+            "output": str(final_path),
+            "seed": "—",
+            "actual_seed": None,
+            "resolution": queue_resolution,
+            "frames": None,
+            "steps": None,
+            "prompt": f"Assemble {len(outputs)} timeline clips",
+            "args": list(args),
+            "queue_program": str(ffmpeg_tool_path("ffmpeg.exe")),
+            "progress": None,
+            "phase": "Waiting to assemble",
+            "error": "",
+            "cancel_reason": "",
+            "settings": {},
+            "log_tail": "",
+            "continue_last_result": False,
+            "continue_from_job_id": None,
+            "continue_from_job_number": None,
+            "manual_continue_video": "",
+            "glue_results": False,
+            "timeline_assembly_concat": str(concat_path),
+            "timeline_assembly_clip_count": len(outputs),
+        }
+        self.queue_jobs.append(job)
+        self._save_queue_state()
+        self._refresh_queue_views()
+        if getattr(self, "timeline_widget", None) is not None:
+            self.timeline_widget.mark_assembly_queued(str(final_path), job.get("id"))
+        self.status.setText("Timeline assembly added to queue")
+        self.append_log(
+            f"\n=== TIMELINE ASSEMBLY QUEUED ===\n"
+            f"{self._job_number_text(job)} • Clips: {len(outputs)}\nOutput: {final_path}\n"
+        )
+        self._start_next_pending()
         return True
 
     def _current_tab_order(self):
@@ -5110,10 +5198,38 @@ class MainWindow(QMainWindow):
             elif code in (0,3) and Path(job.get("output","")).is_file():
                 job["state"]="finished"; job["phase"]="Finished"
                 job["clip_duration"] = self._probe_clip_duration(job.get("output"), job.get("frames"))
+                if job.get("job_type") == "timeline_assembly":
+                    if getattr(self, "timeline_widget", None) is not None:
+                        self.timeline_widget.mark_assembly_finished(job.get("output"))
+                    self.status.setText(f"Timeline assembly finished: {Path(job.get('output','')).name}")
+                    self.append_log(f"=== TIMELINE ASSEMBLY FINISHED ===\n{job.get('output')}\n")
                 if self.play_result_finished.isChecked():
                     play_finished_job = job
             else:
                 job["state"]="failed"; job["error"]=self._extract_failure_reason(job,code); job["phase"]="Failed"
+                if job.get("job_type") == "timeline_assembly" and getattr(self, "timeline_widget", None) is not None:
+                    self.timeline_widget.mark_assembly_failed(job.get("error") or "Assembly failed")
+        if job and job.get("job_type") == "timeline_assembly":
+            # Keep the concat recipe when a running assembly is explicitly requeued;
+            # it is needed for the next attempt. Terminal states can clean it up.
+            if job.get("state") in ("finished", "failed", "cancelled"):
+                concat = Path(str(job.get("timeline_assembly_concat") or ""))
+                try:
+                    if concat.is_file():
+                        concat.unlink()
+                except Exception:
+                    pass
+                if job.get("state") != "finished":
+                    try:
+                        partial = Path(str(job.get("output") or ""))
+                        if partial.is_file():
+                            partial.unlink()
+                    except Exception:
+                        pass
+            elif job.get("state") == "pending" and getattr(self, "timeline_widget", None) is not None:
+                self.timeline_widget.mark_assembly_queued(job.get("output"), job.get("id"))
+            if job.get("state") == "cancelled" and getattr(self, "timeline_widget", None) is not None:
+                self.timeline_widget.mark_assembly_failed("Cancelled")
         finish_line=f"=== FINISHED: exit {code} ===\n"
         self._write_job_log_file(finish_line)
         self.append_log(finish_line); self.proc=None; self.current_job_id=None; self._termination_action=None; self.cancel.setEnabled(False); self.gen.setEnabled(True)
