@@ -3585,7 +3585,12 @@ class TimelineTab(QWidget):
         if not output:
             return False
         if callable(self.preview_result_callback):
-            return bool(self.preview_result_callback(output, clip.get("queue_job_id")))
+            return bool(self.preview_result_callback(
+                output,
+                clip.get("queue_job_id"),
+                clip.get("trim_in"),
+                clip.get("trim_out"),
+            ))
         return False
 
 
@@ -3897,7 +3902,12 @@ class TimelineTab(QWidget):
             return
         output = self._clip_preview_path(clip)
         if callable(self.preview_result_callback) and output:
-            self.preview_result_callback(output, clip.get("queue_job_id"))
+            self.preview_result_callback(
+                output,
+                clip.get("queue_job_id"),
+                clip.get("trim_in"),
+                clip.get("trim_out"),
+            )
 
     def open_selected_output(self):
         clip = self._selected_clip()

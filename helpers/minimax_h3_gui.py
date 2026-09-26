@@ -1049,6 +1049,8 @@ class MainWindow(QMainWindow):
         self._termination_action = None
         self._proc_buffer = ""
         self.preview_path = ""
+        self._preview_trim_start_ms = 0
+        self._preview_trim_end_ms = None
         self._spinner_index = 0
         self._closing = False
         self._ffmpeg_setup_proc = None
@@ -1799,7 +1801,7 @@ class MainWindow(QMainWindow):
             seekrow = QHBoxLayout()
             self.preview_slider = QSlider(Qt.Orientation.Horizontal)
             self.preview_slider.setRange(0,0)
-            self.preview_slider.sliderMoved.connect(self.media_player.setPosition)
+            self.preview_slider.sliderMoved.connect(self._preview_seek_relative)
             self.preview_time = QLabel("00:00 / 00:00")
             self.preview_time.setMinimumWidth(105)
             seekrow.addWidget(self.preview_slider, 1)
@@ -2304,14 +2306,50 @@ class MainWindow(QMainWindow):
         if not job or job.get("state")!="finished": return
         self._load_preview(job,autoplay=True)
 
-    def _load_preview(self,job,autoplay=False):
+    def _load_preview(self,job,autoplay=False,trim_in=None,trim_out=None):
         path=Path(job.get("output",""))
         if not path.is_file(): QMessageBox.warning(self,"Preview","Output file is no longer on disk."); return
         self.preview_path=str(path)
+        try:
+            start_ms=max(0,int(round(float(trim_in or 0.0)*1000.0)))
+        except Exception:
+            start_ms=0
+        try:
+            end_ms=int(round(float(trim_out)*1000.0)) if trim_out is not None else None
+        except Exception:
+            end_ms=None
+        if end_ms is not None and end_ms <= start_ms:
+            end_ms=None
+        self._preview_trim_start_ms=start_ms
+        self._preview_trim_end_ms=end_ms
         if self.media_player is None:
+            # External playback cannot enforce an in/out range, so only use it for
+            # ordinary untrimmed previews. The embedded preview pane is the normal
+            # GrizzlyMax path and supports the exact trim window below.
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))); return
-        self.media_player.setSource(QUrl.fromLocalFile(str(path.resolve()))); self.preview_label.setText(path.name); self.preview_view.reset_view()
-        if autoplay: self.media_player.play()
+        self.media_player.setSource(QUrl.fromLocalFile(str(path.resolve())))
+        self.preview_label.setText(path.name)
+        self.preview_view.reset_view()
+        if start_ms > 0:
+            self.media_player.setPosition(start_ms)
+        if autoplay:
+            self.media_player.play()
+
+    def _preview_bounds(self):
+        if not self.media_player:
+            return 0, 0
+        duration=max(0,int(self.media_player.duration()))
+        start=max(0,min(int(getattr(self,"_preview_trim_start_ms",0) or 0),duration))
+        raw_end=getattr(self,"_preview_trim_end_ms",None)
+        end=duration if raw_end is None else max(start,min(int(raw_end),duration))
+        return start,end
+
+    def _preview_seek_relative(self,value):
+        if not self.media_player:
+            return
+        start,end=self._preview_bounds()
+        target=max(start,min(start+int(value),end))
+        self.media_player.setPosition(target)
 
     def _open_preview_fullscreen(self):
         if not self.media_player or not self.preview_path:
@@ -2323,17 +2361,42 @@ class MainWindow(QMainWindow):
 
     def _preview_toggle(self):
         if not self.media_player: return
-        if self.media_player.playbackState()==QMediaPlayer.PlaybackState.PlayingState: self.media_player.pause()
-        else: self.media_player.play()
-    def _preview_duration_changed(self,d): self.preview_slider.setRange(0,max(0,int(d))); self._preview_position_changed(self.media_player.position() if self.media_player else 0)
+        if self.media_player.playbackState()==QMediaPlayer.PlaybackState.PlayingState:
+            self.media_player.pause()
+        else:
+            start,end=self._preview_bounds()
+            pos=int(self.media_player.position())
+            if pos < start or (end > start and pos >= end):
+                self.media_player.setPosition(start)
+            self.media_player.play()
+    def _preview_duration_changed(self,d):
+        start,end=self._preview_bounds()
+        self.preview_slider.setRange(0,max(0,end-start))
+        if self.media_player and int(self.media_player.position()) < start:
+            self.media_player.setPosition(start)
+        self._preview_position_changed(self.media_player.position() if self.media_player else 0)
     def _preview_position_changed(self,p):
         if not self.media_player: return
-        if not self.preview_slider.isSliderDown(): self.preview_slider.setValue(int(p))
+        start,end=self._preview_bounds()
+        p=int(p)
+        # Timeline clip previews honor the non-destructive trim window.  Stop at
+        # trim_out rather than continuing through the remainder of the source.
+        if end > start and p >= end:
+            if self.media_player.playbackState()==QMediaPlayer.PlaybackState.PlayingState:
+                if self.preview_repeat.isChecked():
+                    self.media_player.setPosition(start); return
+                self.media_player.pause()
+            if p != end:
+                self.media_player.setPosition(end)
+            p=end
+        relative=max(0,min(p-start,max(0,end-start)))
+        if not self.preview_slider.isSliderDown(): self.preview_slider.setValue(relative)
         def fmt(ms):
             sec=max(0,int(ms)//1000); return f"{sec//60:02d}:{sec%60:02d}"
-        self.preview_time.setText(f"{fmt(p)} / {fmt(self.media_player.duration())}")
+        self.preview_time.setText(f"{fmt(relative)} / {fmt(max(0,end-start))}")
     def _preview_media_status(self,status):
-        if self.media_player and status==QMediaPlayer.MediaStatus.EndOfMedia and self.preview_repeat.isChecked(): self.media_player.setPosition(0); self.media_player.play()
+        if self.media_player and status==QMediaPlayer.MediaStatus.EndOfMedia and self.preview_repeat.isChecked():
+            start,_end=self._preview_bounds(); self.media_player.setPosition(start); self.media_player.play()
 
     def _delete_job_output(self,job):
         path=Path(job.get("output",""))
@@ -3040,13 +3103,18 @@ class MainWindow(QMainWindow):
             self.apply_settings(original)
             self.save_last()
 
-    def _preview_timeline_result(self, output, job_id=None):
+    def _preview_timeline_result(self, output, job_id=None, trim_in=None, trim_out=None):
         path = Path(str(output or ""))
         if not path.is_file():
             QMessageBox.warning(self, "Timeline preview", "The selected timeline output file is no longer on disk.")
             return False
         job = self._job_by_id(job_id) if job_id else None
-        self._load_preview(job or {"output": str(path)}, autoplay=True)
+        self._load_preview(
+            job or {"output": str(path)},
+            autoplay=True,
+            trim_in=trim_in,
+            trim_out=trim_out,
+        )
         return True
 
     def _open_timeline_output_folder(self, output):
