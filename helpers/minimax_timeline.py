@@ -54,7 +54,7 @@ FPS = 24.0
 MIN_SEGMENT_SECONDS = 0.3
 # Backward-compatible internal alias; project JSON still uses the existing "segments" key.
 MIN_CUT_SECONDS = MIN_SEGMENT_SECONDS
-TIMELINE_SCHEMA_VERSION = 3
+TIMELINE_SCHEMA_VERSION = 4
 TIMELINE_MAX_REF_IMAGES = 9
 
 
@@ -348,6 +348,46 @@ def _timeline_total_seconds(clips: list[dict]) -> float:
     for i in range(max(0, len(clips) - 1)):
         total -= _transition_overlap_seconds(clips[i], clips[i + 1])
     return max(0.0, total)
+
+
+def _soundtrack_clip_duration(item: dict) -> float:
+    try:
+        source_duration = max(0.0, float(item.get("source_duration") or 0.0))
+    except Exception:
+        source_duration = 0.0
+    try:
+        trim_in = max(0.0, float(item.get("trim_in") or 0.0))
+    except Exception:
+        trim_in = 0.0
+    raw_out = item.get("trim_out")
+    try:
+        trim_out = float(raw_out) if raw_out is not None else source_duration
+    except Exception:
+        trim_out = source_duration
+    if source_duration > 0:
+        trim_in = min(trim_in, source_duration)
+        trim_out = min(max(trim_out, trim_in), source_duration)
+    used = max(0.0, trim_out - trim_in)
+    try:
+        start = max(0.0, float(item.get("timeline_start") or 0.0))
+    except Exception:
+        start = 0.0
+    raw_end = item.get("timeline_end")
+    if raw_end is not None:
+        try:
+            requested = max(start, float(raw_end)) - start
+            used = min(used, requested)
+        except Exception:
+            pass
+    return max(0.0, used)
+
+
+def _soundtrack_clip_end(item: dict) -> float:
+    try:
+        start = max(0.0, float(item.get("timeline_start") or 0.0))
+    except Exception:
+        start = 0.0
+    return start + _soundtrack_clip_duration(item)
 
 
 class TransitionDialog(QDialog):
@@ -950,22 +990,28 @@ class TimelineCanvas(QWidget):
     clipsReordered = Signal(int, int)
     clipFramesChanged = Signal(str, int)
     clipContextMenuRequested = Signal(str, object)
+    audioContextMenuRequested = Signal(str, object)
 
     RULER_H = 30
     CLIP_TOP = 40
     CLIP_H = 116
-    BOTTOM_PAD = 16
+    SOUND_GAP = 32
+    SOUND_ROW_H = 42
+    SOUND_ROW_GAP = 6
+    BOTTOM_PAD = 18
     THUMB_W = 46
     THUMB_H = 36
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.clips: list[dict] = []
+        self.audio_clips: list[dict] = []
         self.selected_id: str | None = None
         self.selected_ids: set[str] = set()
         self.pixels_per_second = 38.0
         self.allowed_frames: list[int] = list(range(124, 720, 17))
         self._rects: list[tuple[str, float, float]] = []
+        self._audio_rects: list[tuple[str, QRect]] = []
         self._press_x = 0.0
         self._press_clip_index = -1
         self._dragging = False
@@ -973,15 +1019,45 @@ class TimelineCanvas(QWidget):
         self._thumb_cache: dict[str, QImage | None] = {}
         self._video_meta_cache: dict[str, dict] = {}
         self._thumb_cache_dir = Path(__file__).resolve().parent / "_timeline_thumb_cache"
-        self.setMinimumHeight(self.CLIP_TOP + self.CLIP_H + self.BOTTOM_PAD)
+        self.setMinimumHeight(self._required_height())
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
+    def _audio_row_assignments(self):
+        rows_end: list[float] = []
+        assignments: list[int] = []
+        for item in self.audio_clips:
+            try:
+                start = max(0.0, float(item.get("timeline_start") or 0.0))
+            except Exception:
+                start = 0.0
+            end = _soundtrack_clip_end(item)
+            row = None
+            for idx, row_end in enumerate(rows_end):
+                if start >= row_end - 0.001:
+                    row = idx
+                    rows_end[idx] = end
+                    break
+            if row is None:
+                row = len(rows_end)
+                rows_end.append(end)
+            assignments.append(row)
+        return assignments, max(1, len(rows_end))
+
+    def _sound_top(self) -> int:
+        return self.CLIP_TOP + self.CLIP_H + self.SOUND_GAP
+
+    def _required_height(self) -> int:
+        _assignments, rows = self._audio_row_assignments()
+        return int(self._sound_top() + rows * (self.SOUND_ROW_H + self.SOUND_ROW_GAP) + self.BOTTOM_PAD)
+
     def sizeHint(self):
-        return QSize(max(900, self._content_width()), self.CLIP_TOP + self.CLIP_H + self.BOTTOM_PAD)
+        return QSize(max(900, self._content_width()), self._required_height())
 
     def _content_width(self) -> int:
-        total = _timeline_total_seconds(self.clips)
+        video_total = _timeline_total_seconds(self.clips)
+        audio_total = max([_soundtrack_clip_end(x) for x in self.audio_clips] or [0.0])
+        total = max(video_total, audio_total)
         return int(max(900, 36 + total * self.pixels_per_second + 36))
 
     def set_clips(self, clips: list[dict], selected_id: str | None = None, selected_ids=None):
@@ -992,13 +1068,22 @@ class TimelineCanvas(QWidget):
         else:
             self.selected_ids = {str(x) for x in selected_ids if x}
         self.setMinimumWidth(self._content_width())
-        self.resize(self._content_width(), self.minimumHeight())
+        self.setMinimumHeight(self._required_height())
+        self.resize(self._content_width(), self._required_height())
+        self.update()
+
+    def set_audio_clips(self, audio_clips):
+        self.audio_clips = list(audio_clips or [])
+        self.setMinimumWidth(self._content_width())
+        self.setMinimumHeight(self._required_height())
+        self.resize(self._content_width(), self._required_height())
         self.update()
 
     def set_zoom(self, pixels_per_second: float):
         self.pixels_per_second = max(16.0, min(120.0, float(pixels_per_second)))
         self.setMinimumWidth(self._content_width())
-        self.resize(self._content_width(), self.minimumHeight())
+        self.setMinimumHeight(self._required_height())
+        self.resize(self._content_width(), self._required_height())
         self.update()
 
     def set_allowed_frames(self, values):
@@ -1336,7 +1421,8 @@ class TimelineCanvas(QWidget):
         accent_text = palette.color(palette.ColorRole.HighlightedText)
         painter.fillRect(self.rect(), bg)
 
-        total_seconds = max(1.0, _timeline_total_seconds(self.clips))
+        audio_total = max([_soundtrack_clip_end(x) for x in self.audio_clips] or [0.0])
+        total_seconds = max(1.0, _timeline_total_seconds(self.clips), audio_total)
         ruler_step = 1
         if self.pixels_per_second < 25:
             ruler_step = 10
@@ -1491,14 +1577,61 @@ class TimelineCanvas(QWidget):
             overlap = _transition_overlap_seconds(clip, self.clips[idx + 1] if idx + 1 < len(self.clips) else None)
             cursor = right - overlap * self.pixels_per_second
 
+        # Dedicated soundtrack lanes share the exact same time ruler/zoom as the
+        # video timeline. Overlapping audio clips are automatically stacked into
+        # additional rows so voice-over, music and effects remain individually clickable.
+        sound_top = self._sound_top()
+        painter.setPen(QPen(border, 1))
+        painter.drawLine(int(x0), sound_top - 12, self.width() - 10, sound_top - 12)
+        painter.setPen(muted)
+        painter.drawText(int(x0), sound_top - 16, "Soundtrack")
+        self._audio_rects = []
+        assignments, _rows = self._audio_row_assignments()
+        for ai, item in enumerate(self.audio_clips):
+            try:
+                start_sec = max(0.0, float(item.get("timeline_start") or 0.0))
+            except Exception:
+                start_sec = 0.0
+            duration = _soundtrack_clip_duration(item)
+            if duration <= 0.0005:
+                continue
+            row = assignments[ai] if ai < len(assignments) else 0
+            left = x0 + start_sec * self.pixels_per_second
+            width = max(42.0, duration * self.pixels_per_second)
+            top = sound_top + row * (self.SOUND_ROW_H + self.SOUND_ROW_GAP)
+            rect = QRect(int(left), int(top), int(width), self.SOUND_ROW_H)
+            self._audio_rects.append((str(item.get("id") or ""), rect))
+            painter.setBrush(QBrush(QColor("#5b4b8a")))
+            painter.setPen(QPen(border, 1))
+            painter.drawRoundedRect(rect, 5, 5)
+            painter.setPen(QColor("#f4f6f8"))
+            name = str(item.get("name") or Path(str(item.get("path") or "Audio")).stem or "Audio")
+            volume = int(round(float(item.get("volume_percent", 100) or 100)))
+            end_sec = start_sec + duration
+            line1 = fm.elidedText(name, Qt.TextElideMode.ElideRight, max(20, rect.width() - 12))
+            painter.drawText(rect.x() + 6, rect.y() + 17, line1)
+            painter.setPen(QColor("#c9c5df"))
+            detail = f"{start_sec:.2f}s → {end_sec:.2f}s  •  {volume}%"
+            painter.drawText(rect.x() + 6, rect.y() + 34, fm.elidedText(detail, Qt.TextElideMode.ElideRight, max(20, rect.width() - 12)))
+
+        if not self.audio_clips:
+            painter.setPen(muted)
+            painter.drawText(int(x0), sound_top + 26, "No soundtrack audio — use + Add audio to add music, voice-over or effects.")
+
         if not self.clips:
             painter.setPen(muted)
             painter.drawText(28, self.CLIP_TOP + 50, "No clips yet — add a generation clip to start the timeline.")
 
     def contextMenuEvent(self, event):
         x = float(event.pos().x())
+        pos = event.pos()
+        for audio_id, rect in reversed(self._audio_rects):
+            if audio_id and rect.contains(pos):
+                self.audioContextMenuRequested.emit(audio_id, event.globalPos())
+                event.accept()
+                return
         idx, _left, _right = self._clip_at(x)
-        if idx < 0:
+        if idx < 0 or pos.y() > self.CLIP_TOP + self.CLIP_H:
             return super().contextMenuEvent(event)
         clip_id = str(self.clips[idx].get("id") or "")
         if not clip_id:
@@ -1510,6 +1643,8 @@ class TimelineCanvas(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
         x = event.position().x()
+        if event.position().y() > self.CLIP_TOP + self.CLIP_H:
+            return super().mousePressEvent(event)
         idx, left, right = self._clip_at(x)
         if idx < 0:
             return
@@ -1657,6 +1792,8 @@ class TimelineTab(QWidget):
             "name": "MiniMax Timeline",
             "project_folder": "",
             "clips": [],
+            "soundtrack_clips": [],
+            "soundtrack_mode": "mix",
             "assembled_output": "",
             "assembly_status": "",
             "auto_assemble": False,
@@ -2010,6 +2147,20 @@ class TimelineTab(QWidget):
         self.ref_presets_btn.setToolTip(
             "Load reusable MiniMax Ref2VA presets and apply them to the currently selected Timeline clip(s)."
         )
+        self.add_audio_btn = QPushButton("+ Add audio")
+        self.add_audio_btn.setMinimumHeight(36)
+        self.add_audio_btn.setToolTip("Add background music, voice-over or another audio file to the soundtrack lanes below the video timeline.")
+        self.soundtrack_mode_combo = QComboBox()
+        self.soundtrack_mode_combo.setMinimumHeight(36)
+        self.soundtrack_mode_combo.addItem("Mix clip audio + soundtrack", "mix")
+        self.soundtrack_mode_combo.addItem("Clip audio only", "clips_only")
+        self.soundtrack_mode_combo.addItem("Soundtrack only", "soundtrack_only")
+        self.soundtrack_mode_combo.setToolTip(
+            "Choose the audio used by Assemble Video:\n"
+            "• Mix clip audio + soundtrack: generated clip sound and added soundtrack are mixed together.\n"
+            "• Clip audio only: soundtrack clips stay in the project but are ignored during assembly.\n"
+            "• Soundtrack only: generated clip sound is muted; only added soundtrack audio is used."
+        )
         self.assemble_timeline_btn = QPushButton("Assemble Video")
         self.assemble_timeline_btn.setMinimumHeight(36)
         self.assemble_timeline_btn.setToolTip(
@@ -2024,6 +2175,8 @@ class TimelineTab(QWidget):
         runbar.addWidget(self.generate_timeline_btn)
         runbar.addWidget(self.hq_restart_btn)
         runbar.addWidget(self.ref_presets_btn)
+        runbar.addWidget(self.add_audio_btn)
+        runbar.addWidget(self.soundtrack_mode_combo)
         runbar.addWidget(self.assemble_timeline_btn)
         runbar.addWidget(self.use_generation_settings_btn)
         self.generation_resolution_label = QLabel("Resolution: —")
@@ -2269,7 +2422,10 @@ class TimelineTab(QWidget):
         self.canvas.clipsReordered.connect(self._reorder_clips)
         self.canvas.clipFramesChanged.connect(self._canvas_frames_changed)
         self.canvas.clipContextMenuRequested.connect(self._show_clip_context_menu)
+        self.canvas.audioContextMenuRequested.connect(self._show_audio_context_menu)
         self.ref_presets_btn.clicked.connect(self._open_ref_presets)
+        self.add_audio_btn.clicked.connect(self._add_soundtrack_audio)
+        self.soundtrack_mode_combo.currentIndexChanged.connect(self._soundtrack_mode_changed)
         self.clip_name.textEdited.connect(self._clip_name_changed)
         self.gen_mode.currentIndexChanged.connect(self._mode_changed)
         self.frames_combo.currentIndexChanged.connect(self._frames_changed)
@@ -2286,6 +2442,17 @@ class TimelineTab(QWidget):
     def _refresh_all(self, *, select_first=False):
         self._update_history_buttons()
         self._refresh_generation_resolution_label()
+        if hasattr(self, "soundtrack_mode_combo"):
+            mode = str(self.project.get("soundtrack_mode") or "mix")
+            if mode not in {"mix", "clips_only", "soundtrack_only"}:
+                mode = "mix"
+                self.project["soundtrack_mode"] = mode
+            idx = self.soundtrack_mode_combo.findData(mode)
+            self.soundtrack_mode_combo.blockSignals(True)
+            try:
+                self.soundtrack_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            finally:
+                self.soundtrack_mode_combo.blockSignals(False)
         valid_ids = {str(c.get("id")) for c in self._clips()}
         self.selected_clip_ids = {str(x) for x in self.selected_clip_ids if str(x) in valid_ids}
         if select_first and self._clips() and not self.selected_clip_id:
@@ -2319,6 +2486,7 @@ class TimelineTab(QWidget):
             else f"Autosaving recovery project to {self._autosave_temp_path}"
         )
         self.canvas.set_clips(self._clips(), self.selected_clip_id, self.selected_clip_ids)
+        self.canvas.set_audio_clips(self.project.get("soundtrack_clips") or [])
         selected_clips = [c for c in self._clips() if str(c.get("id")) in self.selected_clip_ids]
         any_selected = bool(selected_clips)
         all_locked = any_selected and all(bool(c.get("locked", False)) for c in selected_clips)
@@ -2798,6 +2966,22 @@ class TimelineTab(QWidget):
             self.project["auto_assemble_pending"] = False
             self.project.setdefault("global_generation_settings", {})
             self.project.setdefault("hq_restart_override", {})
+            self.project.setdefault("soundtrack_clips", [])
+            self.project.setdefault("soundtrack_mode", "mix")
+            if str(self.project.get("soundtrack_mode") or "mix") not in {"mix", "clips_only", "soundtrack_only"}:
+                self.project["soundtrack_mode"] = "mix"
+            for audio in self.project.get("soundtrack_clips") or []:
+                if not isinstance(audio, dict):
+                    continue
+                audio.setdefault("id", uuid.uuid4().hex)
+                audio.setdefault("path", "")
+                audio.setdefault("name", Path(str(audio.get("path") or "Audio")).stem)
+                audio.setdefault("source_duration", 0.0)
+                audio.setdefault("trim_in", 0.0)
+                audio.setdefault("trim_out", audio.get("source_duration"))
+                audio.setdefault("timeline_start", 0.0)
+                audio.setdefault("timeline_end", None)
+                audio.setdefault("volume_percent", 100)
             for clip in self.project.get("clips") or []:
                 legacy_match = bool(clip.get("match_next_first_frame", False))
                 if not clip.get("edit_mode"):
@@ -3982,6 +4166,180 @@ class TimelineTab(QWidget):
             except (OSError, ValueError):
                 pass
         return ""
+
+    def _probe_audio_duration(self, path: str) -> float:
+        try:
+            ffprobe = self.canvas._ffprobe_path()
+            if not ffprobe:
+                return 0.0
+            cp = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, text=True, timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if cp.returncode == 0:
+                return max(0.0, float((cp.stdout or "0").strip() or 0.0))
+        except Exception:
+            pass
+        return 0.0
+
+    def _soundtrack_mode_changed(self):
+        if self._loading_inspector:
+            return
+        if not hasattr(self, "soundtrack_mode_combo"):
+            return
+        mode = str(self.soundtrack_mode_combo.currentData() or "mix")
+        if mode not in {"mix", "clips_only", "soundtrack_only"}:
+            mode = "mix"
+        old_mode = str(self.project.get("soundtrack_mode") or "mix")
+        if old_mode == mode:
+            return
+        self._record_undo_state("Change soundtrack mix mode")
+        self.project["soundtrack_mode"] = mode
+        self._invalidate_assembly("Soundtrack mix mode changed — assemble again when ready.")
+        self._refresh_all()
+
+    def _soundtrack_by_id(self, audio_id):
+        for idx, item in enumerate(self.project.get("soundtrack_clips") or []):
+            if str(item.get("id") or "") == str(audio_id):
+                return idx, item
+        return -1, None
+
+    def _add_soundtrack_audio(self):
+        if not self._ensure_project_setup_for_first_edit():
+            return
+        names, _ = QFileDialog.getOpenFileNames(
+            self, "Add soundtrack audio", "",
+            "Audio / media (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.wma *.mp4 *.mov *.mkv *.webm);;All files (*.*)"
+        )
+        if not names:
+            return
+        additions = []
+        for name in names:
+            path = Path(name)
+            if not path.is_file():
+                continue
+            duration = self._probe_audio_duration(str(path))
+            if duration <= 0.001:
+                QMessageBox.warning(self, "Soundtrack", f"Could not read an audio duration from:\n{path}")
+            additions.append({
+                "id": uuid.uuid4().hex,
+                "path": str(path),
+                "name": path.stem,
+                "source_duration": duration,
+                "trim_in": 0.0,
+                "trim_out": duration,
+                "timeline_start": 0.0,
+                "timeline_end": None,
+                "volume_percent": 100,
+            })
+        if not additions:
+            return
+        self._record_undo_state("Add soundtrack audio")
+        self.project.setdefault("soundtrack_clips", []).extend(additions)
+        self._invalidate_assembly("Soundtrack changed — assemble again when ready.")
+        self._refresh_all()
+
+    def _show_audio_context_menu(self, audio_id, global_pos):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None:
+            return
+        menu = QMenu(self)
+        trim = menu.addAction("Trim audio…")
+        volume = menu.addAction(f"Volume…  {int(round(float(item.get('volume_percent', 100) or 100)))}%")
+        menu.addSeparator()
+        start_action = menu.addAction(f"Set exact timeline start…  {float(item.get('timeline_start') or 0.0):.2f}s")
+        end_action = menu.addAction(f"Set exact timeline end…  {_soundtrack_clip_end(item):.2f}s")
+        menu.addSeparator()
+        remove = menu.addAction("Remove audio from soundtrack")
+        chosen = menu.exec(global_pos)
+        if chosen is trim:
+            self._trim_soundtrack_audio(audio_id)
+        elif chosen is volume:
+            self._set_soundtrack_volume(audio_id)
+        elif chosen is start_action:
+            self._set_soundtrack_start(audio_id)
+        elif chosen is end_action:
+            self._set_soundtrack_end(audio_id)
+        elif chosen is remove:
+            self._remove_soundtrack_audio(audio_id)
+
+    def _trim_soundtrack_audio(self, audio_id):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None:
+            return
+        duration = max(0.001, float(item.get("source_duration") or self._probe_audio_duration(item.get("path")) or 0.001))
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Trim soundtrack audio")
+        form = QFormLayout(dlg)
+        start = QDoubleSpinBox(); end = QDoubleSpinBox()
+        for spin in (start, end):
+            spin.setRange(0.0, duration); spin.setDecimals(3); spin.setSingleStep(0.1); spin.setSuffix(" s")
+        start.setValue(max(0.0, min(duration, float(item.get("trim_in") or 0.0))))
+        raw_out = item.get("trim_out")
+        end.setValue(max(start.value(), min(duration, float(raw_out) if raw_out is not None else duration)))
+        form.addRow("Source start", start); form.addRow("Source end", end)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_in = float(start.value()); new_out = float(end.value())
+        if new_out <= new_in + 0.001:
+            QMessageBox.warning(self, "Soundtrack", "The audio end must be after its start.")
+            return
+        self._record_undo_state("Trim soundtrack audio")
+        item["trim_in"] = round(new_in, 3); item["trim_out"] = round(new_out, 3)
+        natural_end = float(item.get("timeline_start") or 0.0) + (new_out - new_in)
+        if item.get("timeline_end") is not None:
+            item["timeline_end"] = min(float(item.get("timeline_end")), natural_end)
+        self._invalidate_assembly("Soundtrack trim changed — assemble again when ready.")
+        self._refresh_all()
+
+    def _set_soundtrack_volume(self, audio_id):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None: return
+        current = int(round(float(item.get("volume_percent", 100) or 100)))
+        value, ok = QInputDialog.getInt(self, "Soundtrack volume", "Volume", current, 0, 150, 1)
+        if not ok or value == current: return
+        self._record_undo_state("Change soundtrack volume")
+        item["volume_percent"] = int(value)
+        self._invalidate_assembly("Soundtrack volume changed — assemble again when ready.")
+        self._refresh_all()
+
+    def _set_soundtrack_start(self, audio_id):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None: return
+        total = max(0.0, _timeline_total_seconds(self._clips()))
+        current = max(0.0, float(item.get("timeline_start") or 0.0))
+        value, ok = QInputDialog.getDouble(self, "Soundtrack start", "Start on video timeline (seconds)", current, 0.0, max(36000.0, total), 3)
+        if not ok: return
+        self._record_undo_state("Move soundtrack audio")
+        old_duration = _soundtrack_clip_duration(item)
+        item["timeline_start"] = round(float(value), 3)
+        item["timeline_end"] = round(float(value) + old_duration, 3)
+        self._invalidate_assembly("Soundtrack timing changed — assemble again when ready.")
+        self._refresh_all()
+
+    def _set_soundtrack_end(self, audio_id):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None: return
+        start = max(0.0, float(item.get("timeline_start") or 0.0))
+        natural_end = start + max(0.0, float(item.get("trim_out") or item.get("source_duration") or 0.0) - float(item.get("trim_in") or 0.0))
+        current = _soundtrack_clip_end(item)
+        value, ok = QInputDialog.getDouble(self, "Soundtrack end", "End on video timeline (seconds)", current, start + 0.001, max(start + 0.001, natural_end), 3)
+        if not ok: return
+        self._record_undo_state("Set soundtrack end")
+        item["timeline_end"] = round(float(value), 3)
+        self._invalidate_assembly("Soundtrack timing changed — assemble again when ready.")
+        self._refresh_all()
+
+    def _remove_soundtrack_audio(self, audio_id):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None: return
+        self._record_undo_state("Remove soundtrack audio")
+        del self.project.setdefault("soundtrack_clips", [])[idx]
+        self._invalidate_assembly("Soundtrack changed — assemble again when ready.")
+        self._refresh_all()
 
     def _show_clip_context_menu(self, clip_id, global_pos):
         idx, clip = self._clip_by_id(clip_id)

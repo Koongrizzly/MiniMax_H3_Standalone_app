@@ -3110,6 +3110,12 @@ class MainWindow(QMainWindow):
                 job["timeline_clip_id"] = clip_id
                 job["timeline_clip_index"] = pos
                 job["timeline_clip_name"] = clip_name
+                job["timeline_generation_mode"] = generation_mode
+                job["timeline_edit_mode"] = str(spec.get("edit_mode") or "")
+                job["timeline_use_reference_images"] = bool(use_timeline_refs)
+                job["compiled_prompt"] = str(settings.get("prompt") or "")
+                job["timeline_reference_images"] = copy.deepcopy(spec.get("timeline_reference_images") or spec.get("reference_images") or [])
+                job["timeline_settings_snapshot"] = copy.deepcopy(settings)
                 if bool(spec.get("timeline_alternate_candidate", False)):
                     job["timeline_alternate_candidate"] = True
                     job["timeline_alternate_candidate_id"] = str(spec.get("timeline_alternate_candidate_id") or "")
@@ -3302,6 +3308,67 @@ class MainWindow(QMainWindow):
         def ffconcat_path(path):
             return str(path.resolve()).replace("\\", "/").replace("'", "\\'")
 
+        soundtrack_mode = str((project or {}).get("soundtrack_mode") or "mix")
+        if soundtrack_mode not in {"mix", "clips_only", "soundtrack_only"}:
+            soundtrack_mode = "mix"
+
+        soundtrack_specs = []
+        soundtrack_items = [] if soundtrack_mode == "clips_only" else list((project or {}).get("soundtrack_clips") or [])
+        for audio_index, item in enumerate(soundtrack_items, 1):
+            if not isinstance(item, dict):
+                continue
+            audio_path = Path(str(item.get("path") or ""))
+            if not audio_path.is_file():
+                QMessageBox.warning(
+                    self, "Timeline assembly",
+                    f"Soundtrack audio {audio_index} has no usable file:\n\n{audio_path}",
+                )
+                return False
+            try:
+                source_duration = max(0.0, float(item.get("source_duration") or 0.0))
+            except Exception:
+                source_duration = 0.0
+            if source_duration <= 0.0:
+                source_duration = float(self._probe_clip_duration(str(audio_path), None) or 0.0)
+            try:
+                trim_in = max(0.0, float(item.get("trim_in") or 0.0))
+            except Exception:
+                trim_in = 0.0
+            raw_out = item.get("trim_out")
+            try:
+                trim_out = float(raw_out) if raw_out is not None else source_duration
+            except Exception:
+                trim_out = source_duration
+            if source_duration > 0.0:
+                trim_in = min(trim_in, source_duration)
+                trim_out = min(max(trim_out, trim_in), source_duration)
+            try:
+                timeline_start = max(0.0, float(item.get("timeline_start") or 0.0))
+            except Exception:
+                timeline_start = 0.0
+            used = max(0.0, trim_out - trim_in)
+            raw_end = item.get("timeline_end")
+            if raw_end is not None:
+                try:
+                    used = min(used, max(0.0, float(raw_end) - timeline_start))
+                except Exception:
+                    pass
+            if used <= 0.0005:
+                continue
+            try:
+                volume_percent = max(0, min(150, int(round(float(item.get("volume_percent", 100) or 100)))))
+            except Exception:
+                volume_percent = 100
+            soundtrack_specs.append((item, audio_path, trim_in, used, timeline_start, volume_percent))
+        has_soundtrack = bool(soundtrack_specs)
+        if soundtrack_mode == "soundtrack_only" and not has_soundtrack:
+            QMessageBox.warning(
+                self,
+                "Timeline assembly",
+                "Soundtrack only is selected, but there is no usable soundtrack audio on the timeline."
+            )
+            return False
+
         # The timeline trimmer is non-destructive: in/out points live only in
         # project JSON.  Do not rely on concat-demuxer inpoint/outpoint here:
         # those directives are timestamp/keyframe sensitive and can leak source
@@ -3369,9 +3436,9 @@ class MainWindow(QMainWindow):
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_speed_adjustment or has_transition:
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_speed_adjustment or has_transition or has_soundtrack:
             # Re-encode only when Timeline editing actually requires it (trim,
-            # mixed resolution, per-clip volume/speed, or transitions). Each clip
+            # mixed resolution, per-clip volume/speed, transitions, or soundtrack audio). Each clip
             # is an independent input so trim-in is exact and cannot be defeated by
             # concat-demuxer timestamps/keyframes.  Sources remain untouched.
             args = ["-y"]
@@ -3460,6 +3527,27 @@ class MainWindow(QMainWindow):
                 audio_labels[clip_i] = alabel
                 next_input += 1
 
+            # Soundtrack inputs are independent audio-only sources. They are
+            # trimmed non-destructively, normalized to stereo/48 kHz, delayed to
+            # their exact timeline start position, then mixed over the assembled
+            # clip audio after all clip-to-clip transitions are resolved.
+            soundtrack_labels = []
+            for sidx, (_item, audio_path, trim_in, used_duration, timeline_start, volume_percent) in enumerate(soundtrack_specs):
+                if trim_in > 0.001:
+                    args += ["-ss", f"{trim_in:.6f}"]
+                args += ["-t", f"{used_duration:.6f}", "-i", str(audio_path)]
+                input_index = next_input
+                next_input += 1
+                label = f"st{sidx}"
+                gain = max(0.0, min(1.5, float(volume_percent) / 100.0))
+                delay_ms = max(0, int(round(float(timeline_start) * 1000.0)))
+                filter_parts.append(
+                    f"[{input_index}:a:0]asetpts=PTS-STARTPTS,volume={gain:.3f},aresample=48000,"
+                    f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                    f"adelay={delay_ms}|{delay_ms}[{label}]"
+                )
+                soundtrack_labels.append(label)
+
             allowed_transitions = {
                 "fade", "dissolve", "wipeleft", "wiperight", "wipeup", "wipedown",
                 "slideleft", "slideright", "slideup", "slidedown",
@@ -3522,6 +3610,31 @@ class MainWindow(QMainWindow):
                     filter_parts.append(f"[{current_a}][{next_a}]concat=n=2:v=0:a=1[{out_a}]")
                     current_v, current_a = out_v, out_a
                     current_duration += final_durations[i]
+
+            if soundtrack_mode == "mix":
+                for sidx, soundtrack_label in enumerate(soundtrack_labels):
+                    mixed = f"amix{sidx}"
+                    filter_parts.append(
+                        f"[{current_a}][{soundtrack_label}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[{mixed}]"
+                    )
+                    current_a = mixed
+            elif soundtrack_mode == "soundtrack_only":
+                if len(soundtrack_labels) == 1:
+                    soundtrack_mix = soundtrack_labels[0]
+                else:
+                    soundtrack_mix = "soundtrack_mix"
+                    joined = "".join(f"[{label}]" for label in soundtrack_labels)
+                    filter_parts.append(
+                        f"{joined}amix=inputs={len(soundtrack_labels)}:duration=longest:dropout_transition=0:normalize=0[{soundtrack_mix}]"
+                    )
+                soundtrack_only = "soundtrack_only_out"
+                # Keep final audio exactly as long as the assembled video, including
+                # silence before/after positioned soundtrack clips.
+                filter_parts.append(
+                    f"[{soundtrack_mix}]apad=pad_dur={current_duration:.6f},atrim=duration={current_duration:.6f},"
+                    f"asetpts=PTS-STARTPTS[{soundtrack_only}]"
+                )
+                current_a = soundtrack_only
 
             filter_parts.append(f"[{current_v}]setpts=PTS-STARTPTS[vout]")
             filter_parts.append(f"[{current_a}]asetpts=PTS-STARTPTS[aout]")
@@ -3600,7 +3713,10 @@ class MainWindow(QMainWindow):
             "manual_continue_video": "",
             "glue_results": False,
             "timeline_assembly_concat": str(concat_path),
+            "timeline_soundtrack_mode": soundtrack_mode,
             "timeline_assembly_clip_count": len(outputs),
+            "timeline_assembly_soundtrack_count": len(soundtrack_specs),
+            "timeline_assembly_soundtrack": copy.deepcopy(list((project or {}).get("soundtrack_clips") or [])),
         }
         self.queue_jobs.append(job)
         self._save_queue_state()
@@ -4381,6 +4497,78 @@ class MainWindow(QMainWindow):
         if not name.lower().endswith(".mp4"): name += ".mp4"
         return folder / Path(name).name
 
+    def _queue_job_debug_summary(self, job):
+        """Return a verbose human-readable snapshot of the actual queued job state."""
+        job = job or {}
+        lines = []
+        lines.append("=== QUEUE JOB DEBUG SNAPSHOT ===")
+        lines.append(f"Job #{job.get('job_number') or '?'} | state={job.get('state') or 'pending'} | mode={job.get('mode_name') or job.get('mode') or '?'}")
+        lines.append(f"Output: {job.get('output') or ''}")
+        if job.get('timeline_clip_name'):
+            lines.append(f"Timeline clip: {job.get('timeline_clip_name')} (index {int(job.get('timeline_clip_index') or 0) + 1})")
+        if job.get('timeline_generation_mode'):
+            lines.append(f"Timeline generation mode: {job.get('timeline_generation_mode')}")
+        if job.get('timeline_edit_mode'):
+            lines.append(f"Timeline edit mode: {job.get('timeline_edit_mode')}")
+        if job.get('model_label'):
+            lines.append(f"Model label: {job.get('model_label')}")
+        lines.append("")
+        prompt = str(job.get('compiled_prompt') or job.get('prompt') or '').strip()
+        lines.append("--- Prompt sent to MiniMax ---")
+        lines.append(prompt if prompt else "(empty)")
+        lines.append("")
+        settings = job.get('timeline_settings_snapshot') or job.get('settings') or {}
+        if not isinstance(settings, dict):
+            settings = {}
+        keys = [
+            'mode', 'frames', 'steps', 'cfg', 'shift', 'audio_shift', 'sampler', 'scheduler',
+            'seed', 'aspect', 'resolution', 'widescreen_quality', 'output_folder', 'output_name',
+            'checkpoint', 'model', 'text_encoder', 'vae', 'audio_vae', 'use_hybrid_ref2va',
+        ]
+        lines.append("--- Key settings snapshot ---")
+        for key in keys:
+            if key in settings and settings.get(key) not in (None, '', [], {}):
+                lines.append(f"{key}: {settings.get(key)}")
+        lines.append(f"continue_last_result: {bool(job.get('continue_last_result'))}")
+        lines.append(f"continue_audio_memory: {bool(job.get('continue_audio_memory'))}")
+        lines.append(f"latent_continuation: {bool(job.get('latent_continuation'))}")
+        lines.append(f"combine_frames_latent: {bool(job.get('combine_frames_latent'))}")
+        if job.get('manual_continue_video'):
+            lines.append(f"manual_continue_video: {job.get('manual_continue_video')}")
+        if job.get('resolved_continue_source'):
+            lines.append(f"resolved_continue_source: {job.get('resolved_continue_source')}")
+        if job.get('continue_from_job_number'):
+            lines.append(f"continue_from_job_number: {job.get('continue_from_job_number')}")
+        if job.get('continue_context_frames') not in (None, ''):
+            lines.append(f"continue_context_frames: {job.get('continue_context_frames')}")
+        lines.append("")
+        ref_meta = job.get('timeline_reference_images') or []
+        ref_paths = settings.get('ref_images') or []
+        if ref_meta or ref_paths:
+            lines.append("--- Ref images ---")
+            if ref_meta and isinstance(ref_meta, list):
+                for idx, item in enumerate(ref_meta, 1):
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(f"Ref {idx} path: {item.get('path') or ''}")
+                    pic = str(item.get('picture_description') or '').strip()
+                    subj = str(item.get('subject_description') or '').strip()
+                    if pic:
+                        lines.append(f"Ref {idx} picture_description: {pic}")
+                    if subj:
+                        lines.append(f"Ref {idx} subject_description: {subj}")
+            else:
+                for idx, path in enumerate(ref_paths, 1):
+                    lines.append(f"Ref {idx} path: {path}")
+            lines.append("")
+        lines.append("--- Full settings JSON snapshot ---")
+        try:
+            lines.append(json.dumps(settings, indent=2, ensure_ascii=False, sort_keys=True))
+        except Exception:
+            lines.append(str(settings))
+        lines.append("")
+        return "\n".join(lines)
+
     def _start_job_log_file(self, job):
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4388,7 +4576,8 @@ class MainWindow(QMainWindow):
             path=LOG_DIR / f"minimax_h3_{stamp}_{str(job.get('id',''))[:8]}.log"
             job['log_file']=str(path)
             self._active_log_file=path
-            path.write_text(f"=== QUEUE START ===\nOutput: {job.get('output')}\n", encoding='utf-8')
+            header = f"=== QUEUE START ===\nOutput: {job.get('output')}\n\n{self._queue_job_debug_summary(job)}\n\n"
+            path.write_text(header, encoding='utf-8')
             return path
         except Exception as exc:
             self._active_log_file=None
