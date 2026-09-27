@@ -3312,22 +3312,25 @@ class MainWindow(QMainWindow):
         has_trim = False
         has_volume_adjustment = False
         has_speed_adjustment = False
+        has_transition = False
         for clip, path in zip(clips, outputs):
             try:
-                trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
+                user_trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
             except Exception:
-                trim_in = 0.0
+                user_trim_in = 0.0
 
             # MiniMax continuation renders deliberately reuse the previous clip's
-            # ending as their first frame. Keeping that duplicated boundary frame
-            # in the final timeline can look like a tiny freeze/double-frame at
-            # every continuation seam. During assembly only, skip source frame 0
-            # for clips that were actually generated from the previous video.
-            # Timeline renders are fixed at 24 FPS, so one frame is 1/24 second.
-            # If the user already trimmed farther into the clip, preserve their
-            # larger trim instead of removing another frame on top of it.
-            if str(clip.get("generation_mode") or "new") == "continue":
-                trim_in = max(trim_in, 1.0 / 24.0)
+            # ending as their first decoded video frame.  A timestamp seek to
+            # 1/24 s is normally close, but timestamp rounding around an xfade can
+            # still expose that duplicate for a frame.  When the user has NOT
+            # already trimmed farther than one frame, keep the input at time zero
+            # and remove decoded frame 0 explicitly in the filter graph instead.
+            # Audio is trimmed by the matching 1/24 s there as well, preserving A/V
+            # sync. A larger manual trim always wins and needs no extra frame drop.
+            is_continuation = str(clip.get("generation_mode") or "new") == "continue"
+            exact_drop_first_frame = bool(is_continuation and user_trim_in < (1.0 / 24.0 - 0.0005))
+            trim_in = 0.0 if exact_drop_first_frame else user_trim_in
+            effective_start = (1.0 / 24.0) if exact_drop_first_frame else trim_in
 
             raw_out = clip.get("trim_out")
             try:
@@ -3336,15 +3339,17 @@ class MainWindow(QMainWindow):
                 trim_out = None
             source_duration = float(self._probe_clip_duration(str(path), clip.get("frames")) or 0.0)
             if source_duration > 0:
-                trim_in = min(trim_in, max(0.0, source_duration - 0.001))
+                effective_start = min(effective_start, max(0.0, source_duration - 0.001))
+                if not exact_drop_first_frame:
+                    trim_in = effective_start
                 if trim_out is None:
                     trim_out = source_duration
                 else:
-                    trim_out = min(max(trim_out, trim_in + 0.001), source_duration)
+                    trim_out = min(max(trim_out, effective_start + 0.001), source_duration)
             elif trim_out is None:
-                trim_out = trim_in + max(0.001, float(clip.get('frames') or 24) / 24.0)
-            effective_duration = max(0.001, float(trim_out) - trim_in)
-            trimmed = trim_in > 0.001 or (source_duration > 0 and trim_out < source_duration - 0.02)
+                trim_out = effective_start + max(0.001, float(clip.get('frames') or 24) / 24.0)
+            effective_duration = max(0.001, float(trim_out) - effective_start)
+            trimmed = effective_start > 0.001 or (source_duration > 0 and trim_out < source_duration - 0.02)
             has_trim = has_trim or trimmed
             try:
                 volume_percent = max(0, min(150, int(round(float(clip.get("volume_percent", 100) or 100)))))
@@ -3356,15 +3361,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 speed_multiplier = 1.0
             has_speed_adjustment = has_speed_adjustment or abs(speed_multiplier - 1.0) > 0.0001
-            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier))
+            transition_name = str(clip.get("transition_to_next") or "none").strip().lower()
+            has_transition = has_transition or transition_name not in {"", "none"}
+            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame))
 
         # The concat recipe remains useful for the unchanged fast stream-copy path.
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_speed_adjustment:
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_speed_adjustment or has_transition:
             # Re-encode only when Timeline editing actually requires it (trim,
-            # mixed resolution, per-clip volume, or per-clip speed). Each clip
+            # mixed resolution, per-clip volume/speed, or transitions). Each clip
             # is an independent input so trim-in is exact and cannot be defeated by
             # concat-demuxer timestamps/keyframes.  Sources remain untouched.
             args = ["-y"]
@@ -3382,57 +3389,142 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return False
 
-            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier in trim_specs:
-                # Input-side seek is accurate during transcoding: FFmpeg seeks to a
-                # nearby keyframe then decodes/discards until the requested time.
+            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame in trim_specs:
+                # Input-side seek is used for ordinary user trims. For the special
+                # continuation seam fix we intentionally start at source time zero
+                # and decode one extra frame, because frame 0 itself is discarded
+                # exactly by trim=start_frame=1 in the filter graph below.
                 if trim_in > 0.001:
                     args += ["-ss", f"{trim_in:.6f}"]
-                args += ["-t", f"{effective_duration:.6f}", "-i", str(path)]
-                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier))
+                read_duration = effective_duration + ((1.0 / 24.0) if exact_drop_first_frame else 0.0)
+                args += ["-t", f"{read_duration:.6f}", "-i", str(path)]
+                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, exact_drop_first_frame))
 
             filter_parts = []
-            concat_inputs = []
             synthetic_audio_inputs = []
-            # Add silent audio inputs only for rare source clips without audio so
-            # one silent file cannot make the whole concat graph invalid.
-            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier in input_meta:
+            video_labels = []
+            audio_labels = []
+            final_durations = []
+
+            # Normalize each clip into an independent, zero-based 24-fps video
+            # stream and 48-kHz stereo audio stream. xfade is strict about frame
+            # rate/timebase/geometry compatibility, so normalizing here keeps the
+            # transition path deterministic while leaving source MP4s untouched.
+            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, exact_drop_first_frame in input_meta:
                 final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
-                vchain = f"[{i}:v:0]setpts=(PTS-STARTPTS)/{speed_multiplier:.3f}"
+                final_durations.append(final_duration)
+                vlabel = f"v{i}"
+                # For an untrimmed continuation, remove decoded frame 0 itself,
+                # rather than approximating it with a timestamp seek. This happens
+                # before speed normalization and before xfade sees the clip.
+                vprefix = f"[{i}:v:0]"
+                if exact_drop_first_frame:
+                    vprefix += "trim=start_frame=1,"
+                vchain = vprefix + f"setpts=(PTS-STARTPTS)/{speed_multiplier:.3f},fps=24,settb=AVTB"
                 if normalize_mixed_resolution and target_resolution:
                     tw, th = target_resolution
                     vchain += (
                         f",scale={tw}:{th}:force_original_aspect_ratio=decrease"
                         f",pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2"
                     )
-                vlabel = f"v{i}"
+                vchain += ",format=yuv420p"
                 filter_parts.append(vchain + f"[{vlabel}]")
-                concat_inputs.append(f"[{vlabel}]")
+                video_labels.append(vlabel)
+
                 if has_audio:
                     alabel = f"a{i}"
                     gain = max(0.0, min(1.5, float(volume_percent) / 100.0))
+                    aprefix = f"[{i}:a:0]"
+                    if exact_drop_first_frame:
+                        aprefix += f"atrim=start={1.0 / 24.0:.9f},"
                     filter_parts.append(
-                        f"[{i}:a:0]asetpts=PTS-STARTPTS,atempo={speed_multiplier:.3f},volume={gain:.3f}[{alabel}]"
+                        aprefix + f"asetpts=PTS-STARTPTS,atempo={speed_multiplier:.3f},"
+                        f"volume={gain:.3f},aresample=48000,"
+                        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{alabel}]"
                     )
-                    concat_inputs.append(f"[{alabel}]")
+                    audio_labels.append(alabel)
                 else:
-                    # Synthetic audio is appended after all media inputs.  Record
-                    # the duration now and add the lavfi inputs before filter use.
                     synthetic_audio_inputs.append((i, final_duration))
-                    concat_inputs.append(None)
+                    audio_labels.append(None)
 
-            # Append any needed silent audio sources and fill their concat labels.
+            # Append silent audio inputs only for source clips without an audio
+            # stream. This keeps video/audio chain lengths identical.
             next_input = len(input_meta)
             for clip_i, duration in synthetic_audio_inputs:
                 args += ["-f", "lavfi", "-t", f"{duration:.6f}", "-i", "anullsrc=r=48000:cl=stereo"]
                 alabel = f"a{clip_i}"
-                filter_parts.append(f"[{next_input}:a:0]asetpts=PTS-STARTPTS[{alabel}]")
-                # Each clip contributes video then audio, so audio slot is 2*i+1.
-                concat_inputs[2 * clip_i + 1] = f"[{alabel}]"
+                filter_parts.append(
+                    f"[{next_input}:a:0]asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{alabel}]"
+                )
+                audio_labels[clip_i] = alabel
                 next_input += 1
 
-            filter_parts.append(
-                "".join(concat_inputs) + f"concat=n={len(input_meta)}:v=1:a=1[vout][aout]"
-            )
+            allowed_transitions = {
+                "fade", "dissolve", "wipeleft", "wiperight", "wipeup", "wipedown",
+                "slideleft", "slideright", "slideup", "slidedown",
+                "smoothleft", "smoothright", "smoothup", "smoothdown",
+                "circleopen", "circleclose", "pixelize", "radial", "zoomin",
+            }
+
+            # Build the timeline from left to right. A transition is stored on the
+            # outgoing edge of clip i, so it overlaps clip i with clip i+1 and
+            # shortens total timeline duration by exactly that overlap.
+            current_v = video_labels[0]
+            current_a = audio_labels[0]
+            current_duration = final_durations[0]
+            for i in range(1, len(input_meta)):
+                edge_clip = trim_specs[i - 1][0]
+                transition = str(edge_clip.get("transition_to_next") or "none").strip().lower()
+                requested = float(edge_clip.get("transition_duration", 0.5) or 0.5)
+                requested = max(0.1, min(3.0, round(requested, 1)))
+                # xfade must leave at least one frame of valid material on both
+                # sides. Clamp pathological saved values instead of failing the
+                # entire assembly job.
+                max_overlap = max(0.0, min(current_duration, final_durations[i]) - (1.0 / 24.0))
+                duration = min(requested, max_overlap) if transition in allowed_transitions else 0.0
+
+                next_v = video_labels[i]
+                next_a = audio_labels[i]
+                if duration > 0.0005:
+                    offset = max(0.0, current_duration - duration)
+                    out_v = f"vx{i}"
+                    filter_parts.append(
+                        f"[{current_v}][{next_v}]xfade=transition={transition}:"
+                        f"duration={duration:.6f}:offset={offset:.6f}[{out_v}]"
+                    )
+
+                    audio_mode = str(edge_clip.get("transition_audio_mode") or "crossfade").strip().lower()
+                    out_a = f"ax{i}"
+                    if audio_mode == "hard_cut":
+                        # Visual overlap still reduces timeline length. A hard audio
+                        # cut therefore drops the overlapped tail of the outgoing
+                        # audio and starts the next clip's audio at the cut point.
+                        cut_a = f"acut{i}"
+                        filter_parts.append(
+                            f"[{current_a}]atrim=start=0:end={offset:.6f},asetpts=PTS-STARTPTS[{cut_a}]"
+                        )
+                        filter_parts.append(f"[{cut_a}][{next_a}]concat=n=2:v=0:a=1[{out_a}]")
+                    else:
+                        # 'fade_out_in' deliberately uses a steeper exponential
+                        # curve, producing a deeper dip around the seam than the
+                        # normal linear crossfade while preserving sync/duration.
+                        curve = "exp" if audio_mode == "fade_out_in" else "tri"
+                        filter_parts.append(
+                            f"[{current_a}][{next_a}]acrossfade=d={duration:.6f}:c1={curve}:c2={curve}[{out_a}]"
+                        )
+                    current_v, current_a = out_v, out_a
+                    current_duration = current_duration + final_durations[i] - duration
+                else:
+                    out_v = f"vc{i}"
+                    out_a = f"ac{i}"
+                    filter_parts.append(f"[{current_v}][{next_v}]concat=n=2:v=1:a=0[{out_v}]")
+                    filter_parts.append(f"[{current_a}][{next_a}]concat=n=2:v=0:a=1[{out_a}]")
+                    current_v, current_a = out_v, out_a
+                    current_duration += final_durations[i]
+
+            filter_parts.append(f"[{current_v}]setpts=PTS-STARTPTS[vout]")
+            filter_parts.append(f"[{current_a}]asetpts=PTS-STARTPTS[aout]")
             args += [
                 "-filter_complex", ";".join(filter_parts),
                 "-map", "[vout]", "-map", "[aout]",

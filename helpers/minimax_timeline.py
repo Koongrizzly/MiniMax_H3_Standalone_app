@@ -292,6 +292,116 @@ def _clip_timeline_seconds(clip: dict) -> float:
     return max(0.04, used / _clip_speed(clip))
 
 
+TRANSITION_OPTIONS = [
+    ("None", "none"),
+    ("Fade", "fade"),
+    ("Dissolve", "dissolve"),
+    ("Wipe left", "wipeleft"),
+    ("Wipe right", "wiperight"),
+    ("Wipe up", "wipeup"),
+    ("Wipe down", "wipedown"),
+    ("Slide left", "slideleft"),
+    ("Slide right", "slideright"),
+    ("Slide up", "slideup"),
+    ("Slide down", "slidedown"),
+    ("Smooth left", "smoothleft"),
+    ("Smooth right", "smoothright"),
+    ("Smooth up", "smoothup"),
+    ("Smooth down", "smoothdown"),
+    ("Circle open", "circleopen"),
+    ("Circle close", "circleclose"),
+    ("Pixelize", "pixelize"),
+    ("Radial", "radial"),
+    ("Zoom", "zoomin"),
+]
+_TRANSITION_LABELS = {value: label for label, value in TRANSITION_OPTIONS}
+
+
+def _transition_name(clip: dict) -> str:
+    value = str(clip.get("transition_to_next") or "none").strip().lower()
+    return value if value in _TRANSITION_LABELS else "none"
+
+
+def _transition_requested_seconds(clip: dict) -> float:
+    if _transition_name(clip) == "none":
+        return 0.0
+    try:
+        return max(0.1, min(3.0, round(float(clip.get("transition_duration", 0.5) or 0.5), 1)))
+    except Exception:
+        return 0.5
+
+
+def _transition_overlap_seconds(clip: dict, next_clip: dict | None) -> float:
+    """Effective overlap represented on the Timeline for this outgoing edge."""
+    if next_clip is None or _transition_name(clip) == "none":
+        return 0.0
+    requested = _transition_requested_seconds(clip)
+    # xfade needs some non-transition material on both sides. Keep at least one
+    # 24-fps frame available even when a user chooses a long transition.
+    maximum = max(0.0, min(_clip_timeline_seconds(clip), _clip_timeline_seconds(next_clip)) - (1.0 / FPS))
+    return max(0.0, min(requested, maximum))
+
+
+def _timeline_total_seconds(clips: list[dict]) -> float:
+    total = sum(_clip_timeline_seconds(c) for c in clips)
+    for i in range(max(0, len(clips) - 1)):
+        total -= _transition_overlap_seconds(clips[i], clips[i + 1])
+    return max(0.0, total)
+
+
+class TransitionDialog(QDialog):
+    def __init__(self, clip: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Transition to next clip")
+        self.setMinimumWidth(410)
+        root = QVBoxLayout(self)
+        hint = QLabel("The transition overlaps the end of this clip with the start of the next clip. It is applied only during final assembly; source clips remain unchanged.")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+        form = QFormLayout()
+        self.kind = QComboBox()
+        for label, value in TRANSITION_OPTIONS:
+            self.kind.addItem(label, value)
+        current = _transition_name(clip)
+        idx = self.kind.findData(current)
+        self.kind.setCurrentIndex(idx if idx >= 0 else 0)
+        self.duration = QDoubleSpinBox()
+        self.duration.setRange(0.1, 3.0)
+        self.duration.setDecimals(1)
+        self.duration.setSingleStep(0.1)
+        self.duration.setSuffix(" s")
+        self.duration.setValue(_transition_requested_seconds(clip) or 0.5)
+        self.audio = QComboBox()
+        self.audio.addItem("Crossfade", "crossfade")
+        self.audio.addItem("Hard cut", "hard_cut")
+        self.audio.addItem("Fade out + fade in", "fade_out_in")
+        audio_mode = str(clip.get("transition_audio_mode") or "crossfade")
+        aidx = self.audio.findData(audio_mode)
+        self.audio.setCurrentIndex(aidx if aidx >= 0 else 0)
+        form.addRow("Transition", self.kind)
+        form.addRow("Duration", self.duration)
+        form.addRow("Audio", self.audio)
+        root.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.kind.currentIndexChanged.connect(self._sync_enabled)
+        self._sync_enabled()
+
+    def _sync_enabled(self):
+        enabled = str(self.kind.currentData() or "none") != "none"
+        self.duration.setEnabled(enabled)
+        self.audio.setEnabled(enabled)
+
+    def values(self):
+        return (
+            str(self.kind.currentData() or "none"),
+            round(float(self.duration.value()), 1),
+            str(self.audio.currentData() or "crossfade"),
+        )
+
+
 def _segment_seconds(clip: dict) -> list[float]:
     segments = clip.get("segments") or []
     if not segments:
@@ -795,7 +905,7 @@ class TimelineCanvas(QWidget):
         return QSize(max(900, self._content_width()), self.CLIP_TOP + self.CLIP_H + self.BOTTOM_PAD)
 
     def _content_width(self) -> int:
-        total = sum(_clip_timeline_seconds(c) for c in self.clips)
+        total = _timeline_total_seconds(self.clips)
         return int(max(900, 36 + total * self.pixels_per_second + 36))
 
     def set_clips(self, clips: list[dict], selected_id: str | None = None, selected_ids=None):
@@ -1019,6 +1129,10 @@ class TimelineCanvas(QWidget):
         has_refs = bool(clip.get("use_reference_images", False)) and bool(_reference_entries(clip))
         if has_refs:
             right.append("Ref")
+        if idx + 1 < len(self.clips):
+            transition = _transition_name(clip)
+            if transition != "none":
+                right.append(f"{_TRANSITION_LABELS.get(transition, transition)} {_transition_overlap_seconds(clip, self.clips[idx + 1]):.1f}s")
 
         broken = False
         mode = str(clip.get("generation_mode") or "")
@@ -1146,7 +1260,7 @@ class TimelineCanvas(QWidget):
         accent_text = palette.color(palette.ColorRole.HighlightedText)
         painter.fillRect(self.rect(), bg)
 
-        total_seconds = max(1.0, sum(_clip_timeline_seconds(c) for c in self.clips))
+        total_seconds = max(1.0, _timeline_total_seconds(self.clips))
         ruler_step = 1
         if self.pixels_per_second < 25:
             ruler_step = 10
@@ -1280,7 +1394,12 @@ class TimelineCanvas(QWidget):
                 if right_badges:
                     right_text = " ".join(right_badges)
                     right_w = painter.fontMetrics().horizontalAdvance(right_text)
-                    painter.drawText(thumb_rect.right() - right_w + 1, badge_y, right_text)
+                    # Right-side badges describe the outgoing edge of this clip
+                    # (notably "Transition to next"), so pin them to the clip's
+                    # right edge.  This both gives long transition labels room and
+                    # visually places the label at the cut where the effect occurs.
+                    badge_right = int(right - 10)
+                    painter.drawText(max(int(left + 8), badge_right - right_w), badge_y, right_text)
                 painter.setFont(font)
 
             painter.setPen(QColor("#f4f6f8"))
@@ -1293,7 +1412,8 @@ class TimelineCanvas(QWidget):
                 painter.drawLine(int(left - 7), self.CLIP_TOP + 16, int(left - 3), self.CLIP_TOP + 20)
                 painter.drawLine(int(left - 7), self.CLIP_TOP + 24, int(left - 3), self.CLIP_TOP + 20)
 
-            cursor = right
+            overlap = _transition_overlap_seconds(clip, self.clips[idx + 1] if idx + 1 < len(self.clips) else None)
+            cursor = right - overlap * self.pixels_per_second
 
         if not self.clips:
             painter.setPen(muted)
@@ -2103,7 +2223,7 @@ class TimelineTab(QWidget):
         if select_first and self.selected_clip_id:
             self.selected_clip_ids.add(str(self.selected_clip_id))
             self._selection_anchor_id = str(self.selected_clip_id)
-        total = sum(_clip_timeline_seconds(c) for c in self._clips())
+        total = _timeline_total_seconds(self._clips())
         selection_suffix = f"  •  {len(self.selected_clip_ids)} selected" if len(self.selected_clip_ids) > 1 else ""
         locked_count = sum(1 for c in self._clips() if bool(c.get("locked", False)))
         lock_suffix = f"  •  {locked_count} locked" if locked_count else ""
@@ -3801,6 +3921,9 @@ class TimelineTab(QWidget):
         trim = menu.addAction("Trim clip…")
         volume_action = menu.addAction(f"Volume…  {int(round(float(clip.get('volume_percent', 100) or 100)))}%")
         speed_action = menu.addAction(f"Speed…  {_clip_speed(clip):.1f}x")
+        transition_name = _transition_name(clip)
+        transition_suffix = "" if transition_name == "none" else f"  {_TRANSITION_LABELS.get(transition_name, transition_name)} {_transition_requested_seconds(clip):.1f}s"
+        transition_action = menu.addAction(f"Transition to next clip…{transition_suffix}")
         remove = menu.addAction("Remove clip from timeline")
         menu.addSeparator()
         lock_action = menu.addAction("Unlock clip" if bool(clip.get("locked", False)) else "Lock clip")
@@ -3822,6 +3945,8 @@ class TimelineTab(QWidget):
         preview.setEnabled(output_exists)
         open_folder.setEnabled(output_exists)
         trim.setEnabled(output_exists and not locked)
+        transition_action.setEnabled(not locked and idx + 1 < len(self._clips()))
+        transition_action.setToolTip("Transitions belong to the outgoing cut after this block." if idx + 1 < len(self._clips()) else "The final timeline clip has no next clip to transition into.")
         remove.setEnabled(not locked)
 
         chosen = menu.exec(global_pos)
@@ -3844,6 +3969,8 @@ class TimelineTab(QWidget):
             self._set_clip_volume_by_id(clip_id)
         elif chosen is speed_action:
             self._set_clip_speed_by_id(clip_id)
+        elif chosen is transition_action:
+            self._set_clip_transition_by_id(clip_id)
         elif chosen is remove:
             self._remove_clip_by_id(clip_id)
         elif chosen is lock_action:
@@ -4145,6 +4272,37 @@ class TimelineTab(QWidget):
         self._refresh_all()
         return True
 
+    def _set_clip_transition_by_id(self, clip_id):
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None or idx < 0:
+            return False
+        if idx + 1 >= len(self._clips()):
+            QMessageBox.information(self, "Timeline transition", "The final clip has no next clip to transition into.")
+            return False
+        if bool(clip.get("locked", False)):
+            QMessageBox.information(self, "Timeline transition", "This block is locked. Unlock it before changing its outgoing transition.")
+            return False
+        dlg = TransitionDialog(clip, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        kind, duration, audio_mode = dlg.values()
+        old = (_transition_name(clip), _transition_requested_seconds(clip), str(clip.get("transition_audio_mode") or "crossfade"))
+        new = (kind, duration if kind != "none" else 0.0, audio_mode)
+        if old == new:
+            return True
+        self._record_undo_state("Change clip transition")
+        if kind == "none":
+            clip.pop("transition_to_next", None)
+            clip.pop("transition_duration", None)
+            clip.pop("transition_audio_mode", None)
+        else:
+            clip["transition_to_next"] = kind
+            clip["transition_duration"] = duration
+            clip["transition_audio_mode"] = audio_mode
+        self._invalidate_assembly("Timeline transition changed — assemble again.")
+        self._refresh_all()
+        return True
+
     def _trim_clip_by_id(self, clip_id):
         _idx, clip = self._clip_by_id(clip_id)
         if not clip:
@@ -4367,6 +4525,7 @@ class TimelineTab(QWidget):
             f"References: {len(_reference_entries(clip))}",
             f"Assembly trim: {trim_text}",
             f"Speed: {_clip_speed(clip):.1f}x",
+            f"Transition to next: {(_TRANSITION_LABELS.get(_transition_name(clip), 'None') + ('  ' + format(_transition_requested_seconds(clip), '.1f') + 's' if _transition_name(clip) != 'none' else ''))}",
         ]
         if generated:
             if generated.get("job_number") is not None:
