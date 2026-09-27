@@ -2307,8 +2307,13 @@ class MainWindow(QMainWindow):
         if not job or job.get("state")!="finished": return
         self._load_preview(job,autoplay=True)
 
-    def _load_preview(self,job,autoplay=False,trim_in=None,trim_out=None):
+    def _load_preview(self,job,autoplay=False,trim_in=None,trim_out=None,volume=1.0,playback_rate=1.0):
         path=Path(job.get("output",""))
+        if getattr(self, "audio_output", None) is not None:
+            try:
+                self.audio_output.setVolume(max(0.0, min(1.0, float(volume))))
+            except Exception:
+                pass
         if not path.is_file(): QMessageBox.warning(self,"Preview","Output file is no longer on disk."); return
         self.preview_path=str(path)
         try:
@@ -2323,6 +2328,15 @@ class MainWindow(QMainWindow):
             end_ms=None
         self._preview_trim_start_ms=start_ms
         self._preview_trim_end_ms=end_ms
+        if self.media_player is not None:
+            try:
+                rate = max(0.5, min(2.0, float(playback_rate or 1.0)))
+                self.media_player.setPlaybackRate(rate)
+            except Exception:
+                try:
+                    self.media_player.setPlaybackRate(1.0)
+                except Exception:
+                    pass
         if self.media_player is None:
             # External playback cannot enforce an in/out range, so only use it for
             # ordinary untrimmed previews. The embedded preview pane is the normal
@@ -3104,17 +3118,64 @@ class MainWindow(QMainWindow):
             self.apply_settings(original)
             self.save_last()
 
-    def _preview_timeline_result(self, output, job_id=None, trim_in=None, trim_out=None):
+    def _timeline_volume_preview_path(self, path: Path, volume_percent: int) -> Path:
+        """Return a preview-safe media path for >100% timeline gain.
+
+        QAudioOutput can attenuate normal playback but does not provide reliable
+        gain above 100%, so boosted timeline previews get a tiny cached proxy
+        that stream-copies video and re-encodes only audio with FFmpeg.
+        """
+        try:
+            volume_percent = max(0, min(150, int(round(float(volume_percent)))))
+        except Exception:
+            volume_percent = 100
+        if volume_percent <= 100:
+            return path
+        if not ffmpeg_tools_ready():
+            self._ensure_ffmpeg_async()
+            return path
+        try:
+            stat = path.stat()
+            key = hashlib.sha1(f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{volume_percent}".encode("utf-8", "ignore")).hexdigest()[:16]
+            cache_dir = ROOT / "jobs" / "timeline_volume_preview"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            proxy = cache_dir / f"{path.stem}_vol{volume_percent}_{key}.mp4"
+            if proxy.is_file() and proxy.stat().st_size > 0:
+                return proxy
+            cmd = [
+                str(ffmpeg_tool_path("ffmpeg.exe")), "-y", "-nostdin", "-loglevel", "error",
+                "-i", str(path), "-map", "0:v:0", "-map", "0:a?",
+                "-c:v", "copy", "-af", f"volume={volume_percent / 100.0:.3f}",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(proxy),
+            ]
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags, timeout=120)
+            if completed.returncode == 0 and proxy.is_file() and proxy.stat().st_size > 0:
+                return proxy
+        except Exception:
+            pass
+        return path
+
+    def _preview_timeline_result(self, output, job_id=None, trim_in=None, trim_out=None, volume_percent=100, speed_multiplier=1.0):
         path = Path(str(output or ""))
         if not path.is_file():
             QMessageBox.warning(self, "Timeline preview", "The selected timeline output file is no longer on disk.")
             return False
+        try:
+            volume_percent = max(0, min(150, int(round(float(volume_percent or 100)))))
+        except Exception:
+            volume_percent = 100
+        preview_path = self._timeline_volume_preview_path(path, volume_percent)
         job = self._job_by_id(job_id) if job_id else None
+        preview_job = copy.deepcopy(job) if isinstance(job, dict) else {}
+        preview_job["output"] = str(preview_path)
         self._load_preview(
-            job or {"output": str(path)},
+            preview_job,
             autoplay=True,
             trim_in=trim_in,
             trim_out=trim_out,
+            volume=((volume_percent / 100.0) if volume_percent <= 100 else 1.0),
+            playback_rate=max(0.5, min(2.0, float(speed_multiplier or 1.0))),
         )
         return True
 
@@ -3235,11 +3296,25 @@ class MainWindow(QMainWindow):
         # concatenate reset-timestamp streams in a filter graph.
         trim_specs = []
         has_trim = False
+        has_volume_adjustment = False
+        has_speed_adjustment = False
         for clip, path in zip(clips, outputs):
             try:
                 trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
             except Exception:
                 trim_in = 0.0
+
+            # MiniMax continuation renders deliberately reuse the previous clip's
+            # ending as their first frame. Keeping that duplicated boundary frame
+            # in the final timeline can look like a tiny freeze/double-frame at
+            # every continuation seam. During assembly only, skip source frame 0
+            # for clips that were actually generated from the previous video.
+            # Timeline renders are fixed at 24 FPS, so one frame is 1/24 second.
+            # If the user already trimmed farther into the clip, preserve their
+            # larger trim instead of removing another frame on top of it.
+            if str(clip.get("generation_mode") or "new") == "continue":
+                trim_in = max(trim_in, 1.0 / 24.0)
+
             raw_out = clip.get("trim_out")
             try:
                 trim_out = float(raw_out) if raw_out is not None else None
@@ -3257,14 +3332,25 @@ class MainWindow(QMainWindow):
             effective_duration = max(0.001, float(trim_out) - trim_in)
             trimmed = trim_in > 0.001 or (source_duration > 0 and trim_out < source_duration - 0.02)
             has_trim = has_trim or trimmed
-            trim_specs.append((clip, path, trim_in, trim_out, effective_duration))
+            try:
+                volume_percent = max(0, min(150, int(round(float(clip.get("volume_percent", 100) or 100)))))
+            except Exception:
+                volume_percent = 100
+            has_volume_adjustment = has_volume_adjustment or volume_percent != 100
+            try:
+                speed_multiplier = max(0.5, min(2.0, round(float(clip.get("speed_multiplier", 1.0) or 1.0), 1)))
+            except Exception:
+                speed_multiplier = 1.0
+            has_speed_adjustment = has_speed_adjustment or abs(speed_multiplier - 1.0) > 0.0001
+            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier))
 
         # The concat recipe remains useful for the unchanged fast stream-copy path.
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        if has_trim or normalize_mixed_resolution:
-            # Re-encode only when Timeline editing actually requires it.  Each clip
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_speed_adjustment:
+            # Re-encode only when Timeline editing actually requires it (trim,
+            # mixed resolution, per-clip volume, or per-clip speed). Each clip
             # is an independent input so trim-in is exact and cannot be defeated by
             # concat-demuxer timestamps/keyframes.  Sources remain untouched.
             args = ["-y"]
@@ -3282,21 +3368,22 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return False
 
-            for _clip, path, trim_in, trim_out, effective_duration in trim_specs:
+            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier in trim_specs:
                 # Input-side seek is accurate during transcoding: FFmpeg seeks to a
                 # nearby keyframe then decodes/discards until the requested time.
                 if trim_in > 0.001:
                     args += ["-ss", f"{trim_in:.6f}"]
                 args += ["-t", f"{effective_duration:.6f}", "-i", str(path)]
-                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path)))
+                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier))
 
             filter_parts = []
             concat_inputs = []
             synthetic_audio_inputs = []
             # Add silent audio inputs only for rare source clips without audio so
             # one silent file cannot make the whole concat graph invalid.
-            for i, path, effective_duration, has_audio in input_meta:
-                vchain = f"[{i}:v:0]setpts=PTS-STARTPTS"
+            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier in input_meta:
+                final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
+                vchain = f"[{i}:v:0]setpts=(PTS-STARTPTS)/{speed_multiplier:.3f}"
                 if normalize_mixed_resolution and target_resolution:
                     tw, th = target_resolution
                     vchain += (
@@ -3308,12 +3395,15 @@ class MainWindow(QMainWindow):
                 concat_inputs.append(f"[{vlabel}]")
                 if has_audio:
                     alabel = f"a{i}"
-                    filter_parts.append(f"[{i}:a:0]asetpts=PTS-STARTPTS[{alabel}]")
+                    gain = max(0.0, min(1.5, float(volume_percent) / 100.0))
+                    filter_parts.append(
+                        f"[{i}:a:0]asetpts=PTS-STARTPTS,atempo={speed_multiplier:.3f},volume={gain:.3f}[{alabel}]"
+                    )
                     concat_inputs.append(f"[{alabel}]")
                 else:
                     # Synthetic audio is appended after all media inputs.  Record
                     # the duration now and add the lavfi inputs before filter use.
-                    synthetic_audio_inputs.append((i, effective_duration))
+                    synthetic_audio_inputs.append((i, final_duration))
                     concat_inputs.append(None)
 
             # Append any needed silent audio sources and fill their concat labels.

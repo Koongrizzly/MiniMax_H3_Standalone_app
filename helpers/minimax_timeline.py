@@ -257,11 +257,19 @@ def _clip_seconds(clip: dict) -> float:
     return max(1, int(clip.get("frames") or 124)) / FPS
 
 
-def _clip_timeline_seconds(clip: dict) -> float:
-    """Visible/effective timeline duration after a non-destructive trim.
+def _clip_speed(clip: dict) -> float:
+    """Post-process playback speed stored on a Timeline block."""
+    try:
+        return max(0.5, min(2.0, round(float(clip.get("speed_multiplier", 1.0) or 1.0), 1)))
+    except Exception:
+        return 1.0
 
-    Generation duration remains owned by _clip_seconds(); this function is only
-    for timeline geometry, ruler positions and review/summary timing.
+
+def _clip_timeline_seconds(clip: dict) -> float:
+    """Visible/effective timeline duration after trim and playback-speed edits.
+
+    Generation duration remains owned by _clip_seconds(); speed is a non-destructive
+    post-process edit used only by Timeline geometry, preview and final assembly.
     """
     source_duration = _clip_seconds(clip)
     try:
@@ -270,16 +278,18 @@ def _clip_timeline_seconds(clip: dict) -> float:
         trim_in = 0.0
     trim_out_raw = clip.get("trim_out")
     if trim_out_raw is None:
-        return source_duration
-    try:
-        trim_out = float(trim_out_raw)
-    except Exception:
-        return source_duration
-    # trim_out is captured from the actual rendered media and can differ by a
-    # few frames from the requested generation duration, so trust the saved
-    # trim range itself rather than clamping it to the requested frame count.
-    used = trim_out - trim_in
-    return max(0.04, used) if used > 0.0 else source_duration
+        used = source_duration
+    else:
+        try:
+            trim_out = float(trim_out_raw)
+        except Exception:
+            trim_out = source_duration
+        # trim_out is captured from the actual rendered media and can differ by a
+        # few frames from the requested generation duration, so trust the saved
+        # trim range itself rather than clamping it to the requested frame count.
+        candidate = trim_out - trim_in
+        used = candidate if candidate > 0.0 else source_duration
+    return max(0.04, used / _clip_speed(clip))
 
 
 def _segment_seconds(clip: dict) -> list[float]:
@@ -1159,6 +1169,7 @@ class TimelineTab(QWidget):
             "notes": "",
             "last_generation_info": {},
             "alternate_candidates": [],
+            "speed_multiplier": 1.0,
         }
 
     def _clips(self):
@@ -2248,6 +2259,7 @@ class TimelineTab(QWidget):
                 clip.setdefault("notes", "")
                 clip.setdefault("last_generation_info", {})
                 clip.setdefault("alternate_candidates", [])
+                clip["speed_multiplier"] = _clip_speed(clip)
                 if not clip.get("segments"):
                     clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
                 for seg in clip["segments"]:
@@ -3338,6 +3350,8 @@ class TimelineTab(QWidget):
         preview = menu.addAction("Preview clip")
         open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
+        volume_action = menu.addAction(f"Volume…  {int(round(float(clip.get('volume_percent', 100) or 100)))}%")
+        speed_action = menu.addAction(f"Speed…  {_clip_speed(clip):.1f}x")
         remove = menu.addAction("Remove clip from timeline")
         menu.addSeparator()
         lock_action = menu.addAction("Unlock clip" if bool(clip.get("locked", False)) else "Lock clip")
@@ -3371,6 +3385,10 @@ class TimelineTab(QWidget):
             self._open_clip_folder_by_id(clip_id)
         elif chosen is trim:
             self._trim_clip_by_id(clip_id)
+        elif chosen is volume_action:
+            self._set_clip_volume_by_id(clip_id)
+        elif chosen is speed_action:
+            self._set_clip_speed_by_id(clip_id)
         elif chosen is remove:
             self._remove_clip_by_id(clip_id)
         elif chosen is lock_action:
@@ -3590,6 +3608,8 @@ class TimelineTab(QWidget):
                 clip.get("queue_job_id"),
                 clip.get("trim_in"),
                 clip.get("trim_out"),
+                clip.get("volume_percent", 100),
+                _clip_speed(clip),
             ))
         return False
 
@@ -3613,6 +3633,60 @@ class TimelineTab(QWidget):
         currently_locked = bool(clip.get("locked", False))
         self._record_undo_state("Unlock clip" if currently_locked else "Lock clip")
         clip["locked"] = not currently_locked
+        self._refresh_all()
+        return True
+
+    def _set_clip_volume_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        try:
+            current = int(round(float(clip.get("volume_percent", 100) or 100)))
+        except Exception:
+            current = 100
+        current = max(0, min(150, current))
+        value, accepted = QInputDialog.getInt(
+            self,
+            "Clip volume",
+            "Volume for this clip (0% = mute, 100% = original, 150% = boost):",
+            current, 0, 150, 1,
+        )
+        if not accepted or int(value) == current:
+            return bool(accepted)
+        self._record_undo_state("Change clip volume")
+        value = int(value)
+        if value == 100:
+            clip.pop("volume_percent", None)
+        else:
+            clip["volume_percent"] = value
+        self._invalidate_assembly("Clip volume changed — assemble again.")
+        self._refresh_all()
+        return True
+
+    def _set_clip_speed_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        current = _clip_speed(clip)
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("Clip speed")
+        dlg.setLabelText("Playback speed for this clip (0.5x = half speed, 2.0x = double speed):")
+        dlg.setInputMode(QInputDialog.InputMode.DoubleInput)
+        dlg.setDoubleRange(0.5, 2.0)
+        dlg.setDoubleDecimals(1)
+        dlg.setDoubleStep(0.1)
+        dlg.setDoubleValue(current)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        value = max(0.5, min(2.0, round(float(dlg.doubleValue()), 1)))
+        if abs(value - current) < 0.0001:
+            return True
+        self._record_undo_state("Change clip speed")
+        if abs(value - 1.0) < 0.0001:
+            clip.pop("speed_multiplier", None)
+        else:
+            clip["speed_multiplier"] = value
+        self._invalidate_assembly("Clip speed changed — assemble again.")
         self._refresh_all()
         return True
 
@@ -3837,6 +3911,7 @@ class TimelineTab(QWidget):
             f"HQ: {'Yes' if clip.get('hq_generated') else 'No'}",
             f"References: {len(_reference_entries(clip))}",
             f"Assembly trim: {trim_text}",
+            f"Speed: {_clip_speed(clip):.1f}x",
         ]
         if generated:
             if generated.get("job_number") is not None:
@@ -3907,6 +3982,8 @@ class TimelineTab(QWidget):
                 clip.get("queue_job_id"),
                 clip.get("trim_in"),
                 clip.get("trim_out"),
+                clip.get("volume_percent", 100),
+                _clip_speed(clip),
             )
 
     def open_selected_output(self):
