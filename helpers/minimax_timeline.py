@@ -335,8 +335,31 @@ def _reference_entries(clip: dict) -> list[dict]:
         path = str(item.get("path") or "").strip()
         if not path:
             continue
-        entries.append({"path": path, "name": str(item.get("name") or Path(path).stem).strip()})
+        entry = {
+            "path": path,
+            "name": str(item.get("name") or Path(path).stem).strip(),
+            "picture_description": str(item.get("picture_description") or "").strip(),
+            "subject_description": str(item.get("subject_description") or "").strip(),
+        }
+        preset_id = str(item.get("preset_id") or "").strip()
+        if preset_id:
+            entry["preset_id"] = preset_id
+        entries.append(entry)
     return entries[:5]
+
+
+def _renumber_reference_description(text: str, token: str, index: int, default_body: str) -> str:
+    """Normalize a saved preset line to the positional Picture/Subject number used by MiniMax."""
+    value = str(text or "").strip()
+    prefix = f"<{token} {index}>:"
+    if not value:
+        return f"{prefix} {default_body}"
+    # Users commonly save examples as <Picture 1>: / <Subject 1>:.  Presets are
+    # reusable, so the numeric token is always rewritten to the position chosen
+    # for this particular clip.
+    pattern = rf"^\s*<\s*{re.escape(token)}\s+\d+\s*>\s*:?\s*"
+    body = re.sub(pattern, "", value, count=1, flags=re.IGNORECASE).strip()
+    return f"{prefix} {body or default_body}"
 
 
 def _subject_tokens_present(text: str) -> bool:
@@ -376,10 +399,361 @@ def _compiled_reference_prompt(clip: dict) -> str:
     defs = []
     for idx, ref in enumerate(refs, 1):
         friendly = str(ref.get("name") or f"Reference {idx}").strip() or f"Reference {idx}"
-        defs.append(f'<Subject {idx}> is the reusable visible content named "{friendly}" from <Picture {idx}>.')
+        picture_line = _renumber_reference_description(
+            ref.get("picture_description"), "Picture", idx, f'reference image of {friendly}'
+        )
+        subject_line = _renumber_reference_description(
+            ref.get("subject_description"), "Subject", idx,
+            f'the subject shown in <Picture {idx}>. Preserve its exact identity and appearance.'
+        )
+        # A saved Subject description may itself mention its original Picture number.
+        # Keep the two positional tokens paired after the user changes Subject order.
+        subject_line = re.sub(r"<\s*Picture\s+\d+\s*>", f"<Picture {idx}>", subject_line, flags=re.IGNORECASE)
+        defs.extend([picture_line, subject_line])
     auto_use = "" if _subject_tokens_present(body) else _automatic_subject_usage_line(refs)
     parts = defs + ([auto_use] if auto_use else []) + ([body] if body else [])
     return "\n".join(parts).strip()
+
+
+class RefPresetDialog(QDialog):
+    """Persistent reusable Ref2VA picture/subject presets for Timeline clips."""
+
+    def __init__(self, storage_path: Path, parent=None):
+        super().__init__(parent)
+        self.storage_path = Path(storage_path)
+        self.presets: list[dict] = []
+        self._loading_editor = False
+        self.setWindowTitle("Reference presets")
+        self.resize(900, 680)
+        self._load_presets()
+
+        root = QVBoxLayout(self)
+        hint = QLabel(
+            "Check the references to apply to the Timeline clip(s) selected before opening this window. "
+            "The checked presets define the complete Ref2VA set for those clips. When using more than one, "
+            "set a unique Subject number (1, 2, …); Picture numbering follows the same order automatically."
+        )
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        body = QSplitter(Qt.Orientation.Horizontal, self)
+        body.setChildrenCollapsible(False)
+        root.addWidget(body, 1)
+
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        lv.addWidget(self.list_widget, 1)
+        lbuttons = QHBoxLayout()
+        self.add_btn = QPushButton("+ Add image")
+        self.delete_btn = QPushButton("Delete preset")
+        lbuttons.addWidget(self.add_btn)
+        lbuttons.addWidget(self.delete_btn)
+        lv.addLayout(lbuttons)
+        body.addWidget(left)
+
+        editor = QWidget()
+        ev = QVBoxLayout(editor)
+        ev.setContentsMargins(6, 0, 0, 0)
+        self.thumb = QLabel("No preset selected")
+        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb.setFixedHeight(170)
+        self.thumb.setFrameShape(QFrame.Shape.StyledPanel)
+        ev.addWidget(self.thumb)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.subject_number = QSpinBox()
+        self.subject_number.setRange(1, 5)
+        self.subject_number.setToolTip("For checked presets, this decides which reference becomes <Subject N> / <Picture N>.")
+        form.addRow("Preset name", self.name_edit)
+        form.addRow("Subject number", self.subject_number)
+        ev.addLayout(form)
+
+        ev.addWidget(QLabel("Picture description"))
+        self.picture_edit = QPlainTextEdit()
+        self.picture_edit.setPlaceholderText("<Picture 1>: image of a woman with blonde hair and a white dress")
+        self.picture_edit.setMaximumHeight(115)
+        ev.addWidget(self.picture_edit)
+
+        ev.addWidget(QLabel("Subject description"))
+        self.subject_edit = QPlainTextEdit()
+        self.subject_edit.setPlaceholderText(
+            "<Subject 1>: the woman shown in <Picture 1>. Preserve her exact facial identity, hair, body appearance, and outfit."
+        )
+        self.subject_edit.setMaximumHeight(145)
+        ev.addWidget(self.subject_edit)
+        self.save_btn = QPushButton("Save preset changes")
+        ev.addWidget(self.save_btn)
+        ev.addStretch(1)
+        body.addWidget(editor)
+        body.setSizes([350, 540])
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        self.apply_btn = buttons.button(QDialogButtonBox.StandardButton.Apply)
+        self.apply_btn.setText("Apply to selected clips")
+        root.addWidget(buttons)
+
+        self.add_btn.clicked.connect(self._add_preset)
+        self.delete_btn.clicked.connect(self._delete_preset)
+        self.save_btn.clicked.connect(self._save_current_editor)
+        self.list_widget.currentItemChanged.connect(self._current_changed)
+        self.list_widget.itemChanged.connect(self._item_changed)
+        self.subject_number.valueChanged.connect(self._subject_number_changed)
+        buttons.rejected.connect(self.reject)
+        self.apply_btn.clicked.connect(self._validate_and_accept)
+
+        self._rebuild_list()
+        self._set_editor_enabled(bool(self.presets))
+
+    def _load_presets(self):
+        try:
+            data = json.loads(self.storage_path.read_text(encoding="utf-8")) if self.storage_path.is_file() else {}
+        except Exception:
+            data = {}
+        raw = data.get("presets") if isinstance(data, dict) else []
+        self.presets = []
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            self.presets.append({
+                "id": str(item.get("id") or uuid.uuid4().hex),
+                "name": str(item.get("name") or Path(path).stem).strip(),
+                "path": path,
+                "picture_description": str(item.get("picture_description") or "").strip(),
+                "subject_description": str(item.get("subject_description") or "").strip(),
+            })
+
+    def _persist(self):
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.storage_path.with_suffix(self.storage_path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "presets": self.presets}, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.storage_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Reference presets", f"Could not save the preset list:\n{exc}")
+
+    def _preset_by_id(self, preset_id: str):
+        return next((p for p in self.presets if str(p.get("id")) == str(preset_id)), None)
+
+    def _set_editor_enabled(self, enabled: bool):
+        for w in (self.name_edit, self.subject_number, self.picture_edit, self.subject_edit, self.save_btn, self.delete_btn):
+            w.setEnabled(bool(enabled))
+
+    def _item_label(self, preset: dict, checked: bool, subject_no: int) -> str:
+        name = str(preset.get("name") or Path(str(preset.get("path") or "Reference")).stem)
+        return f"Subject {subject_no}  •  {name}" if checked else name
+
+    def _rebuild_list(self, select_id: str | None = None):
+        checked_state = {}
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            pid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            checked_state[pid] = (item.checkState() == Qt.CheckState.Checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for pos, preset in enumerate(self.presets, 1):
+            pid = str(preset.get("id"))
+            checked, subject_no = checked_state.get(pid, (False, min(pos, 5)))
+            item = QListWidgetItem()
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, pid)
+            item.setData(Qt.ItemDataRole.UserRole + 1, subject_no)
+            item.setText(self._item_label(preset, checked, subject_no))
+            path = Path(str(preset.get("path") or ""))
+            if not path.is_file():
+                item.setToolTip(f"Image file is missing: {path}")
+            self.list_widget.addItem(item)
+            if select_id and pid == str(select_id):
+                self.list_widget.setCurrentItem(item)
+        if self.list_widget.currentItem() is None and self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+        self.list_widget.blockSignals(False)
+        self._set_editor_enabled(bool(self.list_widget.currentItem()))
+        if self.list_widget.currentItem():
+            self._load_item_into_editor(self.list_widget.currentItem())
+
+    def _current_changed(self, current, previous):
+        if current is None:
+            self._set_editor_enabled(False)
+            self.thumb.clear(); self.thumb.setText("No preset selected")
+            return
+        self._set_editor_enabled(True)
+        self._load_item_into_editor(current)
+
+    def _load_item_into_editor(self, item):
+        preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+        if not preset:
+            return
+        self._loading_editor = True
+        try:
+            self.name_edit.setText(str(preset.get("name") or ""))
+            self.picture_edit.setPlainText(str(preset.get("picture_description") or ""))
+            self.subject_edit.setPlainText(str(preset.get("subject_description") or ""))
+            self.subject_number.setValue(max(1, min(5, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))))
+            pix = QPixmap(str(preset.get("path") or ""))
+            if not pix.isNull():
+                self.thumb.setPixmap(pix.scaled(320, 164, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                self.thumb.setToolTip(str(preset.get("path") or ""))
+            else:
+                self.thumb.clear(); self.thumb.setText("Image missing")
+                self.thumb.setToolTip(str(preset.get("path") or ""))
+        finally:
+            self._loading_editor = False
+
+    def _first_unused_subject(self) -> int:
+        used = set()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                used.add(int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))
+        for n in range(1, 6):
+            if n not in used:
+                return n
+        return 5
+
+    def _item_changed(self, item):
+        if item is None:
+            return
+        checked = item.checkState() == Qt.CheckState.Checked
+        self.list_widget.blockSignals(True)
+        try:
+            if checked:
+                # Auto-pick a sensible number the first time it is checked. The user can
+                # still explicitly change it in the editor before Apply.
+                subject_no = int(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
+                others = {
+                    int(self.list_widget.item(i).data(Qt.ItemDataRole.UserRole + 1) or 0)
+                    for i in range(self.list_widget.count())
+                    if self.list_widget.item(i) is not item and self.list_widget.item(i).checkState() == Qt.CheckState.Checked
+                }
+                if subject_no <= 0 or subject_no in others:
+                    item.setData(Qt.ItemDataRole.UserRole + 1, self._first_unused_subject())
+            preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+            if preset:
+                item.setText(self._item_label(preset, checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1)))
+        finally:
+            self.list_widget.blockSignals(False)
+        if item is self.list_widget.currentItem():
+            self._load_item_into_editor(item)
+
+    def _subject_number_changed(self, value: int):
+        if self._loading_editor:
+            return
+        item = self.list_widget.currentItem()
+        if item is None:
+            return
+        self.list_widget.blockSignals(True)
+        try:
+            item.setData(Qt.ItemDataRole.UserRole + 1, int(value))
+            preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+            if preset:
+                item.setText(self._item_label(preset, item.checkState() == Qt.CheckState.Checked, int(value)))
+        finally:
+            self.list_widget.blockSignals(False)
+
+    def _add_preset(self):
+        name, _ = QFileDialog.getOpenFileName(self, "Add reference preset image", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
+        if not name:
+            return
+        path = Path(name)
+        if not path.is_file():
+            return
+        preset = {
+            "id": uuid.uuid4().hex,
+            "name": path.stem,
+            "path": str(path),
+            "picture_description": f"<Picture 1>: reference image of {path.stem}",
+            "subject_description": f"<Subject 1>: the subject shown in <Picture 1>. Preserve its exact identity and appearance.",
+        }
+        self.presets.append(preset)
+        self._persist()
+        self._rebuild_list(select_id=preset["id"])
+
+    def _delete_preset(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return
+        pid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        preset = self._preset_by_id(pid)
+        if not preset:
+            return
+        if QMessageBox.question(self, "Delete reference preset", f'Delete preset "{preset.get("name")}"?') != QMessageBox.StandardButton.Yes:
+            return
+        self.presets = [p for p in self.presets if str(p.get("id")) != pid]
+        self._persist()
+        self._rebuild_list()
+
+    def _save_current_editor(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return
+        preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+        if not preset:
+            return
+        name = self.name_edit.text().strip() or Path(str(preset.get("path") or "Reference")).stem
+        picture = self.picture_edit.toPlainText().strip()
+        subject = self.subject_edit.toPlainText().strip()
+        preset["name"] = name
+        preset["picture_description"] = picture
+        preset["subject_description"] = subject
+        item.setText(self._item_label(preset, item.checkState() == Qt.CheckState.Checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1)))
+        self._persist()
+
+    def _checked_items(self):
+        return [self.list_widget.item(i) for i in range(self.list_widget.count()) if self.list_widget.item(i).checkState() == Qt.CheckState.Checked]
+
+    def _validate_and_accept(self):
+        self._save_current_editor()
+        items = self._checked_items()
+        if not items:
+            QMessageBox.information(self, "Reference presets", "Select at least one reference preset to apply.")
+            return
+        if len(items) > 5:
+            QMessageBox.warning(self, "Reference presets", "MiniMax Ref2VA supports at most 5 timeline reference images.")
+            return
+        numbers = [int(item.data(Qt.ItemDataRole.UserRole + 1) or 1) for item in items]
+        wanted = list(range(1, len(items) + 1))
+        if sorted(numbers) != wanted:
+            QMessageBox.warning(
+                self, "Reference presets",
+                f"For {len(items)} selected presets, assign each Subject number exactly once: " + ", ".join(map(str, wanted)) + "."
+            )
+            return
+        missing = []
+        for item in items:
+            preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+            if preset and not Path(str(preset.get("path") or "")).is_file():
+                missing.append(str(preset.get("name") or preset.get("path")))
+        if missing:
+            QMessageBox.warning(self, "Reference presets", "These preset image files are missing:\n\n" + "\n".join(missing))
+            return
+        self.accept()
+
+    def selected_references(self) -> list[dict]:
+        selected = []
+        for item in self._checked_items():
+            preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+            if not preset:
+                continue
+            selected.append((int(item.data(Qt.ItemDataRole.UserRole + 1) or 1), preset))
+        selected.sort(key=lambda pair: pair[0])
+        refs = []
+        for _subject_no, preset in selected:
+            refs.append({
+                "path": str(preset.get("path") or ""),
+                "name": str(preset.get("name") or "Reference"),
+                "picture_description": str(preset.get("picture_description") or ""),
+                "subject_description": str(preset.get("subject_description") or ""),
+                "preset_id": str(preset.get("id") or ""),
+            })
+        return refs
 
 
 class TimelineCanvas(QWidget):
@@ -1068,6 +1442,7 @@ class TimelineTab(QWidget):
         # Timeline Load dialog opens where the user last loaded a project, even
         # after GrizzlyMax has been restarted.
         self._file_dialog_history_path = app_root / "presets" / "setsave" / "minimax_file_dialog_history.json"
+        self._ref_presets_path = app_root / "presets" / "setsave" / "minimax_timeline_ref_presets.json"
 
         self._build_ui()
         self._ensure_initial_clip()
@@ -1434,6 +1809,11 @@ class TimelineTab(QWidget):
         self.hq_restart_btn.setToolTip(
             "Use the HQ restart feature when your timeline is tested on a low resolution and results look good."
         )
+        self.ref_presets_btn = QPushButton("Ref presets")
+        self.ref_presets_btn.setMinimumHeight(36)
+        self.ref_presets_btn.setToolTip(
+            "Load reusable MiniMax Ref2VA presets and apply them to the currently selected Timeline clip(s)."
+        )
         self.assemble_timeline_btn = QPushButton("Assemble Video")
         self.assemble_timeline_btn.setMinimumHeight(36)
         self.assemble_timeline_btn.setToolTip(
@@ -1447,6 +1827,7 @@ class TimelineTab(QWidget):
         )
         runbar.addWidget(self.generate_timeline_btn)
         runbar.addWidget(self.hq_restart_btn)
+        runbar.addWidget(self.ref_presets_btn)
         runbar.addWidget(self.assemble_timeline_btn)
         runbar.addWidget(self.use_generation_settings_btn)
         self.generation_resolution_label = QLabel("Resolution: —")
@@ -1692,6 +2073,7 @@ class TimelineTab(QWidget):
         self.canvas.clipsReordered.connect(self._reorder_clips)
         self.canvas.clipFramesChanged.connect(self._canvas_frames_changed)
         self.canvas.clipContextMenuRequested.connect(self._show_clip_context_menu)
+        self.ref_presets_btn.clicked.connect(self._open_ref_presets)
         self.clip_name.textEdited.connect(self._clip_name_changed)
         self.gen_mode.currentIndexChanged.connect(self._mode_changed)
         self.frames_combo.currentIndexChanged.connect(self._frames_changed)
@@ -2587,6 +2969,69 @@ class TimelineTab(QWidget):
         finally:
             self.gen_mode.blockSignals(False)
 
+    # --------------------------------------------------------- Ref2VA presets
+    def _open_ref_presets(self):
+        target_indices = [
+            i for i, clip in enumerate(self._clips())
+            if str(clip.get("id")) in self.selected_clip_ids
+            and not bool(clip.get("locked", False))
+            and str(clip.get("generation_mode") or "") != "source"
+        ]
+        if not target_indices:
+            QMessageBox.information(
+                self, "Reference presets",
+                "Select at least one unlocked generation clip before opening Ref presets."
+            )
+            return
+
+        dialog = RefPresetDialog(self._ref_presets_path, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        refs = dialog.selected_references()
+        if not refs:
+            return
+
+        continuation_indices = []
+        for i in target_indices:
+            clip = self._clips()[i]
+            mode = str(clip.get("generation_mode") or "new")
+            edit_mode = str(clip.get("edit_mode") or "")
+            if mode == "continue" or edit_mode in {"continue_previous", "bridge_both", "anchor_next"}:
+                continuation_indices.append(i)
+
+        if continuation_indices:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Ref2VA replaces clip-to-clip frame references")
+            count = len(continuation_indices)
+            box.setText(
+                f"{count} selected clip{'s were' if count != 1 else ' was'} set up to use a previous/next clip frame.\n\n"
+                "MiniMax Ref2VA reference-image mode does not use the first or last frame of other clips. "
+                "Applying these presets will change those clips to standalone Ref2VA generation while keeping their prompts, duration, and other settings."
+            )
+            continue_btn = box.addButton("Continue anyway", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() is not continue_btn:
+                return
+
+        self._record_undo_state("Apply reference presets")
+        self._invalidate_assembly("Reference presets changed — assemble again after regenerating affected clips.")
+        for i in target_indices:
+            clip = self._clips()[i]
+            clip["reference_images"] = copy.deepcopy(refs)
+            clip["use_reference_images"] = True
+            # Ref2VA cannot simultaneously consume continuation/bridge first/last
+            # frames, so applying a preset set makes the selected clip standalone.
+            if str(clip.get("generation_mode") or "new") == "continue" or str(clip.get("edit_mode") or "") in {
+                "continue_previous", "bridge_both", "anchor_next"
+            }:
+                clip["generation_mode"] = "new"
+                clip["edit_mode"] = "standalone"
+                clip["match_next_first_frame"] = False
+            self._touch_clip(i, propagate=False)
+        self._refresh_all()
+
     # --------------------------------------------------------- Ref2VA references
     def _clear_reference_rows(self):
         layout = getattr(self, "refs_rows_layout", None)
@@ -2619,7 +3064,8 @@ class TimelineTab(QWidget):
                 thumb.setPixmap(pix.scaled(54, 54, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             else:
                 thumb.setText("Image")
-            thumb.setToolTip(ref["path"])
+            desc_tip = "\n".join(x for x in (str(ref.get("picture_description") or "").strip(), str(ref.get("subject_description") or "").strip()) if x)
+            thumb.setToolTip(ref["path"] + (("\n\n" + desc_tip) if desc_tip else ""))
 
             token = QLabel(f"<Subject {idx}>\n<Picture {idx}>")
             token.setToolTip(
@@ -2630,7 +3076,9 @@ class TimelineTab(QWidget):
 
             name_edit = QLineEdit(ref.get("name") or Path(ref["path"]).stem)
             name_edit.setPlaceholderText(f"Reference {idx} name")
-            name_edit.setToolTip("Friendly name used in the automatic <Subject N> definition sent to MiniMax.")
+            name_edit.setToolTip(
+                "Friendly reference name. Preset-specific <Picture N> and <Subject N> descriptions are preserved and renumbered automatically."
+            )
             name_edit.editingFinished.connect(lambda i=idx-1, w=name_edit: self._reference_name_changed(i, w.text()))
 
             insert_btn = QPushButton(f"Insert <Subject {idx}>")
@@ -3343,6 +3791,7 @@ class TimelineTab(QWidget):
         regenerate = menu.addAction("(Re)generate this clip")
         regenerate_alternate = menu.addAction("Regenerate as alternate")
         low_res_test = menu.addAction("Create low res test")
+        ref_presets = menu.addAction("Ref presets…")
 
         candidates_menu = menu.addMenu("Alternate candidates")
         self._populate_candidate_menu(candidates_menu, clip_id, clip)
@@ -3365,6 +3814,10 @@ class TimelineTab(QWidget):
         regenerate.setEnabled(not locked and not source)
         regenerate_alternate.setEnabled(not locked and not source and output_exists)
         low_res_test.setEnabled(not locked and not source)
+        ref_presets.setEnabled(any(
+            not bool(c.get("locked", False)) and str(c.get("generation_mode") or "") != "source"
+            for c in self._clips() if str(c.get("id")) in self.selected_clip_ids
+        ))
         # Stale is metadata only: preserved media remains previewable/openable.
         preview.setEnabled(output_exists)
         open_folder.setEnabled(output_exists)
@@ -3379,6 +3832,8 @@ class TimelineTab(QWidget):
             self._generate_alternate_by_id(clip_id)
         elif chosen is low_res_test:
             self._generate_low_res_test_by_id(clip_id)
+        elif chosen is ref_presets:
+            self._open_ref_presets()
         elif chosen is preview:
             self._preview_clip_by_id(clip_id)
         elif chosen is open_folder:
