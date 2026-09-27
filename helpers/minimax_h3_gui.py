@@ -2936,8 +2936,8 @@ class MainWindow(QMainWindow):
                     if not timeline_refs:
                         QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} has reference mode enabled but no reference images.")
                         return False
-                    if len(timeline_refs) > 5:
-                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} has more than 5 reference images.")
+                    if len(timeline_refs) > 9:
+                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} has more than 9 reference images.")
                         return False
                     missing_ref = next((x for x in timeline_refs if not Path(x).is_file()), "")
                     if missing_ref:

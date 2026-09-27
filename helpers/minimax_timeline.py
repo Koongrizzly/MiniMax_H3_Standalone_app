@@ -55,6 +55,7 @@ MIN_SEGMENT_SECONDS = 0.3
 # Backward-compatible internal alias; project JSON still uses the existing "segments" key.
 MIN_CUT_SECONDS = MIN_SEGMENT_SECONDS
 TIMELINE_SCHEMA_VERSION = 3
+TIMELINE_MAX_REF_IMAGES = 9
 
 
 class ClipTrimDialog(QDialog):
@@ -455,7 +456,7 @@ def _reference_entries(clip: dict) -> list[dict]:
         if preset_id:
             entry["preset_id"] = preset_id
         entries.append(entry)
-    return entries[:5]
+    return entries[:TIMELINE_MAX_REF_IMAGES]
 
 
 def _renumber_reference_description(text: str, token: str, index: int, default_body: str) -> str:
@@ -474,6 +475,69 @@ def _renumber_reference_description(text: str, token: str, index: int, default_b
 
 def _subject_tokens_present(text: str) -> bool:
     return bool(re.search(r"<\s*Subject\s+\d+\s*>", str(text or ""), flags=re.IGNORECASE))
+
+
+def _strip_reference_prompt_prefix(text: str) -> str:
+    """Remove a leading block of <Picture N>: / <Subject N>: definitions."""
+    lines = str(text or "").splitlines()
+    if not lines:
+        return ""
+    token_re = re.compile(r"^\s*<\s*(Picture|Subject)\s+\d+\s*>\s*:?.*$", re.IGNORECASE)
+    i = 0
+    saw_token = False
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if token_re.match(stripped):
+            saw_token = True
+            i += 1
+            continue
+        if not stripped:
+            if not saw_token:
+                i += 1
+                continue
+            j = i
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and token_re.match(lines[j].strip()):
+                i = j
+                continue
+            i = j
+            break
+        break
+    if not saw_token:
+        return str(text or "").strip()
+    return "\n".join(lines[i:]).strip()
+
+
+def _reference_prompt_definition_lines(refs: list[dict]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for idx, ref in enumerate(refs, 1):
+        friendly = str(ref.get("name") or f"Reference {idx}").strip() or f"Reference {idx}"
+        picture_line = _renumber_reference_description(
+            ref.get("picture_description"), "Picture", idx, f'reference image of {friendly}'
+        )
+        subject_line = _renumber_reference_description(
+            ref.get("subject_description"), "Subject", idx,
+            f'the subject shown in <Picture {idx}>. Preserve its exact identity and appearance.'
+        )
+        subject_line = re.sub(r"<\s*Picture\s+\d+\s*>", f"<Picture {idx}>", subject_line, flags=re.IGNORECASE)
+        subject_line = re.sub(r"<\s*Subject\s+\d+\s*>", f"<Subject {idx}>", subject_line, count=1, flags=re.IGNORECASE)
+        pairs.append((picture_line, subject_line))
+    return pairs
+
+
+def _reference_prompt_definitions_text(refs: list[dict]) -> str:
+    if not refs:
+        return ""
+    pairs = _reference_prompt_definition_lines(refs)
+    picture_lines = [picture for picture, _subject in pairs if picture]
+    subject_lines = [subject for _picture, subject in pairs if subject]
+    parts = []
+    if picture_lines:
+        parts.append("\n\n".join(picture_lines))
+    if subject_lines:
+        parts.append("\n\n".join(subject_lines))
+    return "\n\n\n".join(parts).strip()
 
 
 def _automatic_subject_usage_line(refs: list[dict]) -> str:
@@ -500,29 +564,16 @@ def _compiled_reference_prompt(clip: dict) -> str:
     one helper usage line so Ref2VA references still participate instead of being defined
     but never invoked.
     """
-    body = _compiled_prompt(clip)
+    body = _strip_reference_prompt_prefix(_compiled_prompt(clip))
     if not bool(clip.get("use_reference_images", False)):
         return body
     refs = _reference_entries(clip)
     if not refs:
         return body
-    defs = []
-    for idx, ref in enumerate(refs, 1):
-        friendly = str(ref.get("name") or f"Reference {idx}").strip() or f"Reference {idx}"
-        picture_line = _renumber_reference_description(
-            ref.get("picture_description"), "Picture", idx, f'reference image of {friendly}'
-        )
-        subject_line = _renumber_reference_description(
-            ref.get("subject_description"), "Subject", idx,
-            f'the subject shown in <Picture {idx}>. Preserve its exact identity and appearance.'
-        )
-        # A saved Subject description may itself mention its original Picture number.
-        # Keep the two positional tokens paired after the user changes Subject order.
-        subject_line = re.sub(r"<\s*Picture\s+\d+\s*>", f"<Picture {idx}>", subject_line, flags=re.IGNORECASE)
-        defs.extend([picture_line, subject_line])
+    defs_text = _reference_prompt_definitions_text(refs)
     auto_use = "" if _subject_tokens_present(body) else _automatic_subject_usage_line(refs)
-    parts = defs + ([auto_use] if auto_use else []) + ([body] if body else [])
-    return "\n".join(parts).strip()
+    parts = ([defs_text] if defs_text else []) + ([auto_use] if auto_use else []) + ([body] if body else [])
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 class RefPresetDialog(QDialog):
@@ -533,6 +584,7 @@ class RefPresetDialog(QDialog):
         self.storage_path = Path(storage_path)
         self.presets: list[dict] = []
         self._loading_editor = False
+        self._check_sequence_counter = 0
         self.setWindowTitle("Reference presets")
         self.resize(900, 680)
         self._load_presets()
@@ -540,8 +592,8 @@ class RefPresetDialog(QDialog):
         root = QVBoxLayout(self)
         hint = QLabel(
             "Check the references to apply to the Timeline clip(s) selected before opening this window. "
-            "The checked presets define the complete Ref2VA set for those clips. When using more than one, "
-            "set a unique Subject number (1, 2, …); Picture numbering follows the same order automatically."
+            "The checked presets define the complete Ref2VA set for those clips. Checked presets are auto-numbered "
+            "in the order you enable them: first checked becomes Subject/Picture 1, next becomes 2, and so on."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -576,8 +628,10 @@ class RefPresetDialog(QDialog):
         form = QFormLayout()
         self.name_edit = QLineEdit()
         self.subject_number = QSpinBox()
-        self.subject_number.setRange(1, 5)
-        self.subject_number.setToolTip("For checked presets, this decides which reference becomes <Subject N> / <Picture N>.")
+        self.subject_number.setRange(1, TIMELINE_MAX_REF_IMAGES)
+        self.subject_number.setReadOnly(True)
+        self.subject_number.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.subject_number.setToolTip("Subject/Picture numbers are assigned automatically in the order presets are checked.")
         form.addRow("Preset name", self.name_edit)
         form.addRow("Subject number", self.subject_number)
         ev.addLayout(form)
@@ -664,17 +718,22 @@ class RefPresetDialog(QDialog):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             pid = str(item.data(Qt.ItemDataRole.UserRole) or "")
-            checked_state[pid] = (item.checkState() == Qt.CheckState.Checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))
+            checked_state[pid] = (
+                item.checkState() == Qt.CheckState.Checked,
+                int(item.data(Qt.ItemDataRole.UserRole + 1) or 1),
+                int(item.data(Qt.ItemDataRole.UserRole + 2) or 0),
+            )
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for pos, preset in enumerate(self.presets, 1):
             pid = str(preset.get("id"))
-            checked, subject_no = checked_state.get(pid, (False, min(pos, 5)))
+            checked, subject_no, check_order = checked_state.get(pid, (False, min(pos, TIMELINE_MAX_REF_IMAGES), 0))
             item = QListWidgetItem()
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, pid)
             item.setData(Qt.ItemDataRole.UserRole + 1, subject_no)
+            item.setData(Qt.ItemDataRole.UserRole + 2, int(check_order) if checked else 0)
             item.setText(self._item_label(preset, checked, subject_no))
             path = Path(str(preset.get("path") or ""))
             if not path.is_file():
@@ -688,6 +747,7 @@ class RefPresetDialog(QDialog):
         self._set_editor_enabled(bool(self.list_widget.currentItem()))
         if self.list_widget.currentItem():
             self._load_item_into_editor(self.list_widget.currentItem())
+        self._renumber_checked_items_by_selection_order()
 
     def _current_changed(self, current, previous):
         if current is None:
@@ -706,7 +766,7 @@ class RefPresetDialog(QDialog):
             self.name_edit.setText(str(preset.get("name") or ""))
             self.picture_edit.setPlainText(str(preset.get("picture_description") or ""))
             self.subject_edit.setPlainText(str(preset.get("subject_description") or ""))
-            self.subject_number.setValue(max(1, min(5, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))))
+            self.subject_number.setValue(max(1, min(TIMELINE_MAX_REF_IMAGES, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))))
             pix = QPixmap(str(preset.get("path") or ""))
             if not pix.isNull():
                 self.thumb.setPixmap(pix.scaled(320, 164, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
@@ -723,10 +783,36 @@ class RefPresetDialog(QDialog):
             item = self.list_widget.item(i)
             if item.checkState() == Qt.CheckState.Checked:
                 used.add(int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))
-        for n in range(1, 6):
+        for n in range(1, TIMELINE_MAX_REF_IMAGES + 1):
             if n not in used:
                 return n
-        return 5
+        return TIMELINE_MAX_REF_IMAGES
+
+    def _next_check_order(self) -> int:
+        self._check_sequence_counter = int(self._check_sequence_counter or 0) + 1
+        return self._check_sequence_counter
+
+    def _checked_items_in_selection_order(self):
+        items = [self.list_widget.item(i) for i in range(self.list_widget.count()) if self.list_widget.item(i).checkState() == Qt.CheckState.Checked]
+        items.sort(key=lambda item: (int(item.data(Qt.ItemDataRole.UserRole + 2) or 0) or 10**9, self.list_widget.row(item)))
+        return items
+
+    def _renumber_checked_items_by_selection_order(self):
+        self.list_widget.blockSignals(True)
+        try:
+            checked_items = self._checked_items_in_selection_order()
+            for pos, item in enumerate(checked_items, 1):
+                item.setData(Qt.ItemDataRole.UserRole + 1, pos)
+            for i in range(self.list_widget.count()):
+                item = self.list_widget.item(i)
+                preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+                if preset:
+                    item.setText(self._item_label(preset, item.checkState() == Qt.CheckState.Checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1)))
+        finally:
+            self.list_widget.blockSignals(False)
+        current = self.list_widget.currentItem()
+        if current is not None:
+            self._load_item_into_editor(current)
 
     def _item_changed(self, item):
         if item is None:
@@ -735,23 +821,17 @@ class RefPresetDialog(QDialog):
         self.list_widget.blockSignals(True)
         try:
             if checked:
-                # Auto-pick a sensible number the first time it is checked. The user can
-                # still explicitly change it in the editor before Apply.
-                subject_no = int(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
-                others = {
-                    int(self.list_widget.item(i).data(Qt.ItemDataRole.UserRole + 1) or 0)
-                    for i in range(self.list_widget.count())
-                    if self.list_widget.item(i) is not item and self.list_widget.item(i).checkState() == Qt.CheckState.Checked
-                }
-                if subject_no <= 0 or subject_no in others:
-                    item.setData(Qt.ItemDataRole.UserRole + 1, self._first_unused_subject())
+                check_order = int(item.data(Qt.ItemDataRole.UserRole + 2) or 0)
+                if check_order <= 0:
+                    item.setData(Qt.ItemDataRole.UserRole + 2, self._next_check_order())
+            else:
+                item.setData(Qt.ItemDataRole.UserRole + 2, 0)
             preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
             if preset:
                 item.setText(self._item_label(preset, checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1)))
         finally:
             self.list_widget.blockSignals(False)
-        if item is self.list_widget.currentItem():
-            self._load_item_into_editor(item)
+        self._renumber_checked_items_by_selection_order()
 
     def _subject_number_changed(self, value: int):
         if self._loading_editor:
@@ -825,8 +905,8 @@ class RefPresetDialog(QDialog):
         if not items:
             QMessageBox.information(self, "Reference presets", "Select at least one reference preset to apply.")
             return
-        if len(items) > 5:
-            QMessageBox.warning(self, "Reference presets", "MiniMax Ref2VA supports at most 5 timeline reference images.")
+        if len(items) > TIMELINE_MAX_REF_IMAGES:
+            QMessageBox.warning(self, "Reference presets", f"MiniMax Ref2VA supports at most {TIMELINE_MAX_REF_IMAGES} timeline reference images.")
             return
         numbers = [int(item.data(Qt.ItemDataRole.UserRole + 1) or 1) for item in items]
         wanted = list(range(1, len(items) + 1))
@@ -847,15 +927,11 @@ class RefPresetDialog(QDialog):
         self.accept()
 
     def selected_references(self) -> list[dict]:
-        selected = []
-        for item in self._checked_items():
+        refs = []
+        for item in self._checked_items_in_selection_order():
             preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
             if not preset:
                 continue
-            selected.append((int(item.data(Qt.ItemDataRole.UserRole + 1) or 1), preset))
-        selected.sort(key=lambda pair: pair[0])
-        refs = []
-        for _subject_no, preset in selected:
             refs.append({
                 "path": str(preset.get("path") or ""),
                 "name": str(preset.get("name") or "Reference"),
@@ -2124,7 +2200,7 @@ class TimelineTab(QWidget):
         self.use_refs_guide.setWordWrap(True)
         self.use_refs_guide.setVisible(False)
         self.add_refs_btn = QPushButton("+ Add reference images")
-        self.add_refs_btn.setToolTip("Add up to 5 reference images for this timeline clip.")
+        self.add_refs_btn.setToolTip(f"Add up to {TIMELINE_MAX_REF_IMAGES} reference images for this timeline clip.")
         self.refs_rows_widget = QWidget()
         self.refs_rows_layout = QVBoxLayout(self.refs_rows_widget)
         self.refs_rows_layout.setContentsMargins(0, 0, 0, 0)
@@ -3137,10 +3213,24 @@ class TimelineTab(QWidget):
 
         self._record_undo_state("Apply reference presets")
         self._invalidate_assembly("Reference presets changed — assemble again after regenerating affected clips.")
+        defs_text = _reference_prompt_definitions_text(refs)
         for i in target_indices:
             clip = self._clips()[i]
             clip["reference_images"] = copy.deepcopy(refs)
             clip["use_reference_images"] = True
+            existing_prompt = _compiled_prompt(clip)
+            prompt_body = _strip_reference_prompt_prefix(existing_prompt)
+            merged_prompt = defs_text if defs_text else ""
+            if prompt_body:
+                merged_prompt = ((merged_prompt + "\n\n\n" + prompt_body) if merged_prompt else prompt_body).strip()
+            segments = clip.setdefault("segments", [])
+            if not segments:
+                segments.append({"id": uuid.uuid4().hex, "prompt": merged_prompt, "weight": 1.0})
+            elif len(segments) > 1:
+                clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": merged_prompt, "weight": 1.0}]
+            else:
+                segments[0]["prompt"] = merged_prompt
+                segments[0]["weight"] = 1.0
             # Ref2VA cannot simultaneously consume continuation/bridge first/last
             # frames, so applying a preset set makes the selected clip standalone.
             if str(clip.get("generation_mode") or "new") == "continue" or str(clip.get("edit_mode") or "") in {
@@ -3217,7 +3307,7 @@ class TimelineTab(QWidget):
         if not refs:
             empty = QLabel("No reference images loaded.")
             self.refs_rows_layout.addWidget(empty)
-        self.add_refs_btn.setEnabled(bool(clip) and len(refs) < 5 and str(clip.get("generation_mode") or "") != "source")
+        self.add_refs_btn.setEnabled(bool(clip) and len(refs) < TIMELINE_MAX_REF_IMAGES and str(clip.get("generation_mode") or "") != "source")
 
     def _reference_mode_changed(self, enabled):
         if self._loading_inspector:
@@ -3244,9 +3334,9 @@ class TimelineTab(QWidget):
         if not clip or bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
             return
         refs = _reference_entries(clip)
-        remaining = 5 - len(refs)
+        remaining = TIMELINE_MAX_REF_IMAGES - len(refs)
         if remaining <= 0:
-            QMessageBox.information(self, "Reference images", "This timeline clip already has the maximum of 5 reference images.")
+            QMessageBox.information(self, "Reference images", f"This timeline clip already has the maximum of {TIMELINE_MAX_REF_IMAGES} reference images.")
             return
         names, _ = QFileDialog.getOpenFileNames(
             self, "Add reference images", "",
@@ -4639,8 +4729,8 @@ class TimelineTab(QWidget):
                 refs = _reference_entries(clip)
                 if not refs:
                     return False, f"{clip.get('name') or f'Clip {i + 1}'} has reference mode enabled but no reference images."
-                if len(refs) > 5:
-                    return False, f"{clip.get('name') or f'Clip {i + 1}'} has more than 5 reference images."
+                if len(refs) > TIMELINE_MAX_REF_IMAGES:
+                    return False, f"{clip.get('name') or f'Clip {i + 1}'} has more than {TIMELINE_MAX_REF_IMAGES} reference images."
                 missing = [r["path"] for r in refs if not Path(r["path"]).is_file()]
                 if missing:
                     return False, f"{clip.get('name') or f'Clip {i + 1}'} has a missing reference image: {missing[0]}"
@@ -4941,8 +5031,8 @@ class TimelineTab(QWidget):
                 refs = _reference_entries(clip)
                 if not refs:
                     return False, f"{name} has reference mode enabled but no reference images."
-                if len(refs) > 5:
-                    return False, f"{name} has more than 5 reference images."
+                if len(refs) > TIMELINE_MAX_REF_IMAGES:
+                    return False, f"{name} has more than {TIMELINE_MAX_REF_IMAGES} reference images."
                 missing = [r["path"] for r in refs if not Path(r["path"]).is_file()]
                 if missing:
                     return False, f"{name} has a missing reference image: {missing[0]}"
