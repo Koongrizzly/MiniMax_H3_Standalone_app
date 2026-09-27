@@ -248,7 +248,7 @@ def _safe_project_name(text: str) -> str:
 
 def _clip_seconds(clip: dict) -> float:
     """Generation/source duration. Do not shorten this for assembly trims."""
-    if str(clip.get("generation_mode") or "") == "source":
+    if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
         try:
             duration = float(clip.get("source_duration_seconds") or 0.0)
             if duration > 0:
@@ -1305,7 +1305,7 @@ class TimelineCanvas(QWidget):
                 prev_path = self._thumbnail_source_path(prev)
                 if prev_path is None:
                     broken = True
-        elif mode == "source":
+        elif mode in {"source", "loaded"}:
             if self._thumbnail_source_path(clip) is None:
                 broken = True
         if broken:
@@ -1493,6 +1493,8 @@ class TimelineCanvas(QWidget):
                 painter.setFont(font)
             if clip.get("generation_mode") == "source":
                 mode = "▣ Loaded start clip"
+            elif clip.get("generation_mode") == "loaded":
+                mode = "▣ Loaded clip"
             else:
                 mode = "↪ Continue" if clip.get("generation_mode") == "continue" else "◆ New"
             edit_mode = str(clip.get("edit_mode") or "")
@@ -1516,9 +1518,9 @@ class TimelineCanvas(QWidget):
             painter.setBrush(QBrush(QColor("#375a7f")))
             painter.setPen(QPen(bg, 1))
             painter.drawRect(box_left, prompt_y, box_w, prompt_h)
-            if clip.get("generation_mode") == "source":
+            if clip.get("generation_mode") in {"source", "loaded"}:
                 source = str(clip.get("start_source_video") or clip.get("output") or "").strip()
-                prompt = Path(source).name if source else "No start video loaded"
+                prompt = Path(source).name if source else "No loaded video"
             else:
                 prompt = _compiled_prompt(clip).replace("\n", " ").strip() or "Empty prompt"
 
@@ -1611,7 +1613,21 @@ class TimelineCanvas(QWidget):
             line1 = fm.elidedText(name, Qt.TextElideMode.ElideRight, max(20, rect.width() - 12))
             painter.drawText(rect.x() + 6, rect.y() + 17, line1)
             painter.setPen(QColor("#c9c5df"))
-            detail = f"{start_sec:.2f}s → {end_sec:.2f}s  •  {volume}%"
+            try:
+                fade_in = max(0.0, float(item.get("fade_in_seconds") or 0.0))
+            except Exception:
+                fade_in = 0.0
+            try:
+                fade_out = max(0.0, float(item.get("fade_out_seconds") or 0.0))
+            except Exception:
+                fade_out = 0.0
+            fade_bits = []
+            if fade_in > 0.001:
+                fade_bits.append(f"FI {fade_in:.1f}s")
+            if fade_out > 0.001:
+                fade_bits.append(f"FO {fade_out:.1f}s")
+            fade_text = ("  •  " + " / ".join(fade_bits)) if fade_bits else ""
+            detail = f"{start_sec:.2f}s → {end_sec:.2f}s  •  {volume}%{fade_text}"
             painter.drawText(rect.x() + 6, rect.y() + 34, fm.elidedText(detail, Qt.TextElideMode.ElideRight, max(20, rect.width() - 12)))
 
         if not self.audio_clips:
@@ -1667,7 +1683,7 @@ class TimelineCanvas(QWidget):
         self._resizing = (
             not modified_click and not locked and (right - x) <= 10
             and len(self.clips) > 0
-            and str(clip.get("generation_mode") or "") != "source"
+            and str(clip.get("generation_mode") or "") not in {"source", "loaded"}
         )
         self.update()
 
@@ -2529,15 +2545,16 @@ class TimelineTab(QWidget):
             self.clip_name.setText(str(clip.get("name") or ""))
             selected_index = self._selected_index()
             self._populate_generation_modes(selected_index, str(clip.get("generation_mode") or "new"))
-            is_source = selected_index == 0 and str(clip.get("generation_mode") or "") == "source"
+            mode_name = str(clip.get("generation_mode") or "")
+            is_media_clip = mode_name in {"source", "loaded"}
             source_path = str(clip.get("start_source_video") or clip.get("output") or "")
-            self.start_source_label.setText(source_path if is_source and source_path else "—")
-            self.start_source_label.setVisible(is_source)
+            self.start_source_label.setText(source_path if is_media_clip and source_path else "—")
+            self.start_source_label.setVisible(is_media_clip)
             if hasattr(self.clip_form, "setRowVisible"):
-                self.clip_form.setRowVisible(self.start_source_label, is_source)
-            editable = enabled and not is_source and not locked
+                self.clip_form.setRowVisible(self.start_source_label, is_media_clip)
+            editable = enabled and not is_media_clip and not locked
             self.clip_name.setEnabled(enabled and not locked)
-            self.gen_mode.setEnabled(enabled and not locked)
+            self.gen_mode.setEnabled(enabled and not locked and not is_media_clip)
             self.prompt_box.setEnabled(editable)
             self.references_box.setEnabled(editable)
             self.settings_box.setEnabled(editable)
@@ -2605,9 +2622,9 @@ class TimelineTab(QWidget):
                 self.cut_prompt.clear()
                 self.cut_prompt.setEnabled(False)
                 return
-            if str(clip.get("generation_mode") or "") == "source":
+            if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
                 self.cut_prompt.clear()
-                self.cut_prompt.setPlaceholderText("Loaded start clips do not need a prompt.")
+                self.cut_prompt.setPlaceholderText("Loaded video clips do not need a generation prompt.")
                 self.cut_prompt.setEnabled(False)
                 return
             self.cut_prompt.setPlaceholderText("Prompt for this H3 generation. You can use the normal Prompt Builder output here, including multiple shots or timestamps.")
@@ -2982,6 +2999,8 @@ class TimelineTab(QWidget):
                 audio.setdefault("timeline_start", 0.0)
                 audio.setdefault("timeline_end", None)
                 audio.setdefault("volume_percent", 100)
+                audio.setdefault("fade_in_seconds", 0.0)
+                audio.setdefault("fade_out_seconds", 0.0)
             for clip in self.project.get("clips") or []:
                 legacy_match = bool(clip.get("match_next_first_frame", False))
                 if not clip.get("edit_mode"):
@@ -3105,8 +3124,8 @@ class TimelineTab(QWidget):
             return
         idx = self._selected_index()
         if idx < 0: return
-        if str(self._clips()[idx].get("generation_mode") or "") == "source":
-            QMessageBox.information(self, "Timeline", "The loaded start clip is a source video and cannot be duplicated as a generation block.")
+        if str(self._clips()[idx].get("generation_mode") or "") in {"source", "loaded"}:
+            QMessageBox.information(self, "Timeline", "Loaded video clips cannot be duplicated as generation blocks. Use Load clip… to add another ready-made video.")
             return
         self._record_undo_state("Duplicate clip")
         clone = copy.deepcopy(self._clips()[idx])
@@ -3333,11 +3352,14 @@ class TimelineTab(QWidget):
             clip = self._selected_clip()
             using_refs = bool((clip or {}).get("use_reference_images", False))
             self.gen_mode.clear()
-            self.gen_mode.addItem("New generation / new chain", "new")
-            if index == 0:
-                self.gen_mode.addItem("Load a start clip", "source")
-            elif not using_refs:
-                self.gen_mode.addItem("Continue previous clip", "continue")
+            if current_mode == "loaded":
+                self.gen_mode.addItem("Loaded video clip", "loaded")
+            else:
+                self.gen_mode.addItem("New generation / new chain", "new")
+                if index == 0:
+                    self.gen_mode.addItem("Load a start clip", "source")
+                elif not using_refs:
+                    self.gen_mode.addItem("Continue previous clip", "continue")
             target = self.gen_mode.findData(current_mode)
             if target < 0:
                 target = 0
@@ -3355,7 +3377,7 @@ class TimelineTab(QWidget):
             i for i, clip in enumerate(self._clips())
             if str(clip.get("id")) in self.selected_clip_ids
             and not bool(clip.get("locked", False))
-            and str(clip.get("generation_mode") or "") != "source"
+            and str(clip.get("generation_mode") or "") not in {"source", "loaded"}
         ]
         if not target_indices:
             QMessageBox.information(
@@ -3491,13 +3513,13 @@ class TimelineTab(QWidget):
         if not refs:
             empty = QLabel("No reference images loaded.")
             self.refs_rows_layout.addWidget(empty)
-        self.add_refs_btn.setEnabled(bool(clip) and len(refs) < TIMELINE_MAX_REF_IMAGES and str(clip.get("generation_mode") or "") != "source")
+        self.add_refs_btn.setEnabled(bool(clip) and len(refs) < TIMELINE_MAX_REF_IMAGES and str(clip.get("generation_mode") or "") not in {"source", "loaded"})
 
     def _reference_mode_changed(self, enabled):
         if self._loading_inspector:
             return
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip or bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
+        if not clip or bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") in {"source", "loaded"}:
             return
         enabled = bool(enabled)
         self._record_undo_state("Toggle reference images")
@@ -3515,7 +3537,7 @@ class TimelineTab(QWidget):
 
     def _add_reference_images(self):
         clip = self._selected_clip(); idx = self._selected_index()
-        if not clip or bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
+        if not clip or bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") in {"source", "loaded"}:
             return
         refs = _reference_entries(clip)
         remaining = TIMELINE_MAX_REF_IMAGES - len(refs)
@@ -3664,6 +3686,8 @@ class TimelineTab(QWidget):
         if not clip or bool(clip.get("locked", False)):
             return
         mode = str(self.gen_mode.currentData() or "new")
+        if str(clip.get("generation_mode") or "") == "loaded":
+            return
         if idx == 0 and mode == "source":
             previous_mode = str(clip.get("generation_mode") or "new")
             self._record_undo_state("Load start clip")
@@ -3752,7 +3776,7 @@ class TimelineTab(QWidget):
             self.generate_selected_btn.setEnabled(False)
             return
 
-        if str(clip.get("generation_mode") or "") == "source":
+        if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
             self.edit_selected_label.setText("Loaded start clip — this block is the source for the continuation chain and is not regenerated by H3.")
             for b in buttons:
                 b.setEnabled(False)
@@ -3865,7 +3889,7 @@ class TimelineTab(QWidget):
         self._refresh_generation_resolution_label()
         changed_finished = False
         for idx, clip in enumerate(self._clips()):
-            if bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") == "source":
+            if bool(clip.get("locked", False)) or str(clip.get("generation_mode") or "") in {"source", "loaded"}:
                 continue
             # Preserve all Timeline-owned values. Queue-time logic will add the
             # block's frames, prompt, refs and continuation source separately.
@@ -4120,7 +4144,7 @@ class TimelineTab(QWidget):
         generated = clip.get("last_generation_info")
         if isinstance(generated, dict):
             add(generated.get("output"))
-        if str(clip.get("generation_mode") or "") == "source":
+        if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
             add(clip.get("start_source_video"))
 
         bases = []
@@ -4232,6 +4256,8 @@ class TimelineTab(QWidget):
                 "timeline_start": 0.0,
                 "timeline_end": None,
                 "volume_percent": 100,
+                "fade_in_seconds": 0.0,
+                "fade_out_seconds": 0.0,
             })
         if not additions:
             return
@@ -4247,7 +4273,10 @@ class TimelineTab(QWidget):
         menu = QMenu(self)
         trim = menu.addAction("Trim audio…")
         volume = menu.addAction(f"Volume…  {int(round(float(item.get('volume_percent', 100) or 100)))}%")
+        fade_in_action = menu.addAction(f"Fade in…  {max(0.0, float(item.get('fade_in_seconds') or 0.0)):.1f}s")
+        fade_out_action = menu.addAction(f"Fade out…  {max(0.0, float(item.get('fade_out_seconds') or 0.0)):.1f}s")
         menu.addSeparator()
+        split_action = menu.addAction("Split audio at…")
         start_action = menu.addAction(f"Set exact timeline start…  {float(item.get('timeline_start') or 0.0):.2f}s")
         end_action = menu.addAction(f"Set exact timeline end…  {_soundtrack_clip_end(item):.2f}s")
         menu.addSeparator()
@@ -4257,6 +4286,12 @@ class TimelineTab(QWidget):
             self._trim_soundtrack_audio(audio_id)
         elif chosen is volume:
             self._set_soundtrack_volume(audio_id)
+        elif chosen is fade_in_action:
+            self._set_soundtrack_fade(audio_id, "in")
+        elif chosen is fade_out_action:
+            self._set_soundtrack_fade(audio_id, "out")
+        elif chosen is split_action:
+            self._split_soundtrack_audio(audio_id)
         elif chosen is start_action:
             self._set_soundtrack_start(audio_id)
         elif chosen is end_action:
@@ -4306,6 +4341,84 @@ class TimelineTab(QWidget):
         self._invalidate_assembly("Soundtrack volume changed — assemble again when ready.")
         self._refresh_all()
 
+    def _set_soundtrack_fade(self, audio_id, direction: str):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None:
+            return
+        key = "fade_in_seconds" if str(direction).lower() == "in" else "fade_out_seconds"
+        label = "Fade in" if key == "fade_in_seconds" else "Fade out"
+        duration = max(0.001, _soundtrack_clip_duration(item))
+        try:
+            current = max(0.0, min(duration, float(item.get(key) or 0.0)))
+        except Exception:
+            current = 0.0
+        value, ok = QInputDialog.getDouble(
+            self, f"Soundtrack {label.lower()}",
+            f"{label} duration in seconds (0 = off)",
+            current, 0.0, duration, 3,
+        )
+        if not ok:
+            return
+        value = max(0.0, min(duration, float(value)))
+        if abs(value - current) < 0.0005:
+            return
+        self._record_undo_state(f"Change soundtrack {label.lower()}")
+        item[key] = round(value, 3)
+        self._invalidate_assembly(f"Soundtrack {label.lower()} changed — assemble again when ready.")
+        self._refresh_all()
+
+    def _split_soundtrack_audio(self, audio_id):
+        idx, item = self._soundtrack_by_id(audio_id)
+        if item is None:
+            return
+        start = max(0.0, float(item.get("timeline_start") or 0.0))
+        duration = max(0.0, _soundtrack_clip_duration(item))
+        end = start + duration
+        if duration <= 0.002:
+            QMessageBox.information(self, "Split soundtrack audio", "This soundtrack block is too short to split.")
+            return
+        default = start + duration / 2.0
+        value, ok = QInputDialog.getDouble(
+            self, "Split soundtrack audio",
+            "Split at video timeline time (seconds)",
+            default, start + 0.001, end - 0.001, 3,
+        )
+        if not ok:
+            return
+        split_time = max(start + 0.001, min(end - 0.001, float(value)))
+        left_duration = split_time - start
+        right_duration = end - split_time
+        try:
+            source_in = max(0.0, float(item.get("trim_in") or 0.0))
+        except Exception:
+            source_in = 0.0
+        source_split = source_in + left_duration
+        source_end = source_split + right_duration
+
+        self._record_undo_state("Split soundtrack audio")
+        original_fade_in = max(0.0, float(item.get("fade_in_seconds") or 0.0))
+        original_fade_out = max(0.0, float(item.get("fade_out_seconds") or 0.0))
+
+        # Left half keeps the original entrance fade; the newly-created cut itself
+        # is hard by default so each side can be adjusted independently afterward.
+        item["trim_out"] = round(source_split, 3)
+        item["timeline_end"] = round(split_time, 3)
+        item["fade_in_seconds"] = round(min(original_fade_in, left_duration), 3)
+        item["fade_out_seconds"] = 0.0
+
+        right = copy.deepcopy(item)
+        right["id"] = uuid.uuid4().hex
+        right["name"] = str(item.get("name") or "Audio") + " (split)"
+        right["trim_in"] = round(source_split, 3)
+        right["trim_out"] = round(source_end, 3)
+        right["timeline_start"] = round(split_time, 3)
+        right["timeline_end"] = round(end, 3)
+        right["fade_in_seconds"] = 0.0
+        right["fade_out_seconds"] = round(min(original_fade_out, right_duration), 3)
+        self.project.setdefault("soundtrack_clips", []).insert(idx + 1, right)
+        self._invalidate_assembly("Soundtrack split changed — assemble again when ready.")
+        self._refresh_all()
+
     def _set_soundtrack_start(self, audio_id):
         idx, item = self._soundtrack_by_id(audio_id)
         if item is None: return
@@ -4341,6 +4454,58 @@ class TimelineTab(QWidget):
         self._invalidate_assembly("Soundtrack changed — assemble again when ready.")
         self._refresh_all()
 
+    def _load_external_clip_after(self, clip_id):
+        """Insert an existing ready-made video immediately after the clicked block."""
+        idx, _clicked = self._clip_by_id(clip_id)
+        if idx < 0:
+            return False
+        if not self._ensure_project_setup_for_first_edit():
+            return False
+        name, _ = QFileDialog.getOpenFileName(
+            self, "Load clip onto timeline", "",
+            "Video files (*.mp4 *.mkv *.mov *.avi *.webm *.m4v);;All files (*.*)"
+        )
+        if not name:
+            return False
+        path = Path(name)
+        if not path.is_file():
+            return False
+        details = self._probe_video_details(str(path))
+        duration = float(details.get("duration") or self._probe_start_video_duration(str(path)) or 0.0)
+        if duration <= 0.001:
+            QMessageBox.warning(self, "Load clip", "Could not read the duration of this video file.")
+            return False
+        self._record_undo_state("Load clip")
+        clip = self._blank_clip(continue_previous=False)
+        clip["name"] = path.stem or f"Loaded clip {idx + 2}"
+        clip["generation_mode"] = "loaded"
+        clip["start_source_video"] = str(path)
+        clip["source_duration_seconds"] = duration
+        clip["frames"] = max(1, int(round(duration * FPS)))
+        clip["edit_mode"] = "standalone"
+        clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
+        clip["settings"] = {}
+        clip["use_reference_images"] = False
+        clip["reference_images"] = []
+        clip["queue_job_id"] = None
+        clip["output"] = str(path)
+        clip["status"] = "finished"
+        clip["stale"] = False
+        clip["hq_generated"] = False
+        clip["last_generation_info"] = {}
+        if int(details.get("width") or 0) > 0 and int(details.get("height") or 0) > 0:
+            clip["loaded_resolution"] = f"{int(details['width'])} × {int(details['height'])}"
+        if details.get("fps"):
+            clip["loaded_fps"] = str(details.get("fps"))
+        self._clips().insert(idx + 1, clip)
+        self._renumber_default_names()
+        self._invalidate_assembly("Loaded clip added — assemble again when ready.")
+        self.selected_clip_id = str(clip["id"])
+        self.selected_clip_ids = {str(clip["id"])}
+        self._selection_anchor_id = str(clip["id"])
+        self._refresh_all()
+        return True
+
     def _show_clip_context_menu(self, clip_id, global_pos):
         idx, clip = self._clip_by_id(clip_id)
         if clip is None:
@@ -4364,10 +4529,13 @@ class TimelineTab(QWidget):
         candidates_menu = menu.addMenu("Alternate candidates")
         self._populate_candidate_menu(candidates_menu, clip_id, clip)
 
+        load_clip_action = menu.addAction("Load clip…")
         preview = menu.addAction("Preview clip")
         open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
         volume_action = menu.addAction(f"Volume…  {int(round(float(clip.get('volume_percent', 100) or 100)))}%")
+        fade_in_action = menu.addAction(f"Audio fade in…  {max(0.0, float(clip.get('audio_fade_in_seconds') or 0.0)):.1f}s")
+        fade_out_action = menu.addAction(f"Audio fade out…  {max(0.0, float(clip.get('audio_fade_out_seconds') or 0.0)):.1f}s")
         speed_action = menu.addAction(f"Speed…  {_clip_speed(clip):.1f}x")
         transition_name = _transition_name(clip)
         transition_suffix = "" if transition_name == "none" else f"  {_TRANSITION_LABELS.get(transition_name, transition_name)} {_transition_requested_seconds(clip):.1f}s"
@@ -4379,14 +4547,14 @@ class TimelineTab(QWidget):
         info = menu.addAction("Info")
 
         locked = bool(clip.get("locked", False))
-        source = str(clip.get("generation_mode") or "") == "source"
+        media_clip = str(clip.get("generation_mode") or "") in {"source", "loaded"}
         preview_path = self._clip_preview_path(clip)
         output_exists = bool(preview_path)
-        regenerate.setEnabled(not locked and not source)
-        regenerate_alternate.setEnabled(not locked and not source and output_exists)
-        low_res_test.setEnabled(not locked and not source)
+        regenerate.setEnabled(not locked and not media_clip)
+        regenerate_alternate.setEnabled(not locked and not media_clip and output_exists)
+        low_res_test.setEnabled(not locked and not media_clip)
         ref_presets.setEnabled(any(
-            not bool(c.get("locked", False)) and str(c.get("generation_mode") or "") != "source"
+            not bool(c.get("locked", False)) and str(c.get("generation_mode") or "") not in {"source", "loaded"}
             for c in self._clips() if str(c.get("id")) in self.selected_clip_ids
         ))
         # Stale is metadata only: preserved media remains previewable/openable.
@@ -4407,6 +4575,8 @@ class TimelineTab(QWidget):
             self._generate_low_res_test_by_id(clip_id)
         elif chosen is ref_presets:
             self._open_ref_presets()
+        elif chosen is load_clip_action:
+            self._load_external_clip_after(clip_id)
         elif chosen is preview:
             self._preview_clip_by_id(clip_id)
         elif chosen is open_folder:
@@ -4415,6 +4585,10 @@ class TimelineTab(QWidget):
             self._trim_clip_by_id(clip_id)
         elif chosen is volume_action:
             self._set_clip_volume_by_id(clip_id)
+        elif chosen is fade_in_action:
+            self._set_clip_audio_fade_by_id(clip_id, "in")
+        elif chosen is fade_out_action:
+            self._set_clip_audio_fade_by_id(clip_id, "out")
         elif chosen is speed_action:
             self._set_clip_speed_by_id(clip_id)
         elif chosen is transition_action:
@@ -4453,7 +4627,7 @@ class TimelineTab(QWidget):
         ``Regenerate as alternate`` jobs.  Only a real media file is archived and
         the same file is never inserted twice.
         """
-        if not isinstance(clip, dict) or str(clip.get("generation_mode") or "") == "source":
+        if not isinstance(clip, dict) or str(clip.get("generation_mode") or "") in {"source", "loaded"}:
             return False
 
         active = self._clip_preview_path(clip)
@@ -4544,8 +4718,8 @@ class TimelineTab(QWidget):
         if bool(clip.get("locked", False)):
             QMessageBox.information(self, "Alternate candidate", "This block is locked. Unlock it before creating an alternate.")
             return False
-        if str(clip.get("generation_mode") or "") == "source":
-            QMessageBox.information(self, "Alternate candidate", "A loaded source clip cannot be regenerated as an alternate.")
+        if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
+            QMessageBox.information(self, "Alternate candidate", "A loaded video clip cannot be regenerated as an alternate.")
             return False
         if not self._clip_preview_path(clip):
             QMessageBox.information(self, "Alternate candidate", "Create the first render normally before adding alternate candidates.")
@@ -4604,8 +4778,8 @@ class TimelineTab(QWidget):
         if bool(clip.get("locked", False)):
             QMessageBox.information(self, "Low res test", "This block is locked. Unlock it before creating a low-res test.")
             return False
-        if str(clip.get("generation_mode") or "") == "source":
-            QMessageBox.information(self, "Low res test", "A loaded source clip cannot be regenerated as a low-res test.")
+        if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
+            QMessageBox.information(self, "Low res test", "A loaded video clip cannot be regenerated as a low-res test.")
             return False
 
         settings = clip.get("settings") if isinstance(clip.get("settings"), dict) else {}
@@ -4690,6 +4864,43 @@ class TimelineTab(QWidget):
         else:
             clip["volume_percent"] = value
         self._invalidate_assembly("Clip volume changed — assemble again.")
+        self._refresh_all()
+        return True
+
+    def _set_clip_audio_fade_by_id(self, clip_id, direction):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        key = "audio_fade_in_seconds" if str(direction).lower() == "in" else "audio_fade_out_seconds"
+        label = "Audio fade in" if key == "audio_fade_in_seconds" else "Audio fade out"
+        try:
+            current = max(0.0, float(clip.get(key) or 0.0))
+        except Exception:
+            current = 0.0
+        try:
+            duration = max(0.001, float(_clip_timeline_seconds(clip)))
+        except Exception:
+            duration = max(0.001, float(clip.get("frames") or 24) / FPS)
+        value, accepted = QInputDialog.getDouble(
+            self,
+            label,
+            "Fade duration in assembled video (seconds; 0 disables the fade):",
+            min(current, duration),
+            0.0,
+            duration,
+            3,
+        )
+        if not accepted:
+            return False
+        value = max(0.0, min(duration, float(value)))
+        if abs(value - current) < 0.0005:
+            return True
+        self._record_undo_state(f"Change {label.lower()}")
+        if value <= 0.0005:
+            clip.pop(key, None)
+        else:
+            clip[key] = round(value, 3)
+        self._invalidate_assembly(f"{label} changed — assemble again.")
         self._refresh_all()
         return True
 
@@ -5073,12 +5284,12 @@ class TimelineTab(QWidget):
             mode = str(clip.get("generation_mode") or "new")
             if i == 0 and mode == "continue":
                 return False, "Clip 1 cannot continue a previous timeline clip."
-            if mode == "source":
-                if i != 0:
+            if mode in {"source", "loaded"}:
+                if mode == "source" and i != 0:
                     return False, "Only Clip 1 can be a loaded start clip."
                 source = str(clip.get("start_source_video") or clip.get("output") or "")
                 if not source or not Path(source).is_file():
-                    return False, "Clip 1 is set to Load a start clip, but the video file is missing."
+                    return False, f"{clip.get('name') or f'Clip {i + 1}'} is a loaded video clip, but its video file is missing."
                 continue
             prompt = _compiled_prompt(clip)
             if not prompt:
@@ -5112,7 +5323,7 @@ class TimelineTab(QWidget):
             # HQ restart is a project-level generation mode. Once selected, keep
             # using the same override for later single-clip regenerations and
             # subsequent timeline generation, including after save/reload.
-            if hq_override and str(clip.get("generation_mode") or "") != "source":
+            if hq_override and str(clip.get("generation_mode") or "") not in {"source", "loaded"}:
                 spec["timeline_hq_override"] = copy.deepcopy(hq_override)
             # Edit/replacement topology is used only by Regenerate selected block.
             spec["match_next_first_frame"] = False
@@ -5122,7 +5333,7 @@ class TimelineTab(QWidget):
                 spec["timeline_previous_job_id"] = str(prev.get("queue_job_id") or "")
                 spec["timeline_previous_status"] = str(prev.get("status") or "")
                 spec["timeline_previous_stale"] = False
-                spec["timeline_previous_is_source"] = str(prev.get("generation_mode") or "") == "source"
+                spec["timeline_previous_is_source"] = str(prev.get("generation_mode") or "") in {"source", "loaded"}
                 # Preserve the predecessor's visible boundary metadata so queue-side
                 # bridge helpers can resolve against the effective timeline clip,
                 # not blindly against source frame 0 / the untrimmed source end.
@@ -5179,11 +5390,11 @@ class TimelineTab(QWidget):
                 QMessageBox.information(self, "Timeline edit", "This block is locked. Unlock it before regenerating it.")
                 return False
 
-            if str(clip.get("generation_mode") or "") == "source":
+            if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
                 QMessageBox.information(
                     self,
                     "Timeline edit",
-                    "The loaded start clip is a source video, not an H3 generation. Choose another block to regenerate it.",
+                    "This is a loaded video clip, not an H3 generation. Choose another block to regenerate it.",
                 )
                 return False
 
@@ -5351,7 +5562,7 @@ class TimelineTab(QWidget):
 
     def _clip_has_usable_output(self, clip: dict) -> bool:
         """Return True only when this block already has a video that can be reused."""
-        if str(clip.get("generation_mode") or "") == "source":
+        if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
             source = str(clip.get("start_source_video") or clip.get("output") or "")
             return bool(source and Path(source).is_file())
         output = str(clip.get("output") or "")
@@ -5377,10 +5588,10 @@ class TimelineTab(QWidget):
             clip = clips[i]
             mode = str(clip.get("generation_mode") or "new")
             name = str(clip.get("name") or f"Clip {i + 1}")
-            if mode == "source":
+            if mode in {"source", "loaded"}:
                 source = str(clip.get("start_source_video") or clip.get("output") or "")
                 if not source or not Path(source).is_file():
-                    return False, f"{name} is a loaded start clip, but its video file is missing."
+                    return False, f"{name} is a loaded video clip, but its video file is missing."
                 continue
             prompt = _compiled_prompt(clip)
             if not prompt:
@@ -5493,7 +5704,7 @@ class TimelineTab(QWidget):
             active_hq = self.project.get("hq_restart_override") or {}
             if isinstance(active_hq, dict) and active_hq:
                 for i in indices:
-                    if 0 <= i < len(clips) and str(clips[i].get("generation_mode") or "") != "source":
+                    if 0 <= i < len(clips) and str(clips[i].get("generation_mode") or "") not in {"source", "loaded"}:
                         clips[i]["hq_generated"] = True
             self.project["assembled_output"] = ""
             self.project["assembly_status"] = ""
@@ -5573,7 +5784,7 @@ class TimelineTab(QWidget):
             self.project["hq_restart_override"] = copy.deepcopy(override)
             for i in unlocked_indices:
                 clip = self._clips()[i]
-                if str(clip.get("generation_mode") or "") != "source":
+                if str(clip.get("generation_mode") or "") not in {"source", "loaded"}:
                     clip["hq_generated"] = True
             self.project["assembled_output"] = ""
             self.project["assembly_status"] = ""

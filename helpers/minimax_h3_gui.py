@@ -2883,13 +2883,13 @@ class MainWindow(QMainWindow):
                 clip_id = str(spec.get("id") or "")
                 clip_name = str(spec.get("name") or f"Clip {pos + 1}")
                 generation_mode = str(spec.get("generation_mode") or "new")
-                if generation_mode == "source":
-                    # A loaded Clip 1 is an existing source video, not an H3 job.
-                    # Keep it on the timeline and let the next Continue block use
-                    # its exact file as the continuation source.
+                if generation_mode in {"source", "loaded"}:
+                    # Loaded media clips are existing timeline video, not H3 jobs.
+                    # Keep them on the timeline and let neighboring generated clips
+                    # use their exact file as a continuation/anchor source when needed.
                     source_video = str(spec.get("start_source_video") or spec.get("output") or "")
                     if not source_video or not Path(source_video).is_file():
-                        QMessageBox.warning(self, "Timeline", f"{clip_name} is a loaded start clip, but its video file is missing.")
+                        QMessageBox.warning(self, "Timeline", f"{clip_name} is a loaded video clip, but its video file is missing.")
                         return False
                     continue
                 settings = copy.deepcopy(spec.get("settings") or original)
@@ -3015,7 +3015,7 @@ class MainWindow(QMainWindow):
                         batch_timeline_indices = {
                             int(x.get("timeline_index", n) or 0)
                             for n, x in enumerate(specs)
-                            if str(x.get("generation_mode") or "new") != "source"
+                            if str(x.get("generation_mode") or "new") not in {"source", "loaded"}
                         }
                         predecessor_is_in_this_batch = previous_timeline_index in batch_timeline_indices
 
@@ -3128,8 +3128,8 @@ class MainWindow(QMainWindow):
             for clip_id, job_id, output, job_info in created:
                 if getattr(self, "timeline_widget", None) is not None:
                     self.timeline_widget.mark_queued(clip_id, job_id, output, job_info)
-            source_count = sum(1 for spec in specs if str(spec.get("generation_mode") or "") == "source")
-            suffix = f" + {source_count} loaded start clip" if source_count == 1 else (f" + {source_count} loaded start clips" if source_count else "")
+            media_count = sum(1 for spec in specs if str(spec.get("generation_mode") or "") in {"source", "loaded"})
+            suffix = f" + {media_count} loaded video clip" if media_count == 1 else (f" + {media_count} loaded video clips" if media_count else "")
             self.status.setText(f"Timeline queued: {len(created)} H3 clip(s){suffix}")
             return True
         finally:
@@ -3238,6 +3238,8 @@ class MainWindow(QMainWindow):
             job = jobs_by_id.get(str(clip.get("queue_job_id") or ""))
             if job and job.get("resolution"):
                 resolutions.add(str(job.get("resolution")))
+            elif clip.get("loaded_resolution"):
+                resolutions.add(str(clip.get("loaded_resolution")))
         normalize_mixed_resolution = False
         target_resolution = None
         if len(resolutions) > 1:
@@ -3359,7 +3361,15 @@ class MainWindow(QMainWindow):
                 volume_percent = max(0, min(150, int(round(float(item.get("volume_percent", 100) or 100)))))
             except Exception:
                 volume_percent = 100
-            soundtrack_specs.append((item, audio_path, trim_in, used, timeline_start, volume_percent))
+            try:
+                fade_in_seconds = max(0.0, min(used, float(item.get("fade_in_seconds") or 0.0)))
+            except Exception:
+                fade_in_seconds = 0.0
+            try:
+                fade_out_seconds = max(0.0, min(used, float(item.get("fade_out_seconds") or 0.0)))
+            except Exception:
+                fade_out_seconds = 0.0
+            soundtrack_specs.append((item, audio_path, trim_in, used, timeline_start, volume_percent, fade_in_seconds, fade_out_seconds))
         has_soundtrack = bool(soundtrack_specs)
         if soundtrack_mode == "soundtrack_only" and not has_soundtrack:
             QMessageBox.warning(
@@ -3378,8 +3388,10 @@ class MainWindow(QMainWindow):
         trim_specs = []
         has_trim = False
         has_volume_adjustment = False
+        has_audio_fade = False
         has_speed_adjustment = False
         has_transition = False
+        has_loaded_media = any(str(c.get("generation_mode") or "") == "loaded" for c in clips)
         for clip, path in zip(clips, outputs):
             try:
                 user_trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
@@ -3427,18 +3439,31 @@ class MainWindow(QMainWindow):
                 speed_multiplier = max(0.5, min(2.0, round(float(clip.get("speed_multiplier", 1.0) or 1.0), 1)))
             except Exception:
                 speed_multiplier = 1.0
+            final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
+            try:
+                audio_fade_in_seconds = max(0.0, min(final_duration, float(clip.get("audio_fade_in_seconds") or 0.0)))
+            except Exception:
+                audio_fade_in_seconds = 0.0
+            try:
+                audio_fade_out_seconds = max(0.0, min(final_duration, float(clip.get("audio_fade_out_seconds") or 0.0)))
+            except Exception:
+                audio_fade_out_seconds = 0.0
+            has_audio_fade = has_audio_fade or audio_fade_in_seconds > 0.0005 or audio_fade_out_seconds > 0.0005
             has_speed_adjustment = has_speed_adjustment or abs(speed_multiplier - 1.0) > 0.0001
             transition_name = str(clip.get("transition_to_next") or "none").strip().lower()
             has_transition = has_transition or transition_name not in {"", "none"}
-            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame))
+            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds))
 
         # The concat recipe remains useful for the unchanged fast stream-copy path.
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_speed_adjustment or has_transition or has_soundtrack:
-            # Re-encode only when Timeline editing actually requires it (trim,
-            # mixed resolution, per-clip volume/speed, transitions, or soundtrack audio). Each clip
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media:
+            # Re-encode when Timeline editing requires it, or whenever a ready-made
+            # external clip is present. Imported media may use different codecs,
+            # frame rates or audio formats, so normalize it to the same 24-fps /
+            # stereo assembly pipeline instead of trusting concat stream-copy.
+            # Each clip
             # is an independent input so trim-in is exact and cannot be defeated by
             # concat-demuxer timestamps/keyframes.  Sources remain untouched.
             args = ["-y"]
@@ -3456,7 +3481,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return False
 
-            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame in trim_specs:
+            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds in trim_specs:
                 # Input-side seek is used for ordinary user trims. For the special
                 # continuation seam fix we intentionally start at source time zero
                 # and decode one extra frame, because frame 0 itself is discarded
@@ -3465,7 +3490,7 @@ class MainWindow(QMainWindow):
                     args += ["-ss", f"{trim_in:.6f}"]
                 read_duration = effective_duration + ((1.0 / 24.0) if exact_drop_first_frame else 0.0)
                 args += ["-t", f"{read_duration:.6f}", "-i", str(path)]
-                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, exact_drop_first_frame))
+                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds))
 
             filter_parts = []
             synthetic_audio_inputs = []
@@ -3477,7 +3502,7 @@ class MainWindow(QMainWindow):
             # stream and 48-kHz stereo audio stream. xfade is strict about frame
             # rate/timebase/geometry compatibility, so normalizing here keeps the
             # transition path deterministic while leaving source MP4s untouched.
-            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, exact_drop_first_frame in input_meta:
+            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds in input_meta:
                 final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
                 final_durations.append(final_duration)
                 vlabel = f"v{i}"
@@ -3504,11 +3529,24 @@ class MainWindow(QMainWindow):
                     aprefix = f"[{i}:a:0]"
                     if exact_drop_first_frame:
                         aprefix += f"atrim=start={1.0 / 24.0:.9f},"
-                    filter_parts.append(
-                        aprefix + f"asetpts=PTS-STARTPTS,atempo={speed_multiplier:.3f},"
-                        f"volume={gain:.3f},aresample=48000,"
-                        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{alabel}]"
-                    )
+                    audio_filters = [
+                        f"asetpts=PTS-STARTPTS",
+                        f"atempo={speed_multiplier:.3f}",
+                        f"volume={gain:.3f}",
+                    ]
+                    # Fade is intentionally applied AFTER the clip gain. So a clip
+                    # set to 75% fades from silence up to exactly 75%, never back
+                    # to 100%.
+                    if audio_fade_in_seconds > 0.0005:
+                        audio_filters.append(f"afade=t=in:st=0:d={audio_fade_in_seconds:.6f}")
+                    if audio_fade_out_seconds > 0.0005:
+                        fade_out_start = max(0.0, final_duration - audio_fade_out_seconds)
+                        audio_filters.append(f"afade=t=out:st={fade_out_start:.6f}:d={audio_fade_out_seconds:.6f}")
+                    audio_filters.extend([
+                        "aresample=48000",
+                        "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                    ])
+                    filter_parts.append(aprefix + ",".join(audio_filters) + f"[{alabel}]")
                     audio_labels.append(alabel)
                 else:
                     synthetic_audio_inputs.append((i, final_duration))
@@ -3532,7 +3570,7 @@ class MainWindow(QMainWindow):
             # their exact timeline start position, then mixed over the assembled
             # clip audio after all clip-to-clip transitions are resolved.
             soundtrack_labels = []
-            for sidx, (_item, audio_path, trim_in, used_duration, timeline_start, volume_percent) in enumerate(soundtrack_specs):
+            for sidx, (_item, audio_path, trim_in, used_duration, timeline_start, volume_percent, fade_in_seconds, fade_out_seconds) in enumerate(soundtrack_specs):
                 if trim_in > 0.001:
                     args += ["-ss", f"{trim_in:.6f}"]
                 args += ["-t", f"{used_duration:.6f}", "-i", str(audio_path)]
@@ -3541,11 +3579,19 @@ class MainWindow(QMainWindow):
                 label = f"st{sidx}"
                 gain = max(0.0, min(1.5, float(volume_percent) / 100.0))
                 delay_ms = max(0, int(round(float(timeline_start) * 1000.0)))
-                filter_parts.append(
-                    f"[{input_index}:a:0]asetpts=PTS-STARTPTS,volume={gain:.3f},aresample=48000,"
-                    f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-                    f"adelay={delay_ms}|{delay_ms}[{label}]"
-                )
+                audio_filters = [
+                    "asetpts=PTS-STARTPTS",
+                    f"volume={gain:.3f}",
+                    "aresample=48000",
+                    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                ]
+                if fade_in_seconds > 0.0005:
+                    audio_filters.append(f"afade=t=in:st=0:d={fade_in_seconds:.6f}")
+                if fade_out_seconds > 0.0005:
+                    fade_out_start = max(0.0, used_duration - fade_out_seconds)
+                    audio_filters.append(f"afade=t=out:st={fade_out_start:.6f}:d={fade_out_seconds:.6f}")
+                audio_filters.append(f"adelay={delay_ms}|{delay_ms}")
+                filter_parts.append(f"[{input_index}:a:0]" + ",".join(audio_filters) + f"[{label}]")
                 soundtrack_labels.append(label)
 
             allowed_transitions = {
