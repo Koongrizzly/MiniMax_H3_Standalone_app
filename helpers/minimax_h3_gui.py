@@ -2810,7 +2810,7 @@ class MainWindow(QMainWindow):
         self.timeline_tab_index = self.tabs.addTab(self.timeline_widget, "Timeline")
         self.tabs.tabBar().setTabData(self.timeline_tab_index, "timeline")
 
-    def _extract_timeline_first_frame(self, video_path, clip_id):
+    def _extract_timeline_first_frame(self, video_path, clip_id, trim_in_seconds=0.0):
         video = Path(str(video_path or ""))
         if not video.is_file():
             return ""
@@ -2830,10 +2830,20 @@ class MainWindow(QMainWindow):
                 out.unlink()
         except Exception:
             pass
+        try:
+            trim_in = max(0.0, float(trim_in_seconds or 0.0))
+        except Exception:
+            trim_in = 0.0
         cmd = [
             str(ffmpeg_tool_path("ffmpeg.exe")), "-y", "-nostdin", "-loglevel", "error",
-            "-i", str(video), "-map", "0:v:0", "-frames:v", "1", str(out),
+            "-i", str(video),
         ]
+        # When the destination clip is trimmed, its visible start is no longer
+        # source frame 0. Seek to the effective trim-in so bridge replacements
+        # target the same first visible frame the timeline/assembler uses.
+        if trim_in > 0.0005:
+            cmd += ["-ss", f"{trim_in:.6f}"]
+        cmd += ["-map", "0:v:0", "-frames:v", "1", str(out)]
         try:
             # This runs on the GUI thread because the queue bridge needs the frame
             # path before it can construct the job. Bound it so a damaged/odd video
@@ -3065,7 +3075,11 @@ class MainWindow(QMainWindow):
                     if not next_output or not Path(next_output).is_file():
                         QMessageBox.warning(self, "Timeline bridge", f"{clip_name} has no valid next timeline result to use as its end anchor.")
                         return False
-                    anchor = self._extract_timeline_first_frame(next_output, clip_id)
+                    anchor = self._extract_timeline_first_frame(
+                        next_output,
+                        clip_id,
+                        spec.get("timeline_next_trim_in") or 0.0,
+                    )
                     if not anchor:
                         return False
                     settings["last"] = anchor

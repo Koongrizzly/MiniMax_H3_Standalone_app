@@ -4516,11 +4516,21 @@ class TimelineTab(QWidget):
                 spec["timeline_previous_status"] = str(prev.get("status") or "")
                 spec["timeline_previous_stale"] = False
                 spec["timeline_previous_is_source"] = str(prev.get("generation_mode") or "") == "source"
+                # Preserve the predecessor's visible boundary metadata so queue-side
+                # bridge helpers can resolve against the effective timeline clip,
+                # not blindly against source frame 0 / the untrimmed source end.
+                spec["timeline_previous_trim_in"] = prev.get("trim_in")
+                spec["timeline_previous_trim_out"] = prev.get("trim_out")
             if i + 1 < len(clips):
                 nxt = clips[i + 1]
                 spec["timeline_next_output"] = str(nxt.get("output") or "")
                 spec["timeline_next_status"] = str(nxt.get("status") or "")
                 spec["timeline_next_stale"] = False
+                # Anchor-next replacement mode must land on the visible start of
+                # the next clip. When that next clip is trimmed, frame 0 of the
+                # source file is no longer the correct destination.
+                spec["timeline_next_trim_in"] = nxt.get("trim_in")
+                spec["timeline_next_trim_out"] = nxt.get("trim_out")
             specs.append(spec)
         return specs
 
