@@ -1288,6 +1288,7 @@ class MainWindow(QMainWindow):
         self.continue_video = VideoPathRow("optional source video to continue")
         self.continue_context = QComboBox()
         for n in (22, 39, 56, 73, 90, 107): self.continue_context.addItem(f"{n} history frames ({n/24:.2f} s)", n)
+        self.continue_context.setCurrentIndex(4)
         self.continue_context.setCurrentIndex(1)
         self.latent_continuation = QCheckBox("Use latent continuation (experimental/beta test)")
         self.latent_continuation.setChecked(False)
@@ -2710,7 +2711,7 @@ class MainWindow(QMainWindow):
         else:
             continue_source=str(job.get("manual_continue_video") or "")
         if continue_source:
-            run_args += ["--continue-video", continue_source, "--continue-context-frames", str(int(job.get("continue_context_frames") or 39))]
+            run_args += ["--continue-video", continue_source, "--continue-context-frames", str(int(job.get("continue_context_frames") or 90))]
             if job.get("continue_last_result") and job.get("continue_audio_memory"):
                 run_args += ["--continue-audio-memory"]
             if job.get("latent_continuation"):
@@ -3389,10 +3390,11 @@ class MainWindow(QMainWindow):
         has_trim = False
         has_volume_adjustment = False
         has_audio_fade = False
+        has_video_edge_fade = False
         has_speed_adjustment = False
         has_transition = False
         has_loaded_media = any(str(c.get("generation_mode") or "") == "loaded" for c in clips)
-        for clip, path in zip(clips, outputs):
+        for clip_index, (clip, path) in enumerate(zip(clips, outputs)):
             try:
                 user_trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
             except Exception:
@@ -3449,16 +3451,25 @@ class MainWindow(QMainWindow):
             except Exception:
                 audio_fade_out_seconds = 0.0
             has_audio_fade = has_audio_fade or audio_fade_in_seconds > 0.0005 or audio_fade_out_seconds > 0.0005
+            try:
+                video_fade_in_seconds = max(0.0, min(final_duration, float(clip.get("video_fade_in_seconds") or 0.0))) if clip_index == 0 else 0.0
+            except Exception:
+                video_fade_in_seconds = 0.0
+            try:
+                video_fade_out_seconds = max(0.0, min(final_duration, float(clip.get("video_fade_out_seconds") or 0.0))) if clip_index == len(clips) - 1 else 0.0
+            except Exception:
+                video_fade_out_seconds = 0.0
+            has_video_edge_fade = has_video_edge_fade or video_fade_in_seconds > 0.0005 or video_fade_out_seconds > 0.0005
             has_speed_adjustment = has_speed_adjustment or abs(speed_multiplier - 1.0) > 0.0001
             transition_name = str(clip.get("transition_to_next") or "none").strip().lower()
             has_transition = has_transition or transition_name not in {"", "none"}
-            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds))
+            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
 
         # The concat recipe remains useful for the unchanged fast stream-copy path.
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media:
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media:
             # Re-encode when Timeline editing requires it, or whenever a ready-made
             # external clip is present. Imported media may use different codecs,
             # frame rates or audio formats, so normalize it to the same 24-fps /
@@ -3481,7 +3492,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return False
 
-            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds in trim_specs:
+            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in trim_specs:
                 # Input-side seek is used for ordinary user trims. For the special
                 # continuation seam fix we intentionally start at source time zero
                 # and decode one extra frame, because frame 0 itself is discarded
@@ -3490,7 +3501,7 @@ class MainWindow(QMainWindow):
                     args += ["-ss", f"{trim_in:.6f}"]
                 read_duration = effective_duration + ((1.0 / 24.0) if exact_drop_first_frame else 0.0)
                 args += ["-t", f"{read_duration:.6f}", "-i", str(path)]
-                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds))
+                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
 
             filter_parts = []
             synthetic_audio_inputs = []
@@ -3502,7 +3513,7 @@ class MainWindow(QMainWindow):
             # stream and 48-kHz stereo audio stream. xfade is strict about frame
             # rate/timebase/geometry compatibility, so normalizing here keeps the
             # transition path deterministic while leaving source MP4s untouched.
-            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds in input_meta:
+            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in input_meta:
                 final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
                 final_durations.append(final_duration)
                 vlabel = f"v{i}"
@@ -3520,6 +3531,11 @@ class MainWindow(QMainWindow):
                         f",pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2"
                     )
                 vchain += ",format=yuv420p"
+                if video_fade_in_seconds > 0.0005:
+                    vchain += f",fade=t=in:st=0:d={video_fade_in_seconds:.6f}:color=black"
+                if video_fade_out_seconds > 0.0005:
+                    fade_out_start = max(0.0, final_duration - video_fade_out_seconds)
+                    vchain += f",fade=t=out:st={fade_out_start:.6f}:d={video_fade_out_seconds:.6f}:color=black"
                 filter_parts.append(vchain + f"[{vlabel}]")
                 video_labels.append(vlabel)
 
@@ -4353,7 +4369,7 @@ class MainWindow(QMainWindow):
         self.continue_video.setToolTip("Native H3 FL2VA continuation. The model receives a VAE-encoded block of preceding motion plus the source video's final frame as the exact boundary anchor; this is not last-frame-only I2V.")
         self.glue_results.setToolTip("When enabled, keep the complete source video first and append the newly generated continuation after it. No continuation overlap frames are trimmed from either clip during the glue step.")
         self.continue_last_result.setToolTip("Ignore the manual Continue video field and use the exact previous queue job as this job's continuation source. Pending chained jobs wait for that specific job to finish; the output folder is never scanned for the newest file.")
-        self.continue_context.setToolTip("How much motion history H3 receives before the separate final-frame boundary anchor. With Use latent continuation OFF this history is rebuilt from decoded source-video frames. With it ON the same history duration is taken directly from the saved H3 latent when available. Values use H3's native 17k+5 temporal grid. 39 history frames (~1.63 s) is the default.")
+        self.continue_context.setToolTip("How much motion history H3 receives before the separate final-frame boundary anchor. With Use latent continuation OFF this history is rebuilt from decoded source-video frames. With it ON the same history duration is taken directly from the saved H3 latent when available. Values use H3's native 17k+5 temporal grid. 90 history frames (~3.75 s) is the default.")
         self.ref_size.setToolTip(
             "How Ref2VA prepares reference images. 'match' follows the generation/reference sizing behavior; "
             "'max' uses the maximum reference sizing path. Default: match."
@@ -5047,7 +5063,7 @@ class MainWindow(QMainWindow):
         return {
             "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "widescreen_quality": self.widescreen_quality.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
-            "continue_video": "" if self.continue_last_result.isChecked() else self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
+            "continue_video": "" if self.continue_last_result.isChecked() else self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 90),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(), "latent_continuation": self.latent_continuation.isChecked(),
             "combine_frames_latent": self.combine_frames_latent.isChecked(),
@@ -5103,7 +5119,7 @@ class MainWindow(QMainWindow):
             # toggle state first, then restore the mutually exclusive manual source.
             self.continue_last_result.setChecked(continue_last_setting)
             self.continue_video.edit.setText("" if continue_last_setting else d.get("continue_video", ""))
-            ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
+            ctx=int(d.get("continue_context_frames",90)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 4)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self.combine_frames_latent.setChecked(bool(d.get("combine_frames_latent", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
@@ -5462,6 +5478,138 @@ class MainWindow(QMainWindow):
             return
         self._install_update(payload)
 
+    def _write_external_update_launcher(self, payload):
+        """Stage a detached Windows updater that replaces files only after this GUI exits."""
+        source_root = Path(payload.get("source_root") or "")
+        temp_dir = Path(payload.get("temp_dir") or "")
+        changed = [str(rel).replace("\\", "/") for rel in (payload.get("changed") or []) if self._update_rel_allowed(rel)]
+        if not source_root.is_dir() or not temp_dir.is_dir():
+            raise RuntimeError("The downloaded update staging folder is no longer available.")
+        if not changed:
+            raise RuntimeError("The update contains no eligible changed application files.")
+
+        launcher_dir = Path(tempfile.mkdtemp(prefix="grizzlymax_updater_"))
+        ps1_path = launcher_dir / "grizzlymax_update.ps1"
+        bat_path = launcher_dir / "update.bat"
+        state_stage = temp_dir / "installed_update_state.json"
+        state = {
+            "repository": APP_UPDATE_REPO,
+            "commit": payload.get("commit", ""),
+            "installed_at": datetime.now().isoformat(timespec="seconds"),
+            "files": payload.get("manifest", []),
+        }
+        state_stage.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        updater_payload = launcher_dir / "update_payload.json"
+        updater_payload.write_text(json.dumps({
+            "parent_pid": int(os.getpid()),
+            "app_root": str(ROOT.resolve()),
+            "source_root": str(source_root.resolve()),
+            "download_temp": str(temp_dir.resolve()),
+            "state_stage": str(state_stage.resolve()),
+            "state_destination": str(APP_UPDATE_STATE.resolve()),
+            "start_bat": str((ROOT / "start.bat").resolve()),
+            "python_exe": str(PYTHON.resolve()),
+            "gui_script": str(Path(__file__).resolve()),
+            "changed": changed,
+        }, indent=2), encoding="utf-8")
+
+        ps1 = r'''param([Parameter(Mandatory=$true)][string]$PayloadPath)
+$ErrorActionPreference = 'Stop'
+$data = Get-Content -LiteralPath $PayloadPath -Raw | ConvertFrom-Json
+$parentPid = [int]$data.parent_pid
+$appRoot = [string]$data.app_root
+$sourceRoot = [string]$data.source_root
+$downloadTemp = [string]$data.download_temp
+$stateStage = [string]$data.state_stage
+$stateDestination = [string]$data.state_destination
+$startBat = [string]$data.start_bat
+$pythonExe = [string]$data.python_exe
+$guiScript = [string]$data.gui_script
+$logDir = Join-Path $appRoot 'logs'
+$logPath = Join-Path $logDir 'app_update_last.log'
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+"[$(Get-Date -Format s)] External updater started. Waiting for GUI PID $parentPid." | Set-Content -LiteralPath $logPath -Encoding UTF8
+$deadline = (Get-Date).AddSeconds(120)
+while ((Get-Date) -lt $deadline) {
+    $proc = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+    if ($null -eq $proc) { break }
+    Start-Sleep -Milliseconds 250
+}
+if (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) {
+    throw "MiniMax H3 Standalone did not close within 120 seconds."
+}
+Start-Sleep -Milliseconds 500
+$count = 0
+foreach ($relValue in $data.changed) {
+    $rel = [string]$relValue
+    $nativeRel = $rel.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $src = Join-Path $sourceRoot $nativeRel
+    $dst = Join-Path $appRoot $nativeRel
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "Update source file is missing: $rel" }
+    $dstDir = Split-Path -Parent $dst
+    if ($dstDir) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
+    $copied = $false
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 30; $attempt++) {
+        try {
+            $tmp = "$dst.update_tmp"
+            Copy-Item -LiteralPath $src -Destination $tmp -Force
+            Move-Item -LiteralPath $tmp -Destination $dst -Force
+            $copied = $true
+            break
+        } catch {
+            $lastError = $_.Exception.Message
+            Remove-Item -LiteralPath "$dst.update_tmp" -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    if (-not $copied) { throw "Could not replace $rel after 30 attempts. $lastError" }
+    $count++
+    "[$(Get-Date -Format s)] Updated: $rel" | Add-Content -LiteralPath $logPath -Encoding UTF8
+}
+$stateDir = Split-Path -Parent $stateDestination
+if ($stateDir) { New-Item -ItemType Directory -Force -Path $stateDir | Out-Null }
+Copy-Item -LiteralPath $stateStage -Destination $stateDestination -Force
+"[$(Get-Date -Format s)] Update complete: $count file(s)." | Add-Content -LiteralPath $logPath -Encoding UTF8
+Remove-Item -LiteralPath $downloadTemp -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $startBat -PathType Leaf) {
+    Start-Process -FilePath $startBat -WorkingDirectory $appRoot
+} elseif (Test-Path -LiteralPath $pythonExe -PathType Leaf) {
+    Start-Process -FilePath $pythonExe -ArgumentList @($guiScript) -WorkingDirectory $appRoot
+} else {
+    throw "Update installed, but neither start.bat nor the bundled Python executable could be found for restart."
+}
+"[$(Get-Date -Format s)] Restart launched." | Add-Content -LiteralPath $logPath -Encoding UTF8
+$launcherDir = Split-Path -Parent $PayloadPath
+$cleanupCommand = 'ping 127.0.0.1 -n 3 >nul & rmdir /s /q "' + $launcherDir + '"'
+Start-Process -WindowStyle Hidden -FilePath 'cmd.exe' -ArgumentList @('/c', $cleanupCommand)
+'''
+        ps1_path.write_text(ps1, encoding="utf-8-sig")
+
+        bat = r'''@echo off
+setlocal
+title GrizzlyMax MiniMax H3 Updater
+echo.
+echo GrizzlyMax updater is waiting for MiniMax H3 Standalone to close...
+echo Do not close this window while files are being updated.
+echo.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0grizzlymax_update.ps1" -PayloadPath "%~dp0update_payload.json"
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" (
+  echo.
+  echo ================================================================
+  echo UPDATE FAILED. No automatic restart was attempted.
+  echo Check logs\app_update_last.log in the application folder.
+  echo ================================================================
+  echo.
+  pause
+)
+exit /b %RC%
+'''
+        bat_path.write_text(bat, encoding="utf-8")
+        return bat_path
+
     def _install_update(self, payload):
         if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(
@@ -5471,6 +5619,31 @@ class MainWindow(QMainWindow):
             )
             self._cleanup_update_payload(payload)
             return
+
+        if os.name == "nt":
+            try:
+                updater_bat = self._write_external_update_launcher(payload)
+                self.save_last()
+                self.status.setText("Update prepared — closing app so the external updater can install it…")
+                flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                subprocess.Popen(
+                    ["cmd.exe", "/c", str(updater_bat)],
+                    cwd=str(updater_bat.parent),
+                    creationflags=flags,
+                )
+                if payload is self._update_payload:
+                    self._update_payload = None
+                QApplication.instance().quit()
+                return
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Application update",
+                    f"The external updater could not be started.\n\n{type(exc).__name__}: {exc}"
+                )
+                self._cleanup_update_payload(payload)
+                return
+
         source_root = Path(payload["source_root"])
         changed = payload.get("changed", [])
         try:
@@ -5503,7 +5676,7 @@ class MainWindow(QMainWindow):
         restart = QMessageBox.question(
             self,
             "Application update installed",
-            "The update was installed successfully and the temporary download folder was cleaned.\n\nRestart MiniMax H3 Standalone now?",
+            "The update was installed successfully.\n\nRestart MiniMax H3 Standalone now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
@@ -5512,10 +5685,7 @@ class MainWindow(QMainWindow):
             start_bat = ROOT / "start.bat"
             try:
                 if start_bat.is_file():
-                    if os.name == "nt" and hasattr(os, "startfile"):
-                        os.startfile(str(start_bat))
-                    else:
-                        subprocess.Popen([str(start_bat)], cwd=str(ROOT))
+                    subprocess.Popen([str(start_bat)], cwd=str(ROOT))
                 else:
                     subprocess.Popen([str(PYTHON), str(Path(__file__).resolve())], cwd=str(ROOT))
                 QApplication.instance().quit()
@@ -5680,7 +5850,7 @@ class MainWindow(QMainWindow):
         else:
             model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
             model_label=Path(model_path).name if model_path else ("Ref2VA default" if mode==2 else "FL2VA default")
-        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 39) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation),"combine_frames_latent":bool(combine_frames_latent)}
+        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 90) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation),"combine_frames_latent":bool(combine_frames_latent)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         self._start_next_pending()
 

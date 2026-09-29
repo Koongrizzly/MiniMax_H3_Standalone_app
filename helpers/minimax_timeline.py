@@ -4536,6 +4536,16 @@ class TimelineTab(QWidget):
         volume_action = menu.addAction(f"Volume…  {int(round(float(clip.get('volume_percent', 100) or 100)))}%")
         fade_in_action = menu.addAction(f"Audio fade in…  {max(0.0, float(clip.get('audio_fade_in_seconds') or 0.0)):.1f}s")
         fade_out_action = menu.addAction(f"Audio fade out…  {max(0.0, float(clip.get('audio_fade_out_seconds') or 0.0)):.1f}s")
+        video_fade_in_action = None
+        video_fade_out_action = None
+        if idx == 0:
+            video_fade_in_action = menu.addAction(
+                f"Video fade in from black…  {max(0.0, float(clip.get('video_fade_in_seconds') or 0.0)):.1f}s"
+            )
+        if idx == len(self._clips()) - 1:
+            video_fade_out_action = menu.addAction(
+                f"Video fade out to black…  {max(0.0, float(clip.get('video_fade_out_seconds') or 0.0)):.1f}s"
+            )
         speed_action = menu.addAction(f"Speed…  {_clip_speed(clip):.1f}x")
         transition_name = _transition_name(clip)
         transition_suffix = "" if transition_name == "none" else f"  {_TRANSITION_LABELS.get(transition_name, transition_name)} {_transition_requested_seconds(clip):.1f}s"
@@ -4589,6 +4599,10 @@ class TimelineTab(QWidget):
             self._set_clip_audio_fade_by_id(clip_id, "in")
         elif chosen is fade_out_action:
             self._set_clip_audio_fade_by_id(clip_id, "out")
+        elif video_fade_in_action is not None and chosen is video_fade_in_action:
+            self._set_clip_video_edge_fade_by_id(clip_id, "in")
+        elif video_fade_out_action is not None and chosen is video_fade_out_action:
+            self._set_clip_video_edge_fade_by_id(clip_id, "out")
         elif chosen is speed_action:
             self._set_clip_speed_by_id(clip_id)
         elif chosen is transition_action:
@@ -4873,6 +4887,53 @@ class TimelineTab(QWidget):
             return False
         key = "audio_fade_in_seconds" if str(direction).lower() == "in" else "audio_fade_out_seconds"
         label = "Audio fade in" if key == "audio_fade_in_seconds" else "Audio fade out"
+        try:
+            current = max(0.0, float(clip.get(key) or 0.0))
+        except Exception:
+            current = 0.0
+        try:
+            duration = max(0.001, float(_clip_timeline_seconds(clip)))
+        except Exception:
+            duration = max(0.001, float(clip.get("frames") or 24) / FPS)
+        value, accepted = QInputDialog.getDouble(
+            self,
+            label,
+            "Fade duration in assembled video (seconds; 0 disables the fade):",
+            min(current, duration),
+            0.0,
+            duration,
+            3,
+        )
+        if not accepted:
+            return False
+        value = max(0.0, min(duration, float(value)))
+        if abs(value - current) < 0.0005:
+            return True
+        self._record_undo_state(f"Change {label.lower()}")
+        if value <= 0.0005:
+            clip.pop(key, None)
+        else:
+            clip[key] = round(value, 3)
+        self._invalidate_assembly(f"{label} changed — assemble again.")
+        self._refresh_all()
+        return True
+
+    def _set_clip_video_edge_fade_by_id(self, clip_id, direction):
+        idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        direction = str(direction).lower()
+        clips = self._clips()
+        if direction == "in":
+            if idx != 0:
+                return False
+            key = "video_fade_in_seconds"
+            label = "Video fade in from black"
+        else:
+            if idx != len(clips) - 1:
+                return False
+            key = "video_fade_out_seconds"
+            label = "Video fade out to black"
         try:
             current = max(0.0, float(clip.get(key) or 0.0))
         except Exception:
