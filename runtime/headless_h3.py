@@ -382,7 +382,7 @@ def _load_continue_latent_payload(path, width, height):
     return video.detach().cpu().contiguous(), (audio.detach().cpu().contiguous() if isinstance(audio,torch.Tensor) else None), payload
 
 
-def prepare_latent_continue_history(path, width, height, continue_context_frames=39):
+def prepare_latent_continue_history(path, width, height, continue_context_frames=90):
     video,_audio,payload=_load_continue_latent_payload(path,width,height)
     requested=max(5,int(continue_context_frames))
     k=max(0,round((requested-5)/17.0)); history_frames=17*k+5
@@ -412,7 +412,7 @@ def prepare_audio_latent_continue_conditioning(path, audio_context_frames=24, fp
     return [{'anchor':'history','latent_frame_count':int(tail.shape[-1]),'latent':tail}]
 
 
-def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=None, last_frame=None, continue_video=None, continue_context_frames=39, continue_latent=None, combine_frames_latent=False):
+def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=None, last_frame=None, continue_video=None, continue_context_frames=90, continue_latent=None, combine_frames_latent=False):
     """Encode FL2VA image anchors and optional native temporal continuation history.
 
     Continue-video conditioning follows H3's model-facing scheme: a temporal block from
@@ -487,12 +487,21 @@ def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=
                 # Prevent the common history block below from being encoded a second time.
                 history=None
             else:
-                # Native latent-only memory still keeps the exact final RGB frame
-                # as the first-frame boundary anchor.
-                tail=_load_video_tail_24(continue_video,1)
+                # True native latent continuation: use the exact tail produced by
+                # the previous H3 sample as the frame-0 guide. Do NOT decode the
+                # MP4's final RGB frame and VAE-encode it again here; that defeats
+                # the point of latent chaining and can compound colour/contrast
+                # shifts from clip to clip. This mirrors the native Add Guide style
+                # used by the reference latent-continuation workflow.
                 history=None
-                boundary=tail[-1:]
-                keyframes.append(latent_history)
+                boundary=None
+                keyframes.append({
+                    "resolved_frame_index": 0,
+                    "latent": latent_history["latent"],
+                    "latent_frame_count": int(latent_history["latent"].shape[2]),
+                    "source_frame_count": int(latent_history.get("source_frame_count") or history_frames),
+                    "anchor": "native_latent_guide",
+                })
         else:
             tail=_load_video_tail_24(continue_video,history_frames+1)
             available=int(tail.shape[0])
@@ -509,20 +518,25 @@ def prepare_keyframe_conditioning(video_vae, width, height, frames, first_frame=
                     # history block; use only their final frame as the boundary anchor.
                     history=None
                 boundary=tail[-1:]
-        tail=_resize_video_frames(tail,width,height,"center")
-        boundary=_resize_video_frames(boundary,width,height,"center")
-        if history is not None:
-            history=_resize_video_frames(history,width,height,"center")
-            history_latent=_encode_continue_history(video_vae, history)
-            keyframes.append({"anchor":"history","latent_frame_count":int(history_latent.shape[2]),"source_frame_count":int(history.shape[0]),"latent":history_latent})
-        images.append(boundary)
-        with torch.inference_mode():
-            boundary_latent=video_vae.encode(boundary)
-        keyframes.append({"anchor":"first","resolved_frame_index":0,"latent_frame_count":int(boundary_latent.shape[2]),"latent":boundary_latent})
+        # Decoded-frame continuation still uses its proven history + explicit
+        # visible final-frame boundary. Combined mode keeps that same boundary
+        # for now because it is explicitly experimental. Native latent-only mode
+        # above deliberately has no RGB boundary round-trip at all.
+        if latent_history is None or combine_frames_latent:
+            tail=_resize_video_frames(tail,width,height,"center")
+            boundary=_resize_video_frames(boundary,width,height,"center")
+            if history is not None:
+                history=_resize_video_frames(history,width,height,"center")
+                history_latent=_encode_continue_history(video_vae, history)
+                keyframes.append({"anchor":"history","latent_frame_count":int(history_latent.shape[2]),"source_frame_count":int(history.shape[0]),"latent":history_latent})
+            images.append(boundary)
+            with torch.inference_mode():
+                boundary_latent=video_vae.encode(boundary)
+            keyframes.append({"anchor":"first","resolved_frame_index":0,"latent_frame_count":int(boundary_latent.shape[2]),"latent":boundary_latent})
         if latent_history is not None and combine_frames_latent:
             history_desc="saved H3 latent + decoded-frame memory (50/50 latent blend)"
         else:
-            history_desc='saved H3 latent' if latent_history is not None else (0 if history is None else int(history.shape[0]))
+            history_desc='saved H3 latent (native guide, no RGB round-trip)' if latent_history is not None else (0 if history is None else int(history.shape[0]))
         print(f"FL2VA continuation context: source={Path(continue_video).name} | history={history_desc} | boundary=final source frame | temporal grid=17k+5", flush=True)
     elif first_frame:
         img=load_image(first_frame)
