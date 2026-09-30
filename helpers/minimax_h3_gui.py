@@ -1289,7 +1289,6 @@ class MainWindow(QMainWindow):
         self.continue_context = QComboBox()
         for n in (22, 39, 56, 73, 90, 107): self.continue_context.addItem(f"{n} history frames ({n/24:.2f} s)", n)
         self.continue_context.setCurrentIndex(4)
-        self.continue_context.setCurrentIndex(1)
         self.latent_continuation = QCheckBox("Use latent continuation (experimental/beta test)")
         self.latent_continuation.setChecked(False)
         self.latent_continuation.setToolTip(
@@ -2988,7 +2987,7 @@ class MainWindow(QMainWindow):
                     # a missing setting defaults to latent continuation ON. If the
                     # user explicitly turns it OFF, generate.py follows the decoded
                     # frame-memory continuation path instead.
-                    settings["latent_continuation"] = bool(settings.get("latent_continuation", True))
+                    settings["latent_continuation"] = bool(settings.get("latent_continuation", False))
 
                     if single_regen:
                         # A middle-clip replacement must continue from the exact
@@ -3310,6 +3309,50 @@ class MainWindow(QMainWindow):
         def ffconcat_path(path):
             return str(path.resolve()).replace("\\", "/").replace("'", "\\'")
 
+        def _sample_boundary_rgb_stats(path, start_seconds, duration_seconds):
+            """Return low-resolution RGB/luma mean+std for a short source window.
+
+            This is intentionally lightweight and uses FFmpeg rawvideo output so the
+            assembly path has no Pillow/OpenCV/Numpy dependency. 64x64 is enough for
+            robust photometric statistics while ignoring fine image detail.
+            """
+            try:
+                ffmpeg = ffmpeg_tool_path("ffmpeg.exe")
+                start_seconds = max(0.0, float(start_seconds or 0.0))
+                duration_seconds = max(1.0 / 24.0, float(duration_seconds or 0.0))
+                cmd = [
+                    str(ffmpeg), "-v", "error", "-ss", f"{start_seconds:.6f}",
+                    "-t", f"{duration_seconds:.6f}", "-i", str(path), "-an",
+                    "-vf", "fps=24,scale=64:64:flags=area,format=rgb24",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                ]
+                cp = subprocess.run(
+                    cmd, capture_output=True, timeout=12,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                raw = cp.stdout or b""
+                if cp.returncode != 0 or len(raw) < 64 * 64 * 3:
+                    return None
+                count = len(raw) // 3
+                sums = [0.0, 0.0, 0.0]
+                sums2 = [0.0, 0.0, 0.0]
+                lsum = 0.0
+                lsum2 = 0.0
+                usable = count * 3
+                for off in range(0, usable, 3):
+                    r = raw[off]; g = raw[off + 1]; b = raw[off + 2]
+                    sums[0] += r; sums[1] += g; sums[2] += b
+                    sums2[0] += r * r; sums2[1] += g * g; sums2[2] += b * b
+                    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                    lsum += y; lsum2 += y * y
+                means = [v / count for v in sums]
+                stds = [max(0.0, sums2[i] / count - means[i] * means[i]) ** 0.5 for i in range(3)]
+                lmean = lsum / count
+                lstd = max(0.0, lsum2 / count - lmean * lmean) ** 0.5
+                return {"mean": means, "std": stds, "lmean": lmean, "lstd": lstd}
+            except Exception:
+                return None
+
         soundtrack_mode = str((project or {}).get("soundtrack_mode") or "mix")
         if soundtrack_mode not in {"mix", "clips_only", "soundtrack_only"}:
             soundtrack_mode = "mix"
@@ -3464,11 +3507,75 @@ class MainWindow(QMainWindow):
             has_transition = has_transition or transition_name not in {"", "none"}
             trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
 
+        # Continuation generations can begin with a small but very visible
+        # photometric jump even when geometry/motion are continuous. Measure a
+        # short window on both sides of each continuation boundary and derive a
+        # conservative RGB mean + luma contrast correction. During assembly the
+        # correction is strongest on the first visible frame of the new clip and
+        # smoothly fades away over 0.75 s, so later intentional lighting changes
+        # remain untouched. Source clips are never modified.
+        seam_color_corrections = {}
+        seam_sample_seconds = 8.0 / 24.0
+        for i in range(1, len(trim_specs)):
+            cur_clip = trim_specs[i][0]
+            if str(cur_clip.get("generation_mode") or "new") != "continue":
+                continue
+            prev_spec = trim_specs[i - 1]
+            cur_spec = trim_specs[i]
+            prev_path = prev_spec[1]
+            cur_path = cur_spec[1]
+            try:
+                prev_end = float(prev_spec[3])
+            except Exception:
+                prev_end = float(self._probe_clip_duration(str(prev_path), prev_spec[0].get("frames")) or 0.0)
+            cur_start = (1.0 / 24.0) if bool(cur_spec[7]) else max(0.0, float(cur_spec[2] or 0.0))
+            prev_stats = _sample_boundary_rgb_stats(
+                prev_path, max(0.0, prev_end - seam_sample_seconds), seam_sample_seconds
+            )
+            cur_stats = _sample_boundary_rgb_stats(cur_path, cur_start, seam_sample_seconds)
+            if not prev_stats or not cur_stats:
+                continue
+
+            gains = []
+            for target_mean, source_mean in zip(prev_stats["mean"], cur_stats["mean"]):
+                if source_mean <= 1.0:
+                    gain = 1.0
+                else:
+                    gain = target_mean / source_mean
+                gains.append(max(0.90, min(1.10, gain)))
+
+            source_lstd = max(1.0, float(cur_stats["lstd"]))
+            contrast = max(0.92, min(1.08, float(prev_stats["lstd"]) / source_lstd))
+            # Estimate the post-channel-gain luma mean, then compensate the small
+            # mean shift introduced by FFmpeg's contrast transform around 0.5.
+            adjusted_lmean = (
+                0.2126 * cur_stats["mean"][0] * gains[0]
+                + 0.7152 * cur_stats["mean"][1] * gains[1]
+                + 0.0722 * cur_stats["mean"][2] * gains[2]
+            ) / 255.0
+            target_lmean = float(prev_stats["lmean"]) / 255.0
+            brightness = target_lmean - (contrast * (adjusted_lmean - 0.5) + 0.5)
+            brightness = max(-0.08, min(0.08, brightness))
+
+            # Skip microscopic corrections that cannot produce a visible seam.
+            if (
+                max(abs(g - 1.0) for g in gains) < 0.003
+                and abs(contrast - 1.0) < 0.005
+                and abs(brightness) < 0.002
+            ):
+                continue
+            seam_color_corrections[i] = {
+                "r": gains[0], "g": gains[1], "b": gains[2],
+                "contrast": contrast, "brightness": brightness,
+                "fade_seconds": 0.75,
+            }
+        has_seam_color_match = bool(seam_color_corrections)
+
         # The concat recipe remains useful for the unchanged fast stream-copy path.
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media:
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media or has_seam_color_match:
             # Re-encode when Timeline editing requires it, or whenever a ready-made
             # external clip is present. Imported media may use different codecs,
             # frame rates or audio formats, so normalize it to the same 24-fps /
@@ -3530,12 +3637,48 @@ class MainWindow(QMainWindow):
                         f",pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2"
                     )
                 vchain += ",format=yuv420p"
-                if video_fade_in_seconds > 0.0005:
-                    vchain += f",fade=t=in:st=0:d={video_fade_in_seconds:.6f}:color=black"
-                if video_fade_out_seconds > 0.0005:
-                    fade_out_start = max(0.0, final_duration - video_fade_out_seconds)
-                    vchain += f",fade=t=out:st={fade_out_start:.6f}:d={video_fade_out_seconds:.6f}:color=black"
-                filter_parts.append(vchain + f"[{vlabel}]")
+                correction = seam_color_corrections.get(i)
+                if correction:
+                    base_label = f"vbase{i}"
+                    orig_label = f"vorig{i}"
+                    corr_src_label = f"vcsrc{i}"
+                    corr_label = f"vcorr{i}"
+                    filter_parts.append(vchain + f"[{base_label}]")
+                    filter_parts.append(f"[{base_label}]split=2[{orig_label}][{corr_src_label}]")
+                    filter_parts.append(
+                        f"[{corr_src_label}]"
+                        f"colorchannelmixer=rr={correction['r']:.6f}:gg={correction['g']:.6f}:bb={correction['b']:.6f},"
+                        f"eq=contrast={correction['contrast']:.6f}:brightness={correction['brightness']:.6f}"
+                        f"[{corr_label}]"
+                    )
+                    fade_seconds = max(0.05, min(final_duration, float(correction.get('fade_seconds') or 0.75)))
+                    filter_parts.append(
+                        f"[{corr_label}][{orig_label}]"
+                        f"blend=all_expr='if(lt(T,{fade_seconds:.6f}),"
+                        f"A*(1-T/{fade_seconds:.6f})+B*(T/{fade_seconds:.6f}),B)':shortest=1"
+                        f"[{vlabel}]"
+                    )
+                    # Edge fades are applied after color matching so black remains
+                    # neutral and is never tinted by an RGB correction.
+                    if video_fade_in_seconds > 0.0005 or video_fade_out_seconds > 0.0005:
+                        faded_label = f"vfaded{i}"
+                        fade_chain = f"[{vlabel}]"
+                        if video_fade_in_seconds > 0.0005:
+                            fade_chain += f"fade=t=in:st=0:d={video_fade_in_seconds:.6f}:color=black"
+                        if video_fade_out_seconds > 0.0005:
+                            if not fade_chain.endswith(']'):
+                                fade_chain += ','
+                            fade_out_start = max(0.0, final_duration - video_fade_out_seconds)
+                            fade_chain += f"fade=t=out:st={fade_out_start:.6f}:d={video_fade_out_seconds:.6f}:color=black"
+                        filter_parts.append(fade_chain + f"[{faded_label}]")
+                        vlabel = faded_label
+                else:
+                    if video_fade_in_seconds > 0.0005:
+                        vchain += f",fade=t=in:st=0:d={video_fade_in_seconds:.6f}:color=black"
+                    if video_fade_out_seconds > 0.0005:
+                        fade_out_start = max(0.0, final_duration - video_fade_out_seconds)
+                        vchain += f",fade=t=out:st={fade_out_start:.6f}:d={video_fade_out_seconds:.6f}:color=black"
+                    filter_parts.append(vchain + f"[{vlabel}]")
                 video_labels.append(vlabel)
 
                 if has_audio:
@@ -3777,6 +3920,7 @@ class MainWindow(QMainWindow):
             "timeline_soundtrack_mode": soundtrack_mode,
             "timeline_assembly_clip_count": len(outputs),
             "timeline_assembly_soundtrack_count": len(soundtrack_specs),
+            "timeline_assembly_seam_color_matches": len(seam_color_corrections),
             "timeline_assembly_soundtrack": copy.deepcopy(list((project or {}).get("soundtrack_clips") or [])),
         }
         self.queue_jobs.append(job)

@@ -2586,8 +2586,8 @@ class TimelineTab(QWidget):
             # Old projects may still contain glue_results=True. Timeline no longer
             # exposes or honors that flag; clips remain separate until assembly.
             settings["glue_results"] = False
-            self.audio_memory_check.setChecked(bool(settings.get("continue_audio_memory", True)))
-            self.latent_continuation_check.setChecked(bool(settings.get("latent_continuation", True)))
+            self.audio_memory_check.setChecked(bool(settings.get("continue_audio_memory", False)))
+            self.latent_continuation_check.setChecked(bool(settings.get("latent_continuation", False)))
             # Latent continuation only affects clips that actually continue from a
             # previous Timeline result. Keep it visible so the choice is obvious,
             # but disable it when it cannot affect generation.
