@@ -3309,49 +3309,103 @@ class MainWindow(QMainWindow):
         def ffconcat_path(path):
             return str(path.resolve()).replace("\\", "/").replace("'", "\\'")
 
-        def _sample_boundary_rgb_stats(path, start_seconds, duration_seconds):
-            """Return low-resolution RGB/luma mean+std for a short source window.
-
-            This is intentionally lightweight and uses FFmpeg rawvideo output so the
-            assembly path has no Pillow/OpenCV/Numpy dependency. 64x64 is enough for
-            robust photometric statistics while ignoring fine image detail.
-            """
+        def _sample_boundary_gray_frames(path, start_seconds, frame_count):
+            """Decode up to frame_count tiny grayscale frames at 24 fps."""
             try:
                 ffmpeg = ffmpeg_tool_path("ffmpeg.exe")
                 start_seconds = max(0.0, float(start_seconds or 0.0))
-                duration_seconds = max(1.0 / 24.0, float(duration_seconds or 0.0))
+                frame_count = max(1, int(frame_count or 1))
                 cmd = [
-                    str(ffmpeg), "-v", "error", "-ss", f"{start_seconds:.6f}",
-                    "-t", f"{duration_seconds:.6f}", "-i", str(path), "-an",
-                    "-vf", "fps=24,scale=64:64:flags=area,format=rgb24",
-                    "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                    str(ffmpeg), "-v", "error", "-i", str(path),
+                    "-ss", f"{start_seconds:.6f}", "-frames:v", str(frame_count), "-an",
+                    "-vf", "fps=24,scale=64:64:flags=area,format=gray",
+                    "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
                 ]
                 cp = subprocess.run(
-                    cmd, capture_output=True, timeout=12,
+                    cmd, capture_output=True, timeout=15,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 raw = cp.stdout or b""
-                if cp.returncode != 0 or len(raw) < 64 * 64 * 3:
-                    return None
-                count = len(raw) // 3
-                sums = [0.0, 0.0, 0.0]
-                sums2 = [0.0, 0.0, 0.0]
-                lsum = 0.0
-                lsum2 = 0.0
-                usable = count * 3
-                for off in range(0, usable, 3):
-                    r = raw[off]; g = raw[off + 1]; b = raw[off + 2]
-                    sums[0] += r; sums[1] += g; sums[2] += b
-                    sums2[0] += r * r; sums2[1] += g * g; sums2[2] += b * b
-                    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
-                    lsum += y; lsum2 += y * y
-                means = [v / count for v in sums]
-                stds = [max(0.0, sums2[i] / count - means[i] * means[i]) ** 0.5 for i in range(3)]
-                lmean = lsum / count
-                lstd = max(0.0, lsum2 / count - lmean * lmean) ** 0.5
-                return {"mean": means, "std": stds, "lmean": lmean, "lstd": lstd}
+                frame_size = 64 * 64
+                if cp.returncode != 0 or len(raw) < frame_size:
+                    return []
+                count = min(frame_count, len(raw) // frame_size)
+                return [raw[i * frame_size:(i + 1) * frame_size] for i in range(count)]
             except Exception:
+                return []
+
+        def _photometric_frame_mae(a, b):
+            """Compare structure while discounting small brightness/contrast shifts.
+
+            Continuation boundaries can be slightly darker/warmer even when they
+            represent the same temporal image. Align B's mean/std to A before the
+            MAE so overlap detection follows geometry/motion rather than grading.
+            """
+            if not a or not b or len(a) != len(b):
                 return None
+            n = float(len(a))
+            ma = sum(a) / n
+            mb = sum(b) / n
+            va = sum((x - ma) * (x - ma) for x in a) / n
+            vb = sum((x - mb) * (x - mb) for x in b) / n
+            sa = max(1.0, va ** 0.5)
+            sb = max(1.0, vb ** 0.5)
+            scale = sa / sb
+            total = 0.0
+            for x, y in zip(a, b):
+                corrected = (y - mb) * scale + ma
+                total += abs(float(x) - corrected)
+            return total / n
+
+        def _detect_continuation_overlap(prev_path, prev_visible_end, cur_path, cur_start):
+            """Find a repeated tail window at the start of a continuation.
+
+            Search up to 20 frames. A single similar boundary frame is deliberately
+            NOT enough to delete anything; at least 3 consecutive frames must match.
+            This prevents the old one-frame rule from skipping a legitimate next
+            frame while still removing a real re-rendered overlap when H3 supplies
+            one.
+            """
+            max_frames = 20
+            min_overlap = 3
+            threshold = 2.75
+            prev_visible_end = max(0.0, float(prev_visible_end or 0.0))
+            cur_start = max(0.0, float(cur_start or 0.0))
+            prev_start = max(0.0, prev_visible_end - max_frames / 24.0)
+            prev_frames = _sample_boundary_gray_frames(prev_path, prev_start, max_frames)
+            cur_frames = _sample_boundary_gray_frames(cur_path, cur_start, max_frames)
+            if len(prev_frames) < min_overlap or len(cur_frames) < min_overlap:
+                return 0, None, []
+
+            max_overlap = min(max_frames, len(prev_frames), len(cur_frames))
+            candidates = []
+            chosen = 0
+            chosen_score = None
+
+            # Compare the previous visible suffix against the continuation prefix.
+            # Prefer the LONGEST confidently matching overlap, not merely the
+            # lowest single-frame score.
+            for overlap in range(min_overlap, max_overlap + 1):
+                pseq = prev_frames[-overlap:]
+                cseq = cur_frames[:overlap]
+                scores = []
+                for pf, cf in zip(pseq, cseq):
+                    score = _photometric_frame_mae(pf, cf)
+                    if score is None:
+                        scores = []
+                        break
+                    scores.append(float(score))
+                if not scores:
+                    continue
+                avg = sum(scores) / len(scores)
+                peak = max(scores)
+                candidates.append((overlap, avg, peak))
+                # Require both good average agreement and no catastrophic frame.
+                if avg <= threshold and peak <= threshold * 1.8:
+                    chosen = overlap
+                    chosen_score = avg
+
+            return chosen, chosen_score, candidates
 
         soundtrack_mode = str((project or {}).get("soundtrack_mode") or "mix")
         if soundtrack_mode not in {"mix", "clips_only", "soundtrack_only"}:
@@ -3436,24 +3490,69 @@ class MainWindow(QMainWindow):
         has_speed_adjustment = False
         has_transition = False
         has_loaded_media = any(str(c.get("generation_mode") or "") == "loaded" for c in clips)
+        boundary_match_info = []
         for clip_index, (clip, path) in enumerate(zip(clips, outputs)):
             try:
                 user_trim_in = max(0.0, float(clip.get("trim_in") or 0.0))
             except Exception:
                 user_trim_in = 0.0
 
-            # MiniMax continuation renders deliberately reuse the previous clip's
-            # ending as their first decoded video frame.  A timestamp seek to
-            # 1/24 s is normally close, but timestamp rounding around an xfade can
-            # still expose that duplicate for a frame.  When the user has NOT
-            # already trimmed farther than one frame, keep the input at time zero
-            # and remove decoded frame 0 explicitly in the filter graph instead.
-            # Audio is trimmed by the matching 1/24 s there as well, preserving A/V
-            # sync. A larger manual trim always wins and needs no extra frame drop.
+            # Search for a REAL multi-frame overlap between the previous visible
+            # tail and the beginning of this continuation. We only remove frames
+            # when at least 3 consecutive frames agree after compensating tiny
+            # exposure/contrast differences. A single similar frame is kept.
             is_continuation = str(clip.get("generation_mode") or "new") == "continue"
-            exact_drop_first_frame = bool(is_continuation and user_trim_in < (1.0 / 24.0 - 0.0005))
-            trim_in = 0.0 if exact_drop_first_frame else user_trim_in
-            effective_start = (1.0 / 24.0) if exact_drop_first_frame else trim_in
+            auto_overlap_drop_frames = 0
+            overlap_score = None
+            if is_continuation and clip_index > 0 and user_trim_in < (1.0 / 24.0 - 0.0005):
+                prev_clip = clips[clip_index - 1]
+                prev_path = outputs[clip_index - 1]
+                prev_transition = str(prev_clip.get("transition_to_next") or "none").strip().lower()
+                # An explicit transition is a user-authored join; do not secretly
+                # shorten either side underneath it.
+                if prev_transition in {"", "none"}:
+                    try:
+                        prev_source_duration = float(
+                            self._probe_clip_duration(str(prev_path), prev_clip.get("frames")) or 0.0
+                        )
+                    except Exception:
+                        prev_source_duration = 0.0
+                    try:
+                        prev_trim_in = max(0.0, float(prev_clip.get("trim_in") or 0.0))
+                    except Exception:
+                        prev_trim_in = 0.0
+                    raw_prev_out = prev_clip.get("trim_out")
+                    try:
+                        prev_trim_out = float(raw_prev_out) if raw_prev_out is not None else prev_source_duration
+                    except Exception:
+                        prev_trim_out = prev_source_duration
+                    if prev_source_duration > 0.0:
+                        prev_trim_out = min(max(prev_trim_out, prev_trim_in), prev_source_duration)
+
+                    auto_overlap_drop_frames, overlap_score, overlap_candidates = _detect_continuation_overlap(
+                        prev_path, prev_trim_out, path, user_trim_in
+                    )
+                    boundary_match_info.append({
+                        "clip_index": clip_index + 1,
+                        "overlap_frames": int(auto_overlap_drop_frames),
+                        "overlap_seconds": round(float(auto_overlap_drop_frames) / 24.0, 6),
+                        "score": None if overlap_score is None else round(float(overlap_score), 4),
+                        "candidates": [
+                            {
+                                "frames": int(frames),
+                                "avg": round(float(avg), 4),
+                                "peak": round(float(peak), 4),
+                            }
+                            for frames, avg, peak in overlap_candidates
+                        ],
+                    })
+
+            trim_in = 0.0 if auto_overlap_drop_frames > 0 else user_trim_in
+            effective_start = (
+                float(auto_overlap_drop_frames) / 24.0
+                if auto_overlap_drop_frames > 0
+                else trim_in
+            )
 
             raw_out = clip.get("trim_out")
             try:
@@ -3463,7 +3562,7 @@ class MainWindow(QMainWindow):
             source_duration = float(self._probe_clip_duration(str(path), clip.get("frames")) or 0.0)
             if source_duration > 0:
                 effective_start = min(effective_start, max(0.0, source_duration - 0.001))
-                if not exact_drop_first_frame:
+                if auto_overlap_drop_frames <= 0:
                     trim_in = effective_start
                 if trim_out is None:
                     trim_out = source_duration
@@ -3505,77 +3604,21 @@ class MainWindow(QMainWindow):
             has_speed_adjustment = has_speed_adjustment or abs(speed_multiplier - 1.0) > 0.0001
             transition_name = str(clip.get("transition_to_next") or "none").strip().lower()
             has_transition = has_transition or transition_name not in {"", "none"}
-            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
+            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
 
-        # Continuation generations can begin with a small but very visible
-        # photometric jump even when geometry/motion are continuous. Measure a
-        # short window on both sides of each continuation boundary and derive a
-        # conservative RGB mean + luma contrast correction. During assembly the
-        # correction is strongest on the first visible frame of the new clip and
-        # smoothly fades away over 0.75 s, so later intentional lighting changes
-        # remain untouched. Source clips are never modified.
+        # The previous seam-color experiment is intentionally disabled. Testing
+        # showed that correcting RGB/luma did not remove the perceptual join. Keep
+        # assembly visually faithful to the generated clips while boundary-frame
+        # matching above decides whether frame 0 should actually be removed.
         seam_color_corrections = {}
-        seam_sample_seconds = 8.0 / 24.0
-        for i in range(1, len(trim_specs)):
-            cur_clip = trim_specs[i][0]
-            if str(cur_clip.get("generation_mode") or "new") != "continue":
-                continue
-            prev_spec = trim_specs[i - 1]
-            cur_spec = trim_specs[i]
-            prev_path = prev_spec[1]
-            cur_path = cur_spec[1]
-            try:
-                prev_end = float(prev_spec[3])
-            except Exception:
-                prev_end = float(self._probe_clip_duration(str(prev_path), prev_spec[0].get("frames")) or 0.0)
-            cur_start = (1.0 / 24.0) if bool(cur_spec[7]) else max(0.0, float(cur_spec[2] or 0.0))
-            prev_stats = _sample_boundary_rgb_stats(
-                prev_path, max(0.0, prev_end - seam_sample_seconds), seam_sample_seconds
-            )
-            cur_stats = _sample_boundary_rgb_stats(cur_path, cur_start, seam_sample_seconds)
-            if not prev_stats or not cur_stats:
-                continue
-
-            gains = []
-            for target_mean, source_mean in zip(prev_stats["mean"], cur_stats["mean"]):
-                if source_mean <= 1.0:
-                    gain = 1.0
-                else:
-                    gain = target_mean / source_mean
-                gains.append(max(0.90, min(1.10, gain)))
-
-            source_lstd = max(1.0, float(cur_stats["lstd"]))
-            contrast = max(0.92, min(1.08, float(prev_stats["lstd"]) / source_lstd))
-            # Estimate the post-channel-gain luma mean, then compensate the small
-            # mean shift introduced by FFmpeg's contrast transform around 0.5.
-            adjusted_lmean = (
-                0.2126 * cur_stats["mean"][0] * gains[0]
-                + 0.7152 * cur_stats["mean"][1] * gains[1]
-                + 0.0722 * cur_stats["mean"][2] * gains[2]
-            ) / 255.0
-            target_lmean = float(prev_stats["lmean"]) / 255.0
-            brightness = target_lmean - (contrast * (adjusted_lmean - 0.5) + 0.5)
-            brightness = max(-0.08, min(0.08, brightness))
-
-            # Skip microscopic corrections that cannot produce a visible seam.
-            if (
-                max(abs(g - 1.0) for g in gains) < 0.003
-                and abs(contrast - 1.0) < 0.005
-                and abs(brightness) < 0.002
-            ):
-                continue
-            seam_color_corrections[i] = {
-                "r": gains[0], "g": gains[1], "b": gains[2],
-                "contrast": contrast, "brightness": brightness,
-                "fade_seconds": 0.75,
-            }
-        has_seam_color_match = bool(seam_color_corrections)
+        has_seam_color_match = False
 
         # The concat recipe remains useful for the unchanged fast stream-copy path.
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media or has_seam_color_match:
+        has_auto_overlap_trim = any(int(spec[7] or 0) > 0 for spec in trim_specs)
+        if has_trim or has_auto_overlap_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media or has_seam_color_match:
             # Re-encode when Timeline editing requires it, or whenever a ready-made
             # external clip is present. Imported media may use different codecs,
             # frame rates or audio formats, so normalize it to the same 24-fps /
@@ -3598,16 +3641,16 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return False
 
-            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in trim_specs:
-                # Input-side seek is used for ordinary user trims. For the special
-                # continuation seam fix we intentionally start at source time zero
-                # and decode one extra frame, because frame 0 itself is discarded
-                # exactly by trim=start_frame=1 in the filter graph below.
+            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in trim_specs:
+                # Input-side seek is used for ordinary user trims. When automatic
+                # overlap matching finds a repeated continuation prefix, start at
+                # source time zero and decode that extra overlap because it is
+                # removed exactly in the filter graph below.
                 if trim_in > 0.001:
                     args += ["-ss", f"{trim_in:.6f}"]
-                read_duration = effective_duration + ((1.0 / 24.0) if exact_drop_first_frame else 0.0)
+                read_duration = effective_duration + (float(auto_overlap_drop_frames) / 24.0)
                 args += ["-t", f"{read_duration:.6f}", "-i", str(path)]
-                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
+                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
 
             filter_parts = []
             synthetic_audio_inputs = []
@@ -3619,16 +3662,15 @@ class MainWindow(QMainWindow):
             # stream and 48-kHz stereo audio stream. xfade is strict about frame
             # rate/timebase/geometry compatibility, so normalizing here keeps the
             # transition path deterministic while leaving source MP4s untouched.
-            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, exact_drop_first_frame, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in input_meta:
+            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in input_meta:
                 final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
                 final_durations.append(final_duration)
                 vlabel = f"v{i}"
-                # For an untrimmed continuation, remove decoded frame 0 itself,
-                # rather than approximating it with a timestamp seek. This happens
-                # before speed normalization and before xfade sees the clip.
+                # Remove exactly the repeated prefix detected by the overlap
+                # search. If no multi-frame overlap was proven, preserve frame 0.
                 vprefix = f"[{i}:v:0]"
-                if exact_drop_first_frame:
-                    vprefix += "trim=start_frame=1,"
+                if auto_overlap_drop_frames > 0:
+                    vprefix += f"trim=start_frame={int(auto_overlap_drop_frames)},"
                 vchain = vprefix + f"setpts=(PTS-STARTPTS)/{speed_multiplier:.3f},fps=24,settb=AVTB"
                 if normalize_mixed_resolution and target_resolution:
                     tw, th = target_resolution
@@ -3685,8 +3727,8 @@ class MainWindow(QMainWindow):
                     alabel = f"a{i}"
                     gain = max(0.0, min(2.0, float(volume_percent) / 100.0))
                     aprefix = f"[{i}:a:0]"
-                    if exact_drop_first_frame:
-                        aprefix += f"atrim=start={1.0 / 24.0:.9f},"
+                    if auto_overlap_drop_frames > 0:
+                        aprefix += f"atrim=start={float(auto_overlap_drop_frames) / 24.0:.9f},"
                     audio_filters = [
                         f"asetpts=PTS-STARTPTS",
                         f"atempo={speed_multiplier:.3f}",
@@ -3920,7 +3962,10 @@ class MainWindow(QMainWindow):
             "timeline_soundtrack_mode": soundtrack_mode,
             "timeline_assembly_clip_count": len(outputs),
             "timeline_assembly_soundtrack_count": len(soundtrack_specs),
-            "timeline_assembly_seam_color_matches": len(seam_color_corrections),
+            "timeline_assembly_seam_color_matches": 0,
+            "timeline_assembly_boundary_matches": copy.deepcopy(boundary_match_info),
+            "timeline_assembly_auto_overlap_boundaries": sum(1 for item in boundary_match_info if int(item.get("overlap_frames") or 0) > 0),
+            "timeline_assembly_auto_overlap_frames": sum(int(item.get("overlap_frames") or 0) for item in boundary_match_info),
             "timeline_assembly_soundtrack": copy.deepcopy(list((project or {}).get("soundtrack_clips") or [])),
         }
         self.queue_jobs.append(job)
@@ -3931,7 +3976,9 @@ class MainWindow(QMainWindow):
         self.status.setText("Timeline assembly added to queue")
         self.append_log(
             f"\n=== TIMELINE ASSEMBLY QUEUED ===\n"
-            f"{self._job_number_text(job)} • Clips: {len(outputs)}\nOutput: {final_path}\n"
+            f"{self._job_number_text(job)} • Clips: {len(outputs)}\n"
+            f"Boundary checks: {boundary_match_info}\n"
+            f"Output: {final_path}\n"
         )
         self._start_next_pending()
         return True
