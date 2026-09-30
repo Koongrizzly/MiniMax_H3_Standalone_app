@@ -2388,6 +2388,11 @@ class TimelineTab(QWidget):
         self.steps_spin = QSpinBox(); self.steps_spin.setRange(1, 100)
         self.scheduler_combo = QComboBox(); self.scheduler_combo.addItems(["simple", "beta"])
         self.audio_memory_check = QCheckBox("Carry audio memory")
+        self.latent_continuation_check = QCheckBox("Use latent continuation")
+        self.latent_continuation_check.setToolTip(
+            "For Continue clips, reuse the previous H3 native latent history when its .h3latent.pt sidecar is available. "
+            "Turn this off to continue from decoded video-frame memory instead. Audio memory is controlled separately."
+        )
         self.model_label = QLabel("—"); self.model_label.setWordWrap(True)
         self.refs_label = QLabel("—"); self.refs_label.setWordWrap(True)
         self.loras_label = QLabel("—"); self.loras_label.setWordWrap(True)
@@ -2395,6 +2400,7 @@ class TimelineTab(QWidget):
         sf.addRow("Steps", self.steps_spin)
         sf.addRow("Scheduler", self.scheduler_combo)
         sf.addRow("", self.audio_memory_check)
+        sf.addRow("", self.latent_continuation_check)
         sf.addRow("Model", self.model_label)
         sf.addRow("References", self.refs_label)
         sf.addRow("LoRAs", self.loras_label)
@@ -2449,6 +2455,7 @@ class TimelineTab(QWidget):
         self.steps_spin.valueChanged.connect(self._settings_changed)
         self.scheduler_combo.currentTextChanged.connect(self._settings_changed)
         self.audio_memory_check.toggled.connect(self._settings_changed)
+        self.latent_continuation_check.toggled.connect(self._settings_changed)
         self.edit_mode_group.buttonClicked.connect(self._edit_mode_changed)
         self.cut_prompt.textChanged.connect(self._cut_prompt_changed)
         self.use_refs_check.toggled.connect(self._reference_mode_changed)
@@ -2521,7 +2528,7 @@ class TimelineTab(QWidget):
         try:
             enabled = clip is not None
             for w in (self.clip_name, self.gen_mode, self.frames_combo, self.seed_spin, self.steps_spin,
-                      self.scheduler_combo, self.audio_memory_check, self.cut_prompt):
+                      self.scheduler_combo, self.audio_memory_check, self.latent_continuation_check, self.cut_prompt):
                 w.setEnabled(enabled)
             if clip is None:
                 self.state_label.setText("No clip selected")
@@ -2580,6 +2587,12 @@ class TimelineTab(QWidget):
             # exposes or honors that flag; clips remain separate until assembly.
             settings["glue_results"] = False
             self.audio_memory_check.setChecked(bool(settings.get("continue_audio_memory", True)))
+            self.latent_continuation_check.setChecked(bool(settings.get("latent_continuation", True)))
+            # Latent continuation only affects clips that actually continue from a
+            # previous Timeline result. Keep it visible so the choice is obvious,
+            # but disable it when it cannot affect generation.
+            can_use_latent = editable and str(clip.get("generation_mode") or "new") == "continue" and not refs_enabled
+            self.latent_continuation_check.setEnabled(can_use_latent)
             self._refresh_edit_workflow(clip)
             state = str(clip.get("status") or "draft").title()
             if locked: state = f"Locked — {state}"
@@ -3756,6 +3769,7 @@ class TimelineTab(QWidget):
         s["seed"] = self.seed_spin.value(); s["steps"] = self.steps_spin.value(); s["scheduler"] = self.scheduler_combo.currentText()
         s["glue_results"] = False
         s["continue_audio_memory"] = self.audio_memory_check.isChecked()
+        s["latent_continuation"] = self.latent_continuation_check.isChecked()
         self._touch_clip(idx)
         self._refresh_all()
 
@@ -4862,12 +4876,12 @@ class TimelineTab(QWidget):
             current = int(round(float(clip.get("volume_percent", 100) or 100)))
         except Exception:
             current = 100
-        current = max(0, min(150, current))
+        current = max(0, min(200, current))
         value, accepted = QInputDialog.getInt(
             self,
             "Clip volume",
-            "Volume for this clip (0% = mute, 100% = original, 150% = boost):",
-            current, 0, 150, 1,
+            "Volume for this clip (0% = mute, 100% = original, 200% = boost):",
+            current, 0, 200, 1,
         )
         if not accepted or int(value) == current:
             return bool(accepted)

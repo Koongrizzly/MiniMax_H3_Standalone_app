@@ -2982,14 +2982,13 @@ class MainWindow(QMainWindow):
                     settings["mode"] = 1  # FL2VA
                     settings["first"] = ""
 
-                    # Timeline continuity always uses the strongest native continuation
-                    # path available. Keep the existing .h3latent.pt sidecar format:
-                    # when the previous generated clip has one, generate.py feeds that
-                    # original H3 latent history to the worker. The worker ALSO uses
-                    # the previous MP4's exact final RGB frame as the boundary anchor.
-                    # If an imported/old clip has no .h3latent.pt, the existing pixel
-                    # history fallback is used automatically.
-                    settings["latent_continuation"] = True
+                    # Timeline continuation can use either the previous native H3
+                    # latent history or decoded source-video frame history. Preserve
+                    # the old Timeline behavior for projects that predate the toggle:
+                    # a missing setting defaults to latent continuation ON. If the
+                    # user explicitly turns it OFF, generate.py follows the decoded
+                    # frame-memory continuation path instead.
+                    settings["latent_continuation"] = bool(settings.get("latent_continuation", True))
 
                     if single_regen:
                         # A middle-clip replacement must continue from the exact
@@ -3001,9 +3000,9 @@ class MainWindow(QMainWindow):
                             return False
                         settings["continue_last_result"] = False
                         settings["continue_video"] = prev_output
-                        # latent_continuation is already forced for every Timeline
-                        # continuation above. Audio memory remains independent; turning
-                        # it on never disables the visual latent + final-frame path.
+                        # Latent continuation follows this clip's Timeline setting.
+                        # Audio memory remains independent from the visual continuation
+                        # path and can be enabled or disabled separately.
                     else:
                         # Batch position is NOT timeline position.  When generating
                         # only missing/selected/later clips, the first queued job can
@@ -3147,7 +3146,7 @@ class MainWindow(QMainWindow):
         that stream-copies video and re-encodes only audio with FFmpeg.
         """
         try:
-            volume_percent = max(0, min(150, int(round(float(volume_percent)))))
+            volume_percent = max(0, min(200, int(round(float(volume_percent)))))
         except Exception:
             volume_percent = 100
         if volume_percent <= 100:
@@ -3183,7 +3182,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Timeline preview", "The selected timeline output file is no longer on disk.")
             return False
         try:
-            volume_percent = max(0, min(150, int(round(float(volume_percent or 100)))))
+            volume_percent = max(0, min(200, int(round(float(volume_percent or 100)))))
         except Exception:
             volume_percent = 100
         preview_path = self._timeline_volume_preview_path(path, volume_percent)
@@ -3433,7 +3432,7 @@ class MainWindow(QMainWindow):
             trimmed = effective_start > 0.001 or (source_duration > 0 and trim_out < source_duration - 0.02)
             has_trim = has_trim or trimmed
             try:
-                volume_percent = max(0, min(150, int(round(float(clip.get("volume_percent", 100) or 100)))))
+                volume_percent = max(0, min(200, int(round(float(clip.get("volume_percent", 100) or 100)))))
             except Exception:
                 volume_percent = 100
             has_volume_adjustment = has_volume_adjustment or volume_percent != 100
@@ -3541,7 +3540,7 @@ class MainWindow(QMainWindow):
 
                 if has_audio:
                     alabel = f"a{i}"
-                    gain = max(0.0, min(1.5, float(volume_percent) / 100.0))
+                    gain = max(0.0, min(2.0, float(volume_percent) / 100.0))
                     aprefix = f"[{i}:a:0]"
                     if exact_drop_first_frame:
                         aprefix += f"atrim=start={1.0 / 24.0:.9f},"
