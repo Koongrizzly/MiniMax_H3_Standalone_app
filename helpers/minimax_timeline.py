@@ -350,6 +350,17 @@ def _timeline_total_seconds(clips: list[dict]) -> float:
     return max(0.0, total)
 
 
+def _clip_timeline_start_seconds(clips: list[dict], target_index: int) -> float:
+    """Absolute visible Timeline start for a clip, including transition overlaps."""
+    cursor = 0.0
+    target_index = max(0, min(int(target_index), max(0, len(clips) - 1)))
+    for i in range(target_index):
+        cursor += _clip_timeline_seconds(clips[i])
+        if i + 1 < len(clips):
+            cursor -= _transition_overlap_seconds(clips[i], clips[i + 1])
+    return max(0.0, cursor)
+
+
 def _soundtrack_clip_duration(item: dict) -> float:
     try:
         source_duration = max(0.0, float(item.get("source_duration") or 0.0))
@@ -491,6 +502,7 @@ def _reference_entries(clip: dict) -> list[dict]:
             "name": str(item.get("name") or Path(path).stem).strip(),
             "picture_description": str(item.get("picture_description") or "").strip(),
             "subject_description": str(item.get("subject_description") or "").strip(),
+            "voice_sample": str(item.get("voice_sample") or "").strip(),
         }
         preset_id = str(item.get("preset_id") or "").strip()
         if preset_id:
@@ -674,6 +686,20 @@ class RefPresetDialog(QDialog):
         self.subject_number.setToolTip("Subject/Picture numbers are assigned automatically in the order presets are checked.")
         form.addRow("Preset name", self.name_edit)
         form.addRow("Subject number", self.subject_number)
+        self.voice_path = QLineEdit()
+        self.voice_path.setReadOnly(True)
+        self.voice_path.setPlaceholderText("Optional voice sample for this subject")
+        voice_row = QWidget()
+        voice_layout = QHBoxLayout(voice_row)
+        voice_layout.setContentsMargins(0, 0, 0, 0)
+        self.voice_load_btn = QPushButton("Load voice…")
+        self.voice_play_btn = QPushButton("Play")
+        self.voice_remove_btn = QPushButton("Remove")
+        voice_layout.addWidget(self.voice_path, 1)
+        voice_layout.addWidget(self.voice_load_btn)
+        voice_layout.addWidget(self.voice_play_btn)
+        voice_layout.addWidget(self.voice_remove_btn)
+        form.addRow("Voice sample", voice_row)
         ev.addLayout(form)
 
         ev.addWidget(QLabel("Picture description"))
@@ -700,9 +726,17 @@ class RefPresetDialog(QDialog):
         self.apply_btn.setText("Apply to selected clips")
         root.addWidget(buttons)
 
+        self._voice_player = QMediaPlayer(self) if QMediaPlayer is not None else None
+        self._voice_output = QAudioOutput(self) if QAudioOutput is not None else None
+        if self._voice_player is not None and self._voice_output is not None:
+            self._voice_player.setAudioOutput(self._voice_output)
+
         self.add_btn.clicked.connect(self._add_preset)
         self.delete_btn.clicked.connect(self._delete_preset)
         self.save_btn.clicked.connect(self._save_current_editor)
+        self.voice_load_btn.clicked.connect(self._load_voice_sample)
+        self.voice_play_btn.clicked.connect(self._play_voice_sample)
+        self.voice_remove_btn.clicked.connect(self._remove_voice_sample)
         self.list_widget.currentItemChanged.connect(self._current_changed)
         self.list_widget.itemChanged.connect(self._item_changed)
         self.subject_number.valueChanged.connect(self._subject_number_changed)
@@ -731,6 +765,7 @@ class RefPresetDialog(QDialog):
                 "path": path,
                 "picture_description": str(item.get("picture_description") or "").strip(),
                 "subject_description": str(item.get("subject_description") or "").strip(),
+                "voice_sample": str(item.get("voice_sample") or "").strip(),
             })
 
     def _persist(self):
@@ -746,12 +781,17 @@ class RefPresetDialog(QDialog):
         return next((p for p in self.presets if str(p.get("id")) == str(preset_id)), None)
 
     def _set_editor_enabled(self, enabled: bool):
-        for w in (self.name_edit, self.subject_number, self.picture_edit, self.subject_edit, self.save_btn, self.delete_btn):
+        for w in (
+            self.name_edit, self.subject_number, self.picture_edit, self.subject_edit,
+            self.voice_path, self.voice_load_btn, self.voice_play_btn, self.voice_remove_btn,
+            self.save_btn, self.delete_btn,
+        ):
             w.setEnabled(bool(enabled))
 
     def _item_label(self, preset: dict, checked: bool, subject_no: int) -> str:
         name = str(preset.get("name") or Path(str(preset.get("path") or "Reference")).stem)
-        return f"Subject {subject_no}  •  {name}" if checked else name
+        voice_badge = "  •  Voice" if str(preset.get("voice_sample") or "").strip() else ""
+        return f"Subject {subject_no}  •  {name}{voice_badge}" if checked else f"{name}{voice_badge}"
 
     def _rebuild_list(self, select_id: str | None = None):
         checked_state = {}
@@ -806,6 +846,7 @@ class RefPresetDialog(QDialog):
             self.name_edit.setText(str(preset.get("name") or ""))
             self.picture_edit.setPlainText(str(preset.get("picture_description") or ""))
             self.subject_edit.setPlainText(str(preset.get("subject_description") or ""))
+            self.voice_path.setText(str(preset.get("voice_sample") or ""))
             self.subject_number.setValue(max(1, min(TIMELINE_MAX_REF_IMAGES, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1))))
             pix = QPixmap(str(preset.get("path") or ""))
             if not pix.isNull():
@@ -901,10 +942,42 @@ class RefPresetDialog(QDialog):
             "path": str(path),
             "picture_description": f"<Picture 1>: reference image of {path.stem}",
             "subject_description": f"<Subject 1>: the subject shown in <Picture 1>. Preserve its exact identity and appearance.",
+            "voice_sample": "",
         }
         self.presets.append(preset)
         self._persist()
         self._rebuild_list(select_id=preset["id"])
+
+    def _load_voice_sample(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return
+        name, _ = QFileDialog.getOpenFileName(
+            self, "Select subject voice sample", "",
+            "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg *.opus);;All files (*.*)"
+        )
+        if not name:
+            return
+        path = Path(name)
+        if path.is_file():
+            self.voice_path.setText(str(path))
+
+    def _play_voice_sample(self):
+        path = Path(self.voice_path.text().strip())
+        if not path.is_file():
+            QMessageBox.information(self, "Voice sample", "No usable voice sample is selected for this preset.")
+            return
+        if self._voice_player is None:
+            QMessageBox.information(self, "Voice sample", "Qt multimedia playback is unavailable in this runtime.")
+            return
+        self._voice_player.stop()
+        self._voice_player.setSource(QUrl.fromLocalFile(str(path.resolve())))
+        self._voice_player.play()
+
+    def _remove_voice_sample(self):
+        self.voice_path.clear()
+        if self._voice_player is not None:
+            self._voice_player.stop()
 
     def _delete_preset(self):
         item = self.list_widget.currentItem()
@@ -933,6 +1006,7 @@ class RefPresetDialog(QDialog):
         preset["name"] = name
         preset["picture_description"] = picture
         preset["subject_description"] = subject
+        preset["voice_sample"] = self.voice_path.text().strip()
         item.setText(self._item_label(preset, item.checkState() == Qt.CheckState.Checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1)))
         self._persist()
 
@@ -957,12 +1031,26 @@ class RefPresetDialog(QDialog):
             )
             return
         missing = []
+        missing_voice = []
+        voice_count = 0
         for item in items:
             preset = self._preset_by_id(str(item.data(Qt.ItemDataRole.UserRole) or ""))
             if preset and not Path(str(preset.get("path") or "")).is_file():
                 missing.append(str(preset.get("name") or preset.get("path")))
+            if preset:
+                voice = str(preset.get("voice_sample") or "").strip()
+                if voice:
+                    voice_count += 1
+                    if not Path(voice).is_file():
+                        missing_voice.append(str(preset.get("name") or voice))
         if missing:
             QMessageBox.warning(self, "Reference presets", "These preset image files are missing:\n\n" + "\n".join(missing))
+            return
+        if missing_voice:
+            QMessageBox.warning(self, "Reference presets", "These preset voice samples are missing:\n\n" + "\n".join(missing_voice))
+            return
+        if voice_count > 3:
+            QMessageBox.warning(self, "Reference presets", "MiniMax H3 Ref2VA supports at most 3 standalone voice/audio references per generation.")
             return
         self.accept()
 
@@ -977,6 +1065,7 @@ class RefPresetDialog(QDialog):
                 "name": str(preset.get("name") or "Reference"),
                 "picture_description": str(preset.get("picture_description") or ""),
                 "subject_description": str(preset.get("subject_description") or ""),
+                "voice_sample": str(preset.get("voice_sample") or ""),
                 "preset_id": str(preset.get("id") or ""),
             })
         return refs
@@ -1608,7 +1697,7 @@ class TimelineCanvas(QWidget):
             painter.drawRoundedRect(rect, 5, 5)
             painter.setPen(QColor("#f4f6f8"))
             name = str(item.get("name") or Path(str(item.get("path") or "Audio")).stem or "Audio")
-            volume = int(round(float(item.get("volume_percent", 100) or 100)))
+            volume = int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))
             end_sec = start_sec + duration
             line1 = fm.elidedText(name, Qt.TextElideMode.ElideRight, max(20, rect.width() - 12))
             painter.drawText(rect.x() + 6, rect.y() + 17, line1)
@@ -4286,7 +4375,7 @@ class TimelineTab(QWidget):
             return
         menu = QMenu(self)
         trim = menu.addAction("Trim audio…")
-        volume = menu.addAction(f"Volume…  {int(round(float(item.get('volume_percent', 100) or 100)))}%")
+        volume = menu.addAction(f"Volume…  {int(round(float(100 if item.get('volume_percent') is None else item.get('volume_percent'))))}%")
         fade_in_action = menu.addAction(f"Fade in…  {max(0.0, float(item.get('fade_in_seconds') or 0.0)):.1f}s")
         fade_out_action = menu.addAction(f"Fade out…  {max(0.0, float(item.get('fade_out_seconds') or 0.0)):.1f}s")
         menu.addSeparator()
@@ -4347,7 +4436,7 @@ class TimelineTab(QWidget):
     def _set_soundtrack_volume(self, audio_id):
         idx, item = self._soundtrack_by_id(audio_id)
         if item is None: return
-        current = int(round(float(item.get("volume_percent", 100) or 100)))
+        current = int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))
         value, ok = QInputDialog.getInt(self, "Soundtrack volume", "Volume", current, 0, 150, 1)
         if not ok or value == current: return
         self._record_undo_state("Change soundtrack volume")
@@ -4547,7 +4636,7 @@ class TimelineTab(QWidget):
         preview = menu.addAction("Preview clip")
         open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
-        volume_action = menu.addAction(f"Volume…  {int(round(float(clip.get('volume_percent', 100) or 100)))}%")
+        volume_action = menu.addAction(f"Volume…  {int(round(float(100 if clip.get('volume_percent') is None else clip.get('volume_percent'))))}%")
         fade_in_action = menu.addAction(f"Audio fade in…  {max(0.0, float(clip.get('audio_fade_in_seconds') or 0.0)):.1f}s")
         fade_out_action = menu.addAction(f"Audio fade out…  {max(0.0, float(clip.get('audio_fade_out_seconds') or 0.0)):.1f}s")
         video_fade_in_action = None
@@ -4828,13 +4917,30 @@ class TimelineTab(QWidget):
         )
 
     def _preview_clip_by_id(self, clip_id):
-        _idx, clip = self._clip_by_id(clip_id)
+        clip_index, clip = self._clip_by_id(clip_id)
         if not clip:
             return False
         output = self._clip_preview_path(clip)
         if not output:
             return False
         if callable(self.preview_result_callback):
+            # Right-click "Preview clip" must use the same soundtrack-aware path
+            # as the main Preview action. The earlier soundtrack patch only wired
+            # preview_selected_result(), so this context-menu path silently played
+            # the raw clip without the Timeline music.
+            try:
+                clip_index = int(clip_index)
+            except Exception:
+                try:
+                    clip_index = self._clips().index(clip)
+                except ValueError:
+                    clip_index = 0
+            soundtrack_preview = {
+                "timeline_start": float(_clip_timeline_start_seconds(self._clips(), clip_index)),
+                "timeline_duration": float(_clip_timeline_seconds(clip)),
+                "mode": str(self.project.get("soundtrack_mode") or "mix"),
+                "clips": copy.deepcopy(list(self.project.get("soundtrack_clips") or [])),
+            }
             return bool(self.preview_result_callback(
                 output,
                 clip.get("queue_job_id"),
@@ -4842,6 +4948,7 @@ class TimelineTab(QWidget):
                 clip.get("trim_out"),
                 clip.get("volume_percent", 100),
                 _clip_speed(clip),
+                soundtrack_preview,
             ))
         return False
 
@@ -4873,7 +4980,7 @@ class TimelineTab(QWidget):
         if not clip:
             return False
         try:
-            current = int(round(float(clip.get("volume_percent", 100) or 100)))
+            current = int(round(float(100 if clip.get("volume_percent") is None else clip.get("volume_percent"))))
         except Exception:
             current = 100
         current = max(0, min(200, current))
@@ -5325,6 +5432,18 @@ class TimelineTab(QWidget):
             return
         output = self._clip_preview_path(clip)
         if callable(self.preview_result_callback) and output:
+            try:
+                clip_index = self._clips().index(clip)
+            except ValueError:
+                clip_index = 0
+            timeline_start = _clip_timeline_start_seconds(self._clips(), clip_index)
+            timeline_duration = _clip_timeline_seconds(clip)
+            soundtrack_preview = {
+                "timeline_start": float(timeline_start),
+                "timeline_duration": float(timeline_duration),
+                "mode": str(self.project.get("soundtrack_mode") or "mix"),
+                "clips": copy.deepcopy(list(self.project.get("soundtrack_clips") or [])),
+            }
             self.preview_result_callback(
                 output,
                 clip.get("queue_job_id"),
@@ -5332,6 +5451,7 @@ class TimelineTab(QWidget):
                 clip.get("trim_out"),
                 clip.get("volume_percent", 100),
                 _clip_speed(clip),
+                soundtrack_preview,
             )
 
     def open_selected_output(self):

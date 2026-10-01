@@ -2926,11 +2926,18 @@ class MainWindow(QMainWindow):
 
                 # Timeline reference images are per-clip Ref2VA inputs.  They are
                 # deliberately separate from the Generation tab's global refs.
-                timeline_refs = [
-                    str(item.get("path") or "")
-                    for item in (spec.get("timeline_reference_images") or spec.get("reference_images") or [])
+                timeline_ref_entries = [
+                    item for item in (spec.get("timeline_reference_images") or spec.get("reference_images") or [])
                     if isinstance(item, dict) and str(item.get("path") or "").strip()
                 ]
+                timeline_refs = [str(item.get("path") or "") for item in timeline_ref_entries]
+                timeline_voice_refs = []
+                timeline_voice_subjects = []
+                for subject_no, item in enumerate(timeline_ref_entries, 1):
+                    voice = str(item.get("voice_sample") or "").strip()
+                    if voice:
+                        timeline_voice_refs.append(voice)
+                        timeline_voice_subjects.append(subject_no)
                 use_timeline_refs = bool(spec.get("use_reference_images", False))
                 if use_timeline_refs:
                     if not timeline_refs:
@@ -2943,13 +2950,21 @@ class MainWindow(QMainWindow):
                     if missing_ref:
                         QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} cannot find reference image:\n{missing_ref}")
                         return False
+                    if len(timeline_voice_refs) > 3:
+                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} has more than 3 voice samples. MiniMax H3 supports at most 3 standalone audio references.")
+                        return False
+                    missing_voice = next((x for x in timeline_voice_refs if not Path(x).is_file()), "")
+                    if missing_voice:
+                        QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} cannot find voice sample:\n{missing_voice}")
+                        return False
                     if str(spec.get("generation_mode") or "new") == "continue":
                         QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} uses reference images and cannot continue from the previous block.")
                         return False
                     settings["mode"] = 2  # Ref2VA; hybrid routing is handled by the existing generator when enabled.
                     settings["ref_images"] = timeline_refs
                     settings["ref_videos"] = []
-                    settings["ref_audios"] = []
+                    settings["ref_audios"] = timeline_voice_refs
+                    settings["ref_audio_subjects"] = timeline_voice_subjects
                     settings["first"] = ""
                     settings["last"] = ""
                     settings["continue_video"] = ""
@@ -2961,6 +2976,7 @@ class MainWindow(QMainWindow):
                     settings["ref_images"] = []
                     settings["ref_videos"] = []
                     settings["ref_audios"] = []
+                    settings["ref_audio_subjects"] = []
 
                 is_continue = str(spec.get("generation_mode") or "new") == "continue"
                 single_regen = bool(spec.get("timeline_single_regeneration", False))
@@ -3096,9 +3112,11 @@ class MainWindow(QMainWindow):
                 if project_folder:
                     settings["output_folder"] = project_folder
 
+                self._timeline_ref_audio_subjects = [int(x) for x in (settings.get("ref_audio_subjects") or [])]
                 self.apply_settings(settings)
                 before = len(self.queue_jobs)
                 self.generate()
+                self._timeline_ref_audio_subjects = []
                 if len(self.queue_jobs) <= before:
                     # generate() already showed the specific validation dialog.
                     # Stop here so a later Continue clip can never attach to the
@@ -3114,6 +3132,10 @@ class MainWindow(QMainWindow):
                 job["timeline_use_reference_images"] = bool(use_timeline_refs)
                 job["compiled_prompt"] = str(settings.get("prompt") or "")
                 job["timeline_reference_images"] = copy.deepcopy(spec.get("timeline_reference_images") or spec.get("reference_images") or [])
+                job["timeline_voice_references"] = [
+                    {"path": path, "subject": subject}
+                    for path, subject in zip(timeline_voice_refs, timeline_voice_subjects)
+                ] if use_timeline_refs else []
                 job["timeline_settings_snapshot"] = copy.deepcopy(settings)
                 if bool(spec.get("timeline_alternate_candidate", False)):
                     job["timeline_alternate_candidate"] = True
@@ -3132,6 +3154,7 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Timeline queued: {len(created)} H3 clip(s){suffix}")
             return True
         finally:
+            self._timeline_ref_audio_subjects = []
             # Timeline queuing must not leave the ordinary Generation tab changed
             # to whatever happened to be the last clip in the project.
             self.apply_settings(original)
@@ -3175,26 +3198,219 @@ class MainWindow(QMainWindow):
             pass
         return path
 
-    def _preview_timeline_result(self, output, job_id=None, trim_in=None, trim_out=None, volume_percent=100, speed_multiplier=1.0):
+    def _timeline_soundtrack_preview_path(self, path: Path, trim_in, trim_out, volume_percent, speed_multiplier, soundtrack_preview):
+        """Build/cache a selected-clip preview with the Timeline soundtrack mixed in.
+
+        This lets the soundtrack drive editing decisions without requiring a full
+        Timeline assembly after every clip change. The proxy represents only the
+        selected clip's visible Timeline interval, with any soundtrack/VO/SFX that
+        overlaps that interval positioned at the correct relative time.
+        """
+        data = soundtrack_preview if isinstance(soundtrack_preview, dict) else {}
+        mode = str(data.get("mode") or "mix")
+        if mode not in {"mix", "clips_only", "soundtrack_only"}:
+            mode = "mix"
+        if mode == "clips_only":
+            return None
+        soundtrack_items = [x for x in (data.get("clips") or []) if isinstance(x, dict)]
+        if not soundtrack_items and mode != "soundtrack_only":
+            return None
+        if not ffmpeg_tools_ready():
+            self._ensure_ffmpeg_async()
+            return None
+
+        try:
+            clip_start = max(0.0, float(data.get("timeline_start") or 0.0))
+            clip_duration = max(0.04, float(data.get("timeline_duration") or 0.0))
+            source_duration = float(self._probe_clip_duration(str(path), None) or 0.0)
+            source_trim_in = max(0.0, float(trim_in or 0.0))
+            if trim_out is None:
+                source_trim_out = source_duration if source_duration > 0 else source_trim_in + clip_duration * float(speed_multiplier or 1.0)
+            else:
+                source_trim_out = max(source_trim_in + 0.001, float(trim_out))
+                if source_duration > 0:
+                    source_trim_out = min(source_trim_out, source_duration)
+            source_used = max(0.001, source_trim_out - source_trim_in)
+            speed = max(0.5, min(2.0, float(speed_multiplier or 1.0)))
+            clip_duration = max(0.04, source_used / speed)
+            clip_end = clip_start + clip_duration
+            volume_percent = max(0, min(200, int(round(float(100 if volume_percent is None else volume_percent)))))
+
+            overlaps = []
+            for item in soundtrack_items:
+                audio_path = Path(str(item.get("path") or ""))
+                if not audio_path.is_file():
+                    continue
+                try:
+                    track_start = max(0.0, float(item.get("timeline_start") or 0.0))
+                    source_track_duration = max(0.0, float(item.get("source_duration") or 0.0))
+                    track_trim_in = max(0.0, float(item.get("trim_in") or 0.0))
+                    raw_out = item.get("trim_out")
+                    track_trim_out = float(raw_out) if raw_out is not None else source_track_duration
+                    if source_track_duration > 0:
+                        track_trim_out = min(max(track_trim_out, track_trim_in), source_track_duration)
+                    natural_duration = max(0.0, track_trim_out - track_trim_in)
+                    raw_end = item.get("timeline_end")
+                    if raw_end is not None:
+                        natural_duration = min(natural_duration, max(0.0, float(raw_end) - track_start))
+                    track_end = track_start + natural_duration
+                    ov_start = max(clip_start, track_start)
+                    ov_end = min(clip_end, track_end)
+                    if ov_end - ov_start <= 0.001:
+                        continue
+                    source_offset = track_trim_in + (ov_start - track_start)
+                    used = ov_end - ov_start
+                    delay = ov_start - clip_start
+                    gain = max(0.0, min(1.5, float(100 if item.get("volume_percent") is None else item.get("volume_percent")) / 100.0))
+                    fade_in = max(0.0, float(item.get("fade_in_seconds") or 0.0))
+                    fade_out = max(0.0, float(item.get("fade_out_seconds") or 0.0))
+                    overlaps.append({
+                        "path": str(audio_path), "source_offset": source_offset,
+                        "duration": used, "delay": delay, "gain": gain,
+                        "track_start": track_start, "track_end": track_end,
+                        "overlap_start": ov_start, "overlap_end": ov_end,
+                        "fade_in": fade_in, "fade_out": fade_out,
+                    })
+                except Exception:
+                    continue
+
+            if not overlaps and mode != "soundtrack_only":
+                return None
+
+            stat = path.stat()
+            cache_payload = {
+                "path": str(path.resolve()), "mtime": stat.st_mtime_ns, "size": stat.st_size,
+                "trim_in": source_trim_in, "trim_out": source_trim_out, "volume": volume_percent,
+                "speed": speed, "mode": mode, "clip_start": clip_start, "clip_duration": clip_duration,
+                "overlaps": overlaps,
+            }
+            key = hashlib.sha1(json.dumps(cache_payload, sort_keys=True, default=str).encode("utf-8", "ignore")).hexdigest()[:20]
+            cache_dir = ROOT / "jobs" / "timeline_soundtrack_preview"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            proxy = cache_dir / f"{path.stem}_soundtrack_{key}.mp4"
+            if proxy.is_file() and proxy.stat().st_size > 0:
+                return proxy
+
+            ffmpeg = str(ffmpeg_tool_path("ffmpeg.exe"))
+            ffprobe = str(ffmpeg_tool_path("ffprobe.exe"))
+            def has_audio(media_path):
+                try:
+                    cp = subprocess.run(
+                        [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", str(media_path)],
+                        capture_output=True, text=True, timeout=5,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+                    )
+                    return cp.returncode == 0 and bool((cp.stdout or "").strip())
+                except Exception:
+                    return False
+
+            args = [ffmpeg, "-y", "-nostdin", "-loglevel", "error"]
+            if source_trim_in > 0.001:
+                args += ["-ss", f"{source_trim_in:.6f}"]
+            args += ["-t", f"{source_used:.6f}", "-i", str(path)]
+            for ov in overlaps:
+                if ov["source_offset"] > 0.001:
+                    args += ["-ss", f"{ov['source_offset']:.6f}"]
+                args += ["-t", f"{ov['duration']:.6f}", "-i", ov["path"]]
+
+            filters = [f"[0:v:0]setpts=(PTS-STARTPTS)/{speed:.6f},fps=24,format=yuv420p[vout]"]
+            if mode == "mix" and has_audio(path):
+                gain = max(0.0, min(2.0, volume_percent / 100.0))
+                filters.append(
+                    f"[0:a:0]asetpts=PTS-STARTPTS,atempo={speed:.6f},volume={gain:.6f},"
+                    f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[abase]"
+                )
+            else:
+                filters.append(
+                    f"anullsrc=r=48000:cl=stereo,atrim=duration={clip_duration:.6f},asetpts=PTS-STARTPTS[abase]"
+                )
+
+            soundtrack_labels = []
+            for idx, ov in enumerate(overlaps, start=1):
+                label = f"st{idx}"
+                chain = (
+                    f"[{idx}:a:0]asetpts=PTS-STARTPTS,volume={ov['gain']:.6f},"
+                    f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+                )
+                # Reproduce fades when the selected clip contains the actual start
+                # or end of the soundtrack block. Mid-fade slices remain usable but
+                # are not artificially restarted from silence.
+                if ov["fade_in"] > 0.0005 and abs(ov["overlap_start"] - ov["track_start"]) < 0.002:
+                    chain += f",afade=t=in:st=0:d={min(ov['fade_in'], ov['duration']):.6f}"
+                if ov["fade_out"] > 0.0005 and abs(ov["overlap_end"] - ov["track_end"]) < 0.002:
+                    fade_dur = min(ov["fade_out"], ov["duration"])
+                    chain += f",afade=t=out:st={max(0.0, ov['duration'] - fade_dur):.6f}:d={fade_dur:.6f}"
+                delay_ms = max(0, int(round(ov["delay"] * 1000.0)))
+                chain += f",adelay={delay_ms}|{delay_ms}[{label}]"
+                filters.append(chain)
+                soundtrack_labels.append(label)
+
+            current = "abase"
+            for idx, label in enumerate(soundtrack_labels):
+                mixed = f"pmix{idx}"
+                filters.append(
+                    f"[{current}][{label}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[{mixed}]"
+                )
+                current = mixed
+            filters.append(f"[{current}]atrim=duration={clip_duration:.6f},asetpts=PTS-STARTPTS[aout]")
+
+            args += [
+                "-filter_complex", ";".join(filters),
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(proxy),
+            ]
+            completed = subprocess.run(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+            )
+            if completed.returncode == 0 and proxy.is_file() and proxy.stat().st_size > 0:
+                return proxy
+        except Exception:
+            pass
+        return None
+
+    def _preview_timeline_result(self, output, job_id=None, trim_in=None, trim_out=None, volume_percent=100, speed_multiplier=1.0, soundtrack_preview=None):
         path = Path(str(output or ""))
         if not path.is_file():
             QMessageBox.warning(self, "Timeline preview", "The selected timeline output file is no longer on disk.")
             return False
         try:
-            volume_percent = max(0, min(200, int(round(float(volume_percent or 100)))))
+            volume_percent = max(0, min(200, int(round(float(100 if volume_percent is None else volume_percent)))))
         except Exception:
             volume_percent = 100
-        preview_path = self._timeline_volume_preview_path(path, volume_percent)
+
+        # If soundtrack audio overlaps the selected Timeline clip, build a small
+        # cached preview proxy containing exactly that visible clip interval plus
+        # its music/VO/SFX. This avoids a full Timeline assembly just to edit to
+        # music. The ordinary preview path remains unchanged when no soundtrack
+        # overlaps or when Clip audio only is selected.
+        soundtrack_proxy = self._timeline_soundtrack_preview_path(
+            path, trim_in, trim_out, volume_percent, speed_multiplier, soundtrack_preview
+        )
+        if soundtrack_proxy is not None:
+            preview_path = soundtrack_proxy
+            preview_trim_in = None
+            preview_trim_out = None
+            preview_volume = 1.0
+            preview_rate = 1.0
+        else:
+            preview_path = self._timeline_volume_preview_path(path, volume_percent)
+            preview_trim_in = trim_in
+            preview_trim_out = trim_out
+            preview_volume = ((volume_percent / 100.0) if volume_percent <= 100 else 1.0)
+            preview_rate = max(0.5, min(2.0, float(speed_multiplier or 1.0)))
+
         job = self._job_by_id(job_id) if job_id else None
         preview_job = copy.deepcopy(job) if isinstance(job, dict) else {}
         preview_job["output"] = str(preview_path)
         self._load_preview(
             preview_job,
             autoplay=True,
-            trim_in=trim_in,
-            trim_out=trim_out,
-            volume=((volume_percent / 100.0) if volume_percent <= 100 else 1.0),
-            playback_rate=max(0.5, min(2.0, float(speed_multiplier or 1.0))),
+            trim_in=preview_trim_in,
+            trim_out=preview_trim_out,
+            volume=preview_volume,
+            playback_rate=preview_rate,
         )
         return True
 
@@ -3455,7 +3671,7 @@ class MainWindow(QMainWindow):
             if used <= 0.0005:
                 continue
             try:
-                volume_percent = max(0, min(150, int(round(float(item.get("volume_percent", 100) or 100)))))
+                volume_percent = max(0, min(150, int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))))
             except Exception:
                 volume_percent = 100
             try:
@@ -3574,7 +3790,7 @@ class MainWindow(QMainWindow):
             trimmed = effective_start > 0.001 or (source_duration > 0 and trim_out < source_duration - 0.02)
             has_trim = has_trim or trimmed
             try:
-                volume_percent = max(0, min(200, int(round(float(clip.get("volume_percent", 100) or 100)))))
+                volume_percent = max(0, min(200, int(round(float(100 if clip.get("volume_percent") is None else clip.get("volume_percent"))))))
             except Exception:
                 volume_percent = 100
             has_volume_adjustment = has_volume_adjustment or volume_percent != 100
@@ -5997,7 +6213,12 @@ exit /b %RC%
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
             ref_audios = self.ref_audios.paths()
-            for pth in ref_audios: args += ["--ref-audio",pth]
+            ref_audio_subjects = list(getattr(self, "_timeline_ref_audio_subjects", []) or [])
+            for ref_i, pth in enumerate(ref_audios):
+                args += ["--ref-audio", pth]
+                subject_n = int(ref_audio_subjects[ref_i]) if ref_i < len(ref_audio_subjects) else 0
+                if 1 <= subject_n <= 9:
+                    args += ["--ref-audio-subject", str(subject_n)]
             if self.lock_source_audio.isChecked():
                 if not ref_audios:
                     QMessageBox.warning(self, "Source audio required", "Use Audio 1 as exact source / output needs at least one standalone audio file in Audio slot 1.")
