@@ -279,7 +279,10 @@ def _clip_timeline_seconds(clip: dict) -> float:
         trim_in = 0.0
     trim_out_raw = clip.get("trim_out")
     if trim_out_raw is None:
-        used = source_duration
+        # A start-only trim still shortens the visible Timeline. Older projects
+        # can contain trim_in without trim_out, so do not accidentally count the
+        # full source duration and shift soundtrack timing.
+        used = max(0.0, source_duration - trim_in)
     else:
         try:
             trim_out = float(trim_out_raw)
@@ -2665,8 +2668,37 @@ class TimelineTab(QWidget):
             for w in (self.frames_combo, self.seed_spin, self.steps_spin, self.scheduler_combo,
                       self.audio_memory_check, self.cut_prompt):
                 w.setEnabled(editable)
-            fidx = self.frames_combo.findData(int(clip.get("frames") or 243))
-            if fidx >= 0: self.frames_combo.setCurrentIndex(fidx)
+            if is_media_clip:
+                # Loaded/source clips are not H3 generations. Show their exact media
+                # duration instead of whichever 243-frame generation option happened
+                # to remain selected in the disabled combo box.
+                media_frames = max(1, int(clip.get("frames") or round(_clip_seconds(clip) * FPS)))
+                media_seconds = _clip_seconds(clip)
+                self.frames_combo.blockSignals(True)
+                exact_index = -1
+                for i in range(self.frames_combo.count()):
+                    if self.frames_combo.itemData(i) == "__loaded_media_exact__":
+                        exact_index = i
+                        break
+                label = f"{media_frames} frames — {media_seconds:.3f} s (loaded video)"
+                if exact_index < 0:
+                    self.frames_combo.addItem(label, "__loaded_media_exact__")
+                    exact_index = self.frames_combo.count() - 1
+                else:
+                    self.frames_combo.setItemText(exact_index, label)
+                self.frames_combo.setCurrentIndex(exact_index)
+                self.frames_combo.blockSignals(False)
+            else:
+                # Remove temporary loaded-media display item before showing a normal
+                # H3 generation block.
+                self.frames_combo.blockSignals(True)
+                for i in range(self.frames_combo.count() - 1, -1, -1):
+                    if self.frames_combo.itemData(i) == "__loaded_media_exact__":
+                        self.frames_combo.removeItem(i)
+                fidx = self.frames_combo.findData(int(clip.get("frames") or 243))
+                if fidx >= 0:
+                    self.frames_combo.setCurrentIndex(fidx)
+                self.frames_combo.blockSignals(False)
             self.seed_spin.setValue(int(settings.get("seed", -1)))
             self.steps_spin.setValue(int(settings.get("steps", 15)))
             sched = str(settings.get("scheduler") or "beta")
@@ -3142,6 +3174,26 @@ class TimelineTab(QWidget):
                 clip.setdefault("notes", "")
                 clip.setdefault("last_generation_info", {})
                 clip.setdefault("alternate_candidates", [])
+
+                # Repair loaded-media Timeline lengths from the actual decoded video
+                # stream. Older builds trusted container metadata and could show e.g.
+                # 7 s for a 17 s concert clip, shifting every later preview against
+                # the soundtrack while final assembly itself remained correct.
+                if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
+                    media_path = str(clip.get("start_source_video") or clip.get("output") or "").strip()
+                    if media_path and Path(media_path).is_file():
+                        precise_duration = self._probe_video_duration_precise(media_path)
+                        if precise_duration > 0.001:
+                            old_duration = float(clip.get("source_duration_seconds") or 0.0)
+                            if abs(precise_duration - old_duration) > (0.5 / FPS):
+                                clip["source_duration_seconds"] = precise_duration
+                                clip["frames"] = max(1, int(round(precise_duration * FPS)))
+                                print(
+                                    f"[TIMELINE] Corrected loaded-media duration "
+                                    f"{old_duration:.3f}s -> {precise_duration:.3f}s: {media_path}",
+                                    flush=True,
+                                )
+
                 clip["speed_multiplier"] = _clip_speed(clip)
                 if not clip.get("segments"):
                     clip["segments"] = [{"id": uuid.uuid4().hex, "prompt": "", "weight": 1.0}]
@@ -3744,7 +3796,80 @@ class TimelineTab(QWidget):
         self.cut_prompt.setTextCursor(cursor)
         self.cut_prompt.setFocus()
 
+    def _probe_video_duration_precise(self, path: str) -> float:
+        """Return the real video-stream duration for externally loaded media.
+
+        Some edited/VFR files carry misleading container duration metadata. Timeline
+        positioning must follow the actual decoded video length, otherwise later
+        clips and soundtrack previews start too early/late even though final FFmpeg
+        assembly still plays the complete file.
+        """
+        try:
+            from runtime.ffmpeg_tools import tool_path as ffmpeg_tool_path
+            exe = str(ffmpeg_tool_path("ffprobe.exe"))
+            cp = subprocess.run(
+                [
+                    exe, "-v", "error", "-count_frames", "-select_streams", "v:0",
+                    "-show_entries",
+                    "stream=duration,nb_read_frames,avg_frame_rate,r_frame_rate:format=duration",
+                    "-of", "json", str(path),
+                ],
+                capture_output=True, text=True, timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if cp.returncode != 0:
+                return 0.0
+            data = json.loads(cp.stdout or "{}")
+            stream = (data.get("streams") or [{}])[0]
+            candidates = []
+
+            try:
+                stream_duration = float(stream.get("duration") or 0.0)
+                if stream_duration > 0:
+                    candidates.append(stream_duration)
+            except Exception:
+                pass
+
+            def _rate(value):
+                value = str(value or "").strip()
+                if "/" in value:
+                    a, b = value.split("/", 1)
+                    a = float(a); b = float(b)
+                    return a / b if b else 0.0
+                return float(value or 0.0)
+
+            try:
+                frames = int(stream.get("nb_read_frames") or 0)
+            except Exception:
+                frames = 0
+            fps = 0.0
+            for key in ("avg_frame_rate", "r_frame_rate"):
+                try:
+                    fps = _rate(stream.get(key))
+                except Exception:
+                    fps = 0.0
+                if fps > 0.001:
+                    break
+            if frames > 0 and fps > 0.001:
+                candidates.append(frames / fps)
+
+            # Prefer actual video-stream/frame-count evidence. Container duration is
+            # only a fallback because edited files can have stale format metadata.
+            if candidates:
+                return max(candidates)
+
+            try:
+                fmt_duration = float((data.get("format") or {}).get("duration") or 0.0)
+                return fmt_duration if fmt_duration > 0 else 0.0
+            except Exception:
+                return 0.0
+        except Exception:
+            return 0.0
+
     def _probe_start_video_duration(self, path: str) -> float:
+        precise = self._probe_video_duration_precise(path)
+        if precise > 0.0:
+            return precise
         try:
             from runtime.ffmpeg_tools import tool_path as ffmpeg_tool_path
             exe = str(ffmpeg_tool_path("ffprobe.exe"))
@@ -4574,7 +4699,7 @@ class TimelineTab(QWidget):
         if not path.is_file():
             return False
         details = self._probe_video_details(str(path))
-        duration = float(details.get("duration") or self._probe_start_video_duration(str(path)) or 0.0)
+        duration = float(self._probe_video_duration_precise(str(path)) or details.get("duration") or self._probe_start_video_duration(str(path)) or 0.0)
         if duration <= 0.001:
             QMessageBox.warning(self, "Load clip", "Could not read the duration of this video file.")
             return False
@@ -6016,10 +6141,26 @@ class TimelineTab(QWidget):
                     clip["status"] = "pending"
                     clip["stale"] = False
                     clip["output"] = str(output or "")
-                    # A trim belongs to the previous rendered version. It was copied
-                    # into the archived candidate above; the new render starts with a
-                    # clean full-range assembly state.
-                    clip.pop("trim_in", None); clip.pop("trim_out", None)
+                    # Ordinary regeneration starts from a clean full-range render,
+                    # but HQ Restart is intentionally a resolution-only replacement of
+                    # an already edited Timeline. Preserve the exact edit boundaries so
+                    # the visible clip duration and every downstream music/clip position
+                    # remain unchanged.
+                    is_hq_restart = bool(
+                        isinstance(job_info, dict)
+                        and isinstance(job_info.get("timeline_hq_override"), dict)
+                        and job_info.get("timeline_hq_override")
+                    )
+                    if not is_hq_restart:
+                        clip.pop("trim_in", None)
+                        clip.pop("trim_out", None)
+                    else:
+                        print(
+                            f"[TIMELINE] HQ restart preserved trim for "
+                            f"{clip.get('name') or clip.get('id')}: "
+                            f"in={clip.get('trim_in')} out={clip.get('trim_out')}",
+                            flush=True,
+                        )
                     if info:
                         clip["last_generation_info"] = info
                 break

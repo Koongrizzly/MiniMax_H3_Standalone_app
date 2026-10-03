@@ -3110,7 +3110,15 @@ class MainWindow(QMainWindow):
                     getattr(self.timeline_widget, "project", {}).get("project_folder") or ""
                 ).strip()
                 if project_folder:
-                    settings["output_folder"] = project_folder
+                    # Keep HQ replacement renders separate from low-resolution/test
+                    # media. This changes only where the new MP4 is written; the
+                    # Timeline block and all of its edit metadata remain the same.
+                    if isinstance(hq_override, dict) and hq_override:
+                        hq_folder = Path(project_folder) / "hq_restart"
+                        hq_folder.mkdir(parents=True, exist_ok=True)
+                        settings["output_folder"] = str(hq_folder)
+                    else:
+                        settings["output_folder"] = project_folder
 
                 self._timeline_ref_audio_subjects = [int(x) for x in (settings.get("ref_audio_subjects") or [])]
                 self.apply_settings(settings)
@@ -3713,62 +3721,14 @@ class MainWindow(QMainWindow):
             except Exception:
                 user_trim_in = 0.0
 
-            # Search for a REAL multi-frame overlap between the previous visible
-            # tail and the beginning of this continuation. We only remove frames
-            # when at least 3 consecutive frames agree after compensating tiny
-            # exposure/contrast differences. A single similar frame is kept.
+            # Assembly timing must follow the visible Timeline exactly. Do not
+            # silently drop/re-align continuation frames here: hidden overlap
+            # removal changes clip duration without changing Timeline geometry,
+            # which shifts every later clip against the soundtrack.
             is_continuation = str(clip.get("generation_mode") or "new") == "continue"
             auto_overlap_drop_frames = 0
-            overlap_score = None
-            if is_continuation and clip_index > 0 and user_trim_in < (1.0 / 24.0 - 0.0005):
-                prev_clip = clips[clip_index - 1]
-                prev_path = outputs[clip_index - 1]
-                prev_transition = str(prev_clip.get("transition_to_next") or "none").strip().lower()
-                # An explicit transition is a user-authored join; do not secretly
-                # shorten either side underneath it.
-                if prev_transition in {"", "none"}:
-                    try:
-                        prev_source_duration = float(
-                            self._probe_clip_duration(str(prev_path), prev_clip.get("frames")) or 0.0
-                        )
-                    except Exception:
-                        prev_source_duration = 0.0
-                    try:
-                        prev_trim_in = max(0.0, float(prev_clip.get("trim_in") or 0.0))
-                    except Exception:
-                        prev_trim_in = 0.0
-                    raw_prev_out = prev_clip.get("trim_out")
-                    try:
-                        prev_trim_out = float(raw_prev_out) if raw_prev_out is not None else prev_source_duration
-                    except Exception:
-                        prev_trim_out = prev_source_duration
-                    if prev_source_duration > 0.0:
-                        prev_trim_out = min(max(prev_trim_out, prev_trim_in), prev_source_duration)
-
-                    auto_overlap_drop_frames, overlap_score, overlap_candidates = _detect_continuation_overlap(
-                        prev_path, prev_trim_out, path, user_trim_in
-                    )
-                    boundary_match_info.append({
-                        "clip_index": clip_index + 1,
-                        "overlap_frames": int(auto_overlap_drop_frames),
-                        "overlap_seconds": round(float(auto_overlap_drop_frames) / 24.0, 6),
-                        "score": None if overlap_score is None else round(float(overlap_score), 4),
-                        "candidates": [
-                            {
-                                "frames": int(frames),
-                                "avg": round(float(avg), 4),
-                                "peak": round(float(peak), 4),
-                            }
-                            for frames, avg, peak in overlap_candidates
-                        ],
-                    })
-
-            trim_in = 0.0 if auto_overlap_drop_frames > 0 else user_trim_in
-            effective_start = (
-                float(auto_overlap_drop_frames) / 24.0
-                if auto_overlap_drop_frames > 0
-                else trim_in
-            )
+            trim_in = user_trim_in
+            effective_start = trim_in
 
             raw_out = clip.get("trim_out")
             try:
@@ -3778,8 +3738,7 @@ class MainWindow(QMainWindow):
             source_duration = float(self._probe_clip_duration(str(path), clip.get("frames")) or 0.0)
             if source_duration > 0:
                 effective_start = min(effective_start, max(0.0, source_duration - 0.001))
-                if auto_overlap_drop_frames <= 0:
-                    trim_in = effective_start
+                trim_in = effective_start
                 if trim_out is None:
                     trim_out = source_duration
                 else:
@@ -3833,8 +3792,8 @@ class MainWindow(QMainWindow):
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
-        has_auto_overlap_trim = any(int(spec[7] or 0) > 0 for spec in trim_specs)
-        if has_trim or has_auto_overlap_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media or has_seam_color_match:
+        has_auto_overlap_trim = False
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media or has_seam_color_match:
             # Re-encode when Timeline editing requires it, or whenever a ready-made
             # external clip is present. Imported media may use different codecs,
             # frame rates or audio formats, so normalize it to the same 24-fps /
@@ -3864,7 +3823,7 @@ class MainWindow(QMainWindow):
                 # removed exactly in the filter graph below.
                 if trim_in > 0.001:
                     args += ["-ss", f"{trim_in:.6f}"]
-                read_duration = effective_duration + (float(auto_overlap_drop_frames) / 24.0)
+                read_duration = effective_duration
                 args += ["-t", f"{read_duration:.6f}", "-i", str(path)]
                 input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
 
@@ -3885,9 +3844,14 @@ class MainWindow(QMainWindow):
                 # Remove exactly the repeated prefix detected by the overlap
                 # search. If no multi-frame overlap was proven, preserve frame 0.
                 vprefix = f"[{i}:v:0]"
-                if auto_overlap_drop_frames > 0:
-                    vprefix += f"trim=start_frame={int(auto_overlap_drop_frames)},"
-                vchain = vprefix + f"setpts=(PTS-STARTPTS)/{speed_multiplier:.3f},fps=24,settb=AVTB"
+                # Enforce the Timeline's visible source duration again in the
+                # filter graph. Input-side -ss/-t is useful for efficiency, but
+                # this trim is the authoritative boundary for final assembly.
+                vchain = (
+                    vprefix
+                    + f"trim=start=0:duration={effective_duration:.6f},"
+                    + f"setpts=(PTS-STARTPTS)/{speed_multiplier:.3f},fps=24,settb=AVTB"
+                )
                 if normalize_mixed_resolution and target_resolution:
                     tw, th = target_resolution
                     vchain += (
@@ -3943,9 +3907,8 @@ class MainWindow(QMainWindow):
                     alabel = f"a{i}"
                     gain = max(0.0, min(2.0, float(volume_percent) / 100.0))
                     aprefix = f"[{i}:a:0]"
-                    if auto_overlap_drop_frames > 0:
-                        aprefix += f"atrim=start={float(auto_overlap_drop_frames) / 24.0:.9f},"
                     audio_filters = [
+                        f"atrim=start=0:duration={effective_duration:.6f}",
                         f"asetpts=PTS-STARTPTS",
                         f"atempo={speed_multiplier:.3f}",
                         f"volume={gain:.3f}",
@@ -4179,9 +4142,9 @@ class MainWindow(QMainWindow):
             "timeline_assembly_clip_count": len(outputs),
             "timeline_assembly_soundtrack_count": len(soundtrack_specs),
             "timeline_assembly_seam_color_matches": 0,
-            "timeline_assembly_boundary_matches": copy.deepcopy(boundary_match_info),
-            "timeline_assembly_auto_overlap_boundaries": sum(1 for item in boundary_match_info if int(item.get("overlap_frames") or 0) > 0),
-            "timeline_assembly_auto_overlap_frames": sum(int(item.get("overlap_frames") or 0) for item in boundary_match_info),
+            "timeline_assembly_boundary_matches": [],
+            "timeline_assembly_auto_overlap_boundaries": 0,
+            "timeline_assembly_auto_overlap_frames": 0,
             "timeline_assembly_soundtrack": copy.deepcopy(list((project or {}).get("soundtrack_clips") or [])),
         }
         self.queue_jobs.append(job)
@@ -4193,7 +4156,7 @@ class MainWindow(QMainWindow):
         self.append_log(
             f"\n=== TIMELINE ASSEMBLY QUEUED ===\n"
             f"{self._job_number_text(job)} • Clips: {len(outputs)}\n"
-            f"Boundary checks: {boundary_match_info}\n"
+            f"Assembly timing: exact Timeline trims; hidden overlap trimming disabled\n"
             f"Output: {final_path}\n"
         )
         self._start_next_pending()
