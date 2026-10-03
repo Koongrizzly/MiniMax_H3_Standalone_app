@@ -3176,7 +3176,7 @@ class MainWindow(QMainWindow):
         that stream-copies video and re-encodes only audio with FFmpeg.
         """
         try:
-            volume_percent = max(0, min(200, int(round(float(volume_percent)))))
+            volume_percent = max(0, min(300, int(round(float(volume_percent)))))
         except Exception:
             volume_percent = 100
         if volume_percent <= 100:
@@ -3242,7 +3242,7 @@ class MainWindow(QMainWindow):
             speed = max(0.5, min(2.0, float(speed_multiplier or 1.0)))
             clip_duration = max(0.04, source_used / speed)
             clip_end = clip_start + clip_duration
-            volume_percent = max(0, min(200, int(round(float(100 if volume_percent is None else volume_percent)))))
+            volume_percent = max(0, min(300, int(round(float(100 if volume_percent is None else volume_percent)))))
 
             overlaps = []
             for item in soundtrack_items:
@@ -3323,7 +3323,7 @@ class MainWindow(QMainWindow):
 
             filters = [f"[0:v:0]setpts=(PTS-STARTPTS)/{speed:.6f},fps=24,format=yuv420p[vout]"]
             if mode == "mix" and has_audio(path):
-                gain = max(0.0, min(2.0, volume_percent / 100.0))
+                gain = max(0.0, min(3.0, volume_percent / 100.0))
                 filters.append(
                     f"[0:a:0]asetpts=PTS-STARTPTS,atempo={speed:.6f},volume={gain:.6f},"
                     f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[abase]"
@@ -3384,7 +3384,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Timeline preview", "The selected timeline output file is no longer on disk.")
             return False
         try:
-            volume_percent = max(0, min(200, int(round(float(100 if volume_percent is None else volume_percent)))))
+            volume_percent = max(0, min(300, int(round(float(100 if volume_percent is None else volume_percent)))))
         except Exception:
             volume_percent = 100
 
@@ -3749,12 +3749,12 @@ class MainWindow(QMainWindow):
             trimmed = effective_start > 0.001 or (source_duration > 0 and trim_out < source_duration - 0.02)
             has_trim = has_trim or trimmed
             try:
-                volume_percent = max(0, min(200, int(round(float(100 if clip.get("volume_percent") is None else clip.get("volume_percent"))))))
+                volume_percent = max(0, min(300, int(round(float(100 if clip.get("volume_percent") is None else clip.get("volume_percent"))))))
             except Exception:
                 volume_percent = 100
             has_volume_adjustment = has_volume_adjustment or volume_percent != 100
             try:
-                speed_multiplier = max(0.5, min(2.0, round(float(clip.get("speed_multiplier", 1.0) or 1.0), 1)))
+                speed_multiplier = max(0.5, min(2.0, round(float(clip.get("speed_multiplier", 1.0) or 1.0), 2)))
             except Exception:
                 speed_multiplier = 1.0
             final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
@@ -3905,7 +3905,7 @@ class MainWindow(QMainWindow):
 
                 if has_audio:
                     alabel = f"a{i}"
-                    gain = max(0.0, min(2.0, float(volume_percent) / 100.0))
+                    gain = max(0.0, min(3.0, float(volume_percent) / 100.0))
                     aprefix = f"[{i}:a:0]"
                     audio_filters = [
                         f"atrim=start=0:duration={effective_duration:.6f}",

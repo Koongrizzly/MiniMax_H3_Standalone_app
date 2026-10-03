@@ -276,7 +276,7 @@ def _clip_seconds(clip: dict) -> float:
 def _clip_speed(clip: dict) -> float:
     """Post-process playback speed stored on a Timeline block."""
     try:
-        return max(0.5, min(2.0, round(float(clip.get("speed_multiplier", 1.0) or 1.0), 1)))
+        return max(0.5, min(2.0, round(float(clip.get("speed_multiplier", 1.0) or 1.0), 2)))
     except Exception:
         return 1.0
 
@@ -4886,7 +4886,7 @@ class TimelineTab(QWidget):
             video_fade_out_action = menu.addAction(
                 f"Video fade out to black…  {max(0.0, float(clip.get('video_fade_out_seconds') or 0.0)):.1f}s"
             )
-        speed_action = menu.addAction(f"Speed…  {_clip_speed(clip):.1f}x")
+        speed_action = menu.addAction(f"Speed…  {_clip_speed(clip):.2f}x")
         transition_name = _transition_name(clip)
         transition_suffix = "" if transition_name == "none" else f"  {_TRANSITION_LABELS.get(transition_name, transition_name)} {_transition_requested_seconds(clip):.1f}s"
         transition_action = menu.addAction(f"Transition to next clip…{transition_suffix}")
@@ -5237,12 +5237,12 @@ class TimelineTab(QWidget):
             current = int(round(float(100 if clip.get("volume_percent") is None else clip.get("volume_percent"))))
         except Exception:
             current = 100
-        current = max(0, min(200, current))
+        current = max(0, min(300, current))
         value, accepted = QInputDialog.getInt(
             self,
             "Clip volume",
-            "Volume for this clip (0% = mute, 100% = original, 200% = boost):",
-            current, 0, 200, 1,
+            "Volume for this clip (0% = mute, 100% = original, 300% = boost):",
+            current, 0, 300, 1,
         )
         if not accepted or int(value) == current:
             return bool(accepted)
@@ -5350,12 +5350,12 @@ class TimelineTab(QWidget):
         dlg.setLabelText("Playback speed for this clip (0.5x = half speed, 2.0x = double speed):")
         dlg.setInputMode(QInputDialog.InputMode.DoubleInput)
         dlg.setDoubleRange(0.5, 2.0)
-        dlg.setDoubleDecimals(1)
-        dlg.setDoubleStep(0.1)
+        dlg.setDoubleDecimals(2)
+        dlg.setDoubleStep(0.01)
         dlg.setDoubleValue(current)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return False
-        value = max(0.5, min(2.0, round(float(dlg.doubleValue()), 1)))
+        value = max(0.5, min(2.0, round(float(dlg.doubleValue()), 2)))
         if abs(value - current) < 0.0001:
             return True
         self._record_undo_state("Change clip speed")
@@ -5619,7 +5619,7 @@ class TimelineTab(QWidget):
             f"HQ: {'Yes' if clip.get('hq_generated') else 'No'}",
             f"References: {len(_reference_entries(clip))}",
             f"Assembly trim: {trim_text}",
-            f"Speed: {_clip_speed(clip):.1f}x",
+            f"Speed: {_clip_speed(clip):.2f}x",
             f"Transition to next: {(_TRANSITION_LABELS.get(_transition_name(clip), 'None') + ('  ' + format(_transition_requested_seconds(clip), '.1f') + 's' if _transition_name(clip) != 'none' else ''))}",
         ]
         if generated:
