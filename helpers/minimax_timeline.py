@@ -57,6 +57,21 @@ MIN_CUT_SECONDS = MIN_SEGMENT_SECONDS
 TIMELINE_SCHEMA_VERSION = 4
 TIMELINE_MAX_REF_IMAGES = 9
 
+# Keep these labels in sync with the Generation tab in minimax_h3_gui.py.
+# The 720p label maps to MiniMax H3's valid 1280x704 tensor size and the
+# 1080p label maps to 1920x1088, exactly like the Generation tab.
+TIMELINE_RESOLUTION_PRESETS = [
+    "576 × 320",
+    "736 × 384",
+    "832 × 448",
+    "960 × 544",
+    "1024 × 576",
+    "1152 × 640",
+    "1280 × 720",
+    "1344 × 768",
+    "1920 × 1088",
+]
+
 
 class ClipTrimDialog(QDialog):
     """Non-destructive in/out editor for an existing rendered timeline clip."""
@@ -1981,6 +1996,8 @@ class TimelineTab(QWidget):
             "queue_job_id": None,
             "output": "",
             "hq_generated": False,
+            "hq_restart_cancelled": False,
+            "hq_restart_locked": False,
             "locked": False,
             "notes": "",
             "last_generation_info": {},
@@ -2877,6 +2894,89 @@ class TimelineTab(QWidget):
                 continue
             return project_name, project_folder
 
+    def _resolution_override_from_preset(self, preset: str) -> dict:
+        """Build a queue/settings resolution override matching the Generation tab."""
+        preset = str(preset or "").strip()
+        if preset not in TIMELINE_RESOLUTION_PRESETS:
+            return {}
+        current = self.project.get("global_generation_settings") or self._capture_settings()
+        current_aspect = str((current or {}).get("aspect") or "16:9")
+        if current_aspect not in {"16:9", "9:16", "1:1"}:
+            current_aspect = "16:9"
+        return {"aspect": current_aspect, "resolution": preset}
+
+    @staticmethod
+    def _apply_resolution_override_to_settings(settings: dict, override: dict) -> None:
+        if not isinstance(settings, dict) or not isinstance(override, dict):
+            return
+        aspect = str(override.get("aspect") or "").strip()
+        if aspect in {"16:9", "9:16", "1:1", "21:9"}:
+            settings["aspect"] = aspect
+        resolution = str(override.get("resolution") or "").strip()
+        if resolution:
+            settings["resolution"] = resolution
+        widescreen = str(override.get("widescreen_quality") or "").strip()
+        if widescreen:
+            settings["widescreen_quality"] = widescreen
+
+    def _set_initial_timeline_resolution(self, preset: str) -> bool:
+        """Set the new project's baseline resolution without replacing other settings."""
+        override = self._resolution_override_from_preset(preset)
+        if not override:
+            return False
+        baseline = self.project.get("global_generation_settings")
+        if not isinstance(baseline, dict) or not baseline:
+            baseline = self._timeline_global_settings()
+        baseline = copy.deepcopy(baseline)
+        self._apply_resolution_override_to_settings(baseline, override)
+        self.project["global_generation_settings"] = baseline
+        for clip in self._clips():
+            if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
+                continue
+            settings = clip.setdefault("settings", {})
+            self._apply_resolution_override_to_settings(settings, override)
+        self._refresh_generation_resolution_label()
+        self._refresh_all()
+        return True
+
+    def _offer_new_project_generation_setup(self) -> None:
+        """Offer Generation-tab settings and an optional resolution when a project is named."""
+        use_box = QMessageBox(self)
+        use_box.setWindowTitle("Timeline generation settings")
+        use_box.setIcon(QMessageBox.Icon.Question)
+        use_box.setText("Use the current settings from the Generation tab for this Timeline project?")
+        use_box.setInformativeText(
+            "Yes uses the same action as the 'Use current Generation settings' button. "
+            "Timeline prompts, references and clip durations remain Timeline-owned."
+        )
+        yes_btn = use_box.addButton("Yes — use Generation settings", QMessageBox.ButtonRole.AcceptRole)
+        no_btn = use_box.addButton("No — keep current Timeline settings", QMessageBox.ButtonRole.RejectRole)
+        use_box.exec()
+        if use_box.clickedButton() is yes_btn:
+            self.use_current_generation_settings()
+
+        res_box = QMessageBox(self)
+        res_box.setWindowTitle("Timeline resolution")
+        res_box.setIcon(QMessageBox.Icon.Question)
+        res_box.setText("Do you want to set a resolution for this Timeline project?")
+        res_box.setInformativeText(
+            "Keep leaves the resolution already present in the Timeline/Generation settings unchanged. "
+            "Change lets you choose one of the normal Generation-tab resolution presets."
+        )
+        keep_btn = res_box.addButton("Keep", QMessageBox.ButtonRole.AcceptRole)
+        change_btn = res_box.addButton("Change…", QMessageBox.ButtonRole.ActionRole)
+        res_box.exec()
+        if res_box.clickedButton() is not change_btn:
+            return
+        current_settings = self.project.get("global_generation_settings", {})
+        current_preset = str((current_settings or {}).get("resolution") or "").strip()
+        default_index = TIMELINE_RESOLUTION_PRESETS.index(current_preset) if current_preset in TIMELINE_RESOLUTION_PRESETS else 0
+        choice, accepted = QInputDialog.getItem(
+            self, "Timeline resolution", "Select resolution:", TIMELINE_RESOLUTION_PRESETS, default_index, False
+        )
+        if accepted:
+            self._set_initial_timeline_resolution(str(choice))
+
     def _ensure_project_setup_for_first_edit(self):
         """Ask for project identity the first time the startup Timeline is edited.
 
@@ -2914,6 +3014,7 @@ class TimelineTab(QWidget):
         self.summary_label.setToolTip(
             f"Project folder: {project_folder}\nRecovery: {self._autosave_temp_path}"
         )
+        self._offer_new_project_generation_setup()
         return True
 
     def new_project(self):
@@ -2975,6 +3076,7 @@ class TimelineTab(QWidget):
         except Exception:
             pass
         self._refresh_all(select_first=True)
+        self._offer_new_project_generation_setup()
 
     def save_project(self):
         # The temporary autosave is only a recovery file. It must never silently
@@ -3170,6 +3272,8 @@ class TimelineTab(QWidget):
                 clip.setdefault("queue_job_id", None)
                 clip.setdefault("output", "")
                 clip.setdefault("hq_generated", False)
+                clip.setdefault("hq_restart_cancelled", False)
+                clip.setdefault("hq_restart_locked", False)
                 clip.setdefault("locked", False)
                 clip.setdefault("notes", "")
                 clip.setdefault("last_generation_info", {})
@@ -4749,9 +4853,17 @@ class TimelineTab(QWidget):
             self._refresh_all()
 
         menu = QMenu(self)
+        locked = bool(clip.get("locked", False))
+        media_clip = str(clip.get("generation_mode") or "") in {"source", "loaded"}
         regenerate = menu.addAction("(Re)generate this clip")
         regenerate_alternate = menu.addAction("Regenerate as alternate")
         low_res_test = menu.addAction("Create low res test")
+        resolution_menu = menu.addMenu("Create this clip in another resolution")
+        resolution_actions = {}
+        for preset in TIMELINE_RESOLUTION_PRESETS:
+            action = resolution_menu.addAction(preset)
+            action.setToolTip(f"Recreate only this clip at {preset}, keeping its other Timeline settings unchanged.")
+            resolution_actions[action] = preset
         ref_presets = menu.addAction("Ref presets…")
 
         candidates_menu = menu.addMenu("Alternate candidates")
@@ -4780,17 +4892,30 @@ class TimelineTab(QWidget):
         transition_action = menu.addAction(f"Transition to next clip…{transition_suffix}")
         remove = menu.addAction("Remove clip from timeline")
         menu.addSeparator()
+        active_hq = self.project.get("hq_restart_override") or {}
+        hq_cancel_action = None
+        if isinstance(active_hq, dict) and active_hq and not media_clip:
+            hq_cancel_action = menu.addAction("Cancel HQ restart for this clip")
+            hq_cancel_action.setToolTip(
+                "Remove the project-wide HQ restart resolution lock from this clip. "
+                "The current HQ video is kept, but the clip is unlocked and can be recreated at a lower resolution again."
+            )
+            hq_cancel_action.setEnabled(not bool(clip.get("hq_restart_cancelled", False)))
         lock_action = menu.addAction("Unlock clip" if bool(clip.get("locked", False)) else "Lock clip")
         notes = menu.addAction("Add / read notes")
         info = menu.addAction("Info")
 
-        locked = bool(clip.get("locked", False))
-        media_clip = str(clip.get("generation_mode") or "") in {"source", "loaded"}
         preview_path = self._clip_preview_path(clip)
         output_exists = bool(preview_path)
         regenerate.setEnabled(not locked and not media_clip)
         regenerate_alternate.setEnabled(not locked and not media_clip and output_exists)
         low_res_test.setEnabled(not locked and not media_clip)
+        hq_clip_locked = bool(isinstance(active_hq, dict) and active_hq and not clip.get("hq_restart_cancelled", False))
+        resolution_menu.setEnabled(not locked and not media_clip and not hq_clip_locked)
+        if hq_clip_locked:
+            resolution_menu.setToolTip("Use 'Cancel HQ restart for this clip' first to allow another resolution.")
+        elif locked:
+            resolution_menu.setToolTip("Unlock this clip before recreating it at another resolution.")
         ref_presets.setEnabled(any(
             not bool(c.get("locked", False)) and str(c.get("generation_mode") or "") not in {"source", "loaded"}
             for c in self._clips() if str(c.get("id")) in self.selected_clip_ids
@@ -4811,6 +4936,8 @@ class TimelineTab(QWidget):
             self._generate_alternate_by_id(clip_id)
         elif chosen is low_res_test:
             self._generate_low_res_test_by_id(clip_id)
+        elif chosen in resolution_actions:
+            self._create_clip_at_resolution_by_id(clip_id, resolution_actions[chosen])
         elif chosen is ref_presets:
             self._open_ref_presets()
         elif chosen is load_clip_action:
@@ -4837,6 +4964,8 @@ class TimelineTab(QWidget):
             self._set_clip_transition_by_id(clip_id)
         elif chosen is remove:
             self._remove_clip_by_id(clip_id)
+        elif hq_cancel_action is not None and chosen is hq_cancel_action:
+            self._cancel_hq_restart_for_clip_by_id(clip_id)
         elif chosen is lock_action:
             self._toggle_clip_lock_by_id(clip_id)
         elif chosen is notes:
@@ -5643,7 +5772,11 @@ class TimelineTab(QWidget):
             # HQ restart is a project-level generation mode. Once selected, keep
             # using the same override for later single-clip regenerations and
             # subsequent timeline generation, including after save/reload.
-            if hq_override and str(clip.get("generation_mode") or "") not in {"source", "loaded"}:
+            if (
+                hq_override
+                and not bool(clip.get("hq_restart_cancelled", False))
+                and str(clip.get("generation_mode") or "") not in {"source", "loaded"}
+            ):
                 spec["timeline_hq_override"] = copy.deepcopy(hq_override)
             # Edit/replacement topology is used only by Regenerate selected block.
             spec["match_next_first_frame"] = False
@@ -5830,7 +5963,7 @@ class TimelineTab(QWidget):
                         clip["hq_generated"] = False
                     else:
                         active_hq = self.project.get("hq_restart_override") or {}
-                        if isinstance(active_hq, dict) and active_hq:
+                        if isinstance(active_hq, dict) and active_hq and not bool(clip.get("hq_restart_cancelled", False)):
                             clip["hq_generated"] = True
                     self._invalidate_assembly(
                         "Low-res test queued — assemble again when ready."
@@ -5879,6 +6012,50 @@ class TimelineTab(QWidget):
             if hasattr(self, "generate_selected_btn"):
                 self.generate_selected_btn.setText(old_button_text)
                 self._refresh_edit_workflow(self._selected_clip())
+
+    def _create_clip_at_resolution_by_id(self, clip_id, preset: str):
+        idx, clip = self._clip_by_id(clip_id)
+        if clip is None or idx < 0:
+            return False
+        if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
+            return False
+        active_hq = self.project.get("hq_restart_override") or {}
+        if isinstance(active_hq, dict) and active_hq and not bool(clip.get("hq_restart_cancelled", False)):
+            QMessageBox.information(
+                self,
+                "HQ restart is active",
+                "Use 'Cancel HQ restart for this clip' first. That removes the project HQ resolution lock from this clip so it can be created at another resolution.",
+            )
+            return False
+        if bool(clip.get("locked", False)):
+            QMessageBox.information(self, "Timeline edit", "This block is locked. Unlock it before recreating it at another resolution.")
+            return False
+        override = self._resolution_override_from_preset(preset)
+        if not override:
+            return False
+        self.selected_clip_id = str(clip_id)
+        self.selected_clip_ids = {str(clip_id)}
+        self._selection_anchor_id = str(clip_id)
+        result = self._generate_selected_impl(one_shot_resolution_override=override)
+        if result:
+            clip["hq_generated"] = self._resolution_height_from_text(preset) >= 704
+            self._refresh_all()
+        return result
+
+    def _cancel_hq_restart_for_clip_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if clip is None:
+            return False
+        active_hq = self.project.get("hq_restart_override") or {}
+        if not isinstance(active_hq, dict) or not active_hq:
+            return False
+        self._record_undo_state("Cancel HQ restart for clip")
+        clip["hq_restart_cancelled"] = True
+        if bool(clip.get("hq_restart_locked", False)):
+            clip["locked"] = False
+        clip["hq_restart_locked"] = False
+        self._refresh_all()
+        return True
 
     def _clip_has_usable_output(self, clip: dict) -> bool:
         """Return True only when this block already has a video that can be reused."""
@@ -6024,7 +6201,11 @@ class TimelineTab(QWidget):
             active_hq = self.project.get("hq_restart_override") or {}
             if isinstance(active_hq, dict) and active_hq:
                 for i in indices:
-                    if 0 <= i < len(clips) and str(clips[i].get("generation_mode") or "") not in {"source", "loaded"}:
+                    if (
+                        0 <= i < len(clips)
+                        and not bool(clips[i].get("hq_restart_cancelled", False))
+                        and str(clips[i].get("generation_mode") or "") not in {"source", "loaded"}
+                    ):
                         clips[i]["hq_generated"] = True
             self.project["assembled_output"] = ""
             self.project["assembly_status"] = ""
@@ -6106,6 +6287,9 @@ class TimelineTab(QWidget):
                 clip = self._clips()[i]
                 if str(clip.get("generation_mode") or "") not in {"source", "loaded"}:
                     clip["hq_generated"] = True
+                    clip["hq_restart_cancelled"] = False
+                    clip["hq_restart_locked"] = True
+                    clip["locked"] = True
             self.project["assembled_output"] = ""
             self.project["assembly_status"] = ""
             self.project["auto_assemble"] = False
