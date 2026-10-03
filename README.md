@@ -54,6 +54,25 @@ Main Features :
   
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026-09-25%2023_13_56-.jpg)
 
+Watch a 6 minute shortfilm made from scratch with the timeline director on youtube (click the image below)
+
+
+  <p align="center">
+  <a href="https://youtu.be/uye8BzmC_jE">
+    <img
+      src="https://i.ytimg.com/vi/uye8BzmC_jE/0.jpg"
+      width="800"
+      alt="GrizzlyMax video demo"
+    >
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://youtu.be/uye8BzmC_jE">
+    ▶ Watch the full video on YouTube
+  </a>
+</p>
+  
 - 09/13/26 :
 
   Added support for several int8 models, including the singularity & SparseRef15_Hybrid checkpoints.
@@ -84,7 +103,7 @@ Main Features :
  
   Add an idea, extra details, camera shots, location(s) in the idea tab and a music track and click start
   to create a full music videoclip with the click of a button.
-  
+
 
 ---
 
