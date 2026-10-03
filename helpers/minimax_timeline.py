@@ -1187,7 +1187,7 @@ class TimelineCanvas(QWidget):
         self.update()
 
     def set_zoom(self, pixels_per_second: float):
-        self.pixels_per_second = max(16.0, min(120.0, float(pixels_per_second)))
+        self.pixels_per_second = max(0.25, min(120.0, float(pixels_per_second)))
         self.setMinimumWidth(self._content_width())
         self.setMinimumHeight(self._required_height())
         self.resize(self._content_width(), self._required_height())
@@ -1569,7 +1569,9 @@ class TimelineCanvas(QWidget):
         for idx, clip in enumerate(self.clips):
             source_duration = _clip_seconds(clip)
             duration = _clip_timeline_seconds(clip)
-            width = max(74.0, duration * self.pixels_per_second)
+            # At overview zoom levels clips are allowed to become genuinely small.
+            # The old 74 px floor prevented long projects from ever fitting on screen.
+            width = max(6.0, duration * self.pixels_per_second)
             left, right = cursor, cursor + width
             self._rects.append((str(clip.get("id")), left, right))
             clip_id = str(clip.get("id"))
@@ -1581,101 +1583,101 @@ class TimelineCanvas(QWidget):
             painter.setPen(QPen(accent if selected else border, 3 if primary_selected else (2 if selected else 1)))
             painter.drawRoundedRect(int(left), self.CLIP_TOP, int(width - 4), self.CLIP_H, 5, 5)
 
-            # Clip header.
-            painter.setPen(accent_text if selected else text)
-            name = str(clip.get("name") or f"Clip {idx + 1}")
-            name_width = int(max(20, width - (58 if bool(clip.get("locked", False)) else 18)))
-            info_width = int(max(20, width - 18))
-            elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, name_width)
-            painter.drawText(int(left + 8), self.CLIP_TOP + 18, elided)
-            if bool(clip.get("locked", False)):
-                lock_font = QFont(font)
-                lock_font.setPointSize(max(7, font.pointSize() - 2))
-                lock_font.setBold(True)
-                painter.setFont(lock_font)
-                lock_text = "LOCK"
-                lock_w = painter.fontMetrics().horizontalAdvance(lock_text)
-                painter.setPen(QColor("#f4d35e"))
-                painter.drawText(int(right - lock_w - 10), self.CLIP_TOP + 18, lock_text)
-                painter.setFont(font)
-            if clip.get("generation_mode") == "source":
-                mode = "▣ Loaded start clip"
-            elif clip.get("generation_mode") == "loaded":
-                mode = "▣ Loaded clip"
-            else:
-                mode = "↪ Continue" if clip.get("generation_mode") == "continue" else "◆ New"
-            edit_mode = str(clip.get("edit_mode") or "")
-            bridge = "  •  ⇥ Next frame" if edit_mode in {"bridge_both", "anchor_next"} else ""
-            ref_count = len(_reference_entries(clip)) if bool(clip.get("use_reference_images", False)) else 0
-            refs_info = f"  •  Ref2VA ×{ref_count}" if ref_count else ""
-            if clip.get("trim_out") is not None:
-                duration_text = f"{duration:.2f}s used"
-            else:
-                duration_text = f"{duration:.2f}s"
-            info = f"{mode}  •  {int(clip.get('frames') or 0)}f  •  {duration_text}{bridge}{refs_info}"
-            painter.setPen(muted if not selected else accent_text)
-            painter.drawText(int(left + 8), self.CLIP_TOP + 38, fm.elidedText(info, Qt.TextElideMode.ElideRight, info_width))
+            # Clip details adapt to the actual block width. At overview zoom
+            # levels the status colour and clip boundary matter more than text, so
+            # labels and thumbnails progressively disappear instead of forcing a
+            # minimum width that makes the project scroll horizontally.
+            show_name = width >= 34
+            show_info = width >= 86
+            show_prompt = width >= 58
+            show_thumb = width >= 92
 
-            # Show a compact prompt preview. If an output clip already exists, also
-            # draw a small thumbnail so timeline blocks are visually recognizable.
-            prompt_y = self.CLIP_TOP + 53
-            prompt_h = 42
-            box_left = int(left + 5)
-            box_w = max(1, int(width - 14))
-            painter.setBrush(QBrush(QColor("#375a7f")))
-            painter.setPen(QPen(bg, 1))
-            painter.drawRect(box_left, prompt_y, box_w, prompt_h)
-            if clip.get("generation_mode") in {"source", "loaded"}:
-                source = str(clip.get("start_source_video") or clip.get("output") or "").strip()
-                prompt = Path(source).name if source else "No loaded video"
-            else:
-                prompt = _compiled_prompt(clip).replace("\n", " ").strip() or "Empty prompt"
+            if show_name:
+                painter.setPen(accent_text if selected else text)
+                name = str(clip.get("name") or f"Clip {idx + 1}")
+                name_width = int(max(8, width - (58 if bool(clip.get("locked", False)) else 18)))
+                elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, name_width)
+                painter.drawText(int(left + 8), self.CLIP_TOP + 18, elided)
+                if bool(clip.get("locked", False)) and width >= 74:
+                    lock_font = QFont(font)
+                    lock_font.setPointSize(max(7, font.pointSize() - 2))
+                    lock_font.setBold(True)
+                    painter.setFont(lock_font)
+                    lock_text = "LOCK"
+                    lock_w = painter.fontMetrics().horizontalAdvance(lock_text)
+                    painter.setPen(QColor("#f4d35e"))
+                    painter.drawText(int(right - lock_w - 10), self.CLIP_TOP + 18, lock_text)
+                    painter.setFont(font)
 
-            text_left = box_left + 6
-            text_w = max(12, box_w - 12)
-            image = self._clip_thumbnail(clip)
-            if image is not None and box_w >= 70:
-                thumb_rect = QRect(box_left + 4, prompt_y + 3, self.THUMB_W, self.THUMB_H)
-                painter.fillRect(thumb_rect, QColor("#223548"))
-                # The v4 extractor already returns an exact THUMB_W x THUMB_H
-                # raster. Paint it 1:1: no Qt-side resize and no source-rect
-                # overloads are involved.
-                painter.drawImage(thumb_rect.x(), thumb_rect.y(), image)
-                painter.setPen(QPen(QColor("#8ea7bf"), 1))
-                # drawRect() uses both the current pen and brush. The prompt
-                # preview left a solid blue brush active, which was filling this
-                # rectangle *after* drawImage() and hiding the thumbnail.
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(thumb_rect)
-                text_left = thumb_rect.right() + 8
-                text_w = max(12, box_left + box_w - text_left - 6)
+            if show_info:
+                if clip.get("generation_mode") == "source":
+                    mode = "▣ Loaded start clip"
+                elif clip.get("generation_mode") == "loaded":
+                    mode = "▣ Loaded clip"
+                else:
+                    mode = "↪ Continue" if clip.get("generation_mode") == "continue" else "◆ New"
+                edit_mode = str(clip.get("edit_mode") or "")
+                bridge = "  •  ⇥ Next frame" if edit_mode in {"bridge_both", "anchor_next"} else ""
+                ref_count = len(_reference_entries(clip)) if bool(clip.get("use_reference_images", False)) else 0
+                refs_info = f"  •  Ref2VA ×{ref_count}" if ref_count else ""
+                if clip.get("trim_out") is not None:
+                    duration_text = f"{duration:.2f}s used"
+                else:
+                    duration_text = f"{duration:.2f}s"
+                info = f"{mode}  •  {int(clip.get('frames') or 0)}f  •  {duration_text}{bridge}{refs_info}"
+                painter.setPen(muted if not selected else accent_text)
+                info_width = int(max(12, width - 18))
+                painter.drawText(int(left + 8), self.CLIP_TOP + 38, fm.elidedText(info, Qt.TextElideMode.ElideRight, info_width))
 
-                # Compact status/provenance badges below the thumbnail. They
-                # describe the active rendered clip rather than merely the current
-                # editor settings, so old clips remain truthful after later edits.
-                badge_font = QFont(font)
-                badge_font.setPointSize(max(7, font.pointSize() - 2))
-                badge_font.setBold(True)
-                painter.setFont(badge_font)
-                badge_y = prompt_y + prompt_h + 13
-                left_badges, right_badges = self._status_badges(idx, clip)
+            if show_prompt:
+                # Show a compact prompt preview. If an output clip already exists,
+                # also draw a thumbnail when the block is wide enough to make it useful.
+                prompt_y = self.CLIP_TOP + 53
+                prompt_h = 42
+                box_left = int(left + 5)
+                box_w = max(1, int(width - 14))
+                painter.setBrush(QBrush(QColor("#375a7f")))
+                painter.setPen(QPen(bg, 1))
+                painter.drawRect(box_left, prompt_y, box_w, prompt_h)
+                if clip.get("generation_mode") in {"source", "loaded"}:
+                    source = str(clip.get("start_source_video") or clip.get("output") or "").strip()
+                    prompt = Path(source).name if source else "No loaded video"
+                else:
+                    prompt = _compiled_prompt(clip).replace("\n", " ").strip() or "Empty prompt"
+
+                text_left = box_left + 6
+                text_w = max(8, box_w - 12)
+                image = self._clip_thumbnail(clip) if show_thumb else None
+                if image is not None and box_w >= 70:
+                    thumb_rect = QRect(box_left + 4, prompt_y + 3, self.THUMB_W, self.THUMB_H)
+                    painter.fillRect(thumb_rect, QColor("#223548"))
+                    painter.drawImage(thumb_rect.x(), thumb_rect.y(), image)
+                    painter.setPen(QPen(QColor("#8ea7bf"), 1))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRect(thumb_rect)
+                    text_left = thumb_rect.right() + 8
+                    text_w = max(8, box_left + box_w - text_left - 6)
+
+                    # Compact status/provenance badges below the thumbnail.
+                    badge_font = QFont(font)
+                    badge_font.setPointSize(max(7, font.pointSize() - 2))
+                    badge_font.setBold(True)
+                    painter.setFont(badge_font)
+                    badge_y = prompt_y + prompt_h + 13
+                    left_badges, right_badges = self._status_badges(idx, clip)
+                    painter.setPen(QColor("#f4f6f8"))
+                    if left_badges:
+                        painter.drawText(thumb_rect.left(), badge_y, " ".join(left_badges))
+                    if right_badges:
+                        right_text = " ".join(right_badges)
+                        right_w = painter.fontMetrics().horizontalAdvance(right_text)
+                        badge_right = int(right - 10)
+                        painter.drawText(max(int(left + 8), badge_right - right_w), badge_y, right_text)
+                    painter.setFont(font)
+
                 painter.setPen(QColor("#f4f6f8"))
-                if left_badges:
-                    painter.drawText(thumb_rect.left(), badge_y, " ".join(left_badges))
-                if right_badges:
-                    right_text = " ".join(right_badges)
-                    right_w = painter.fontMetrics().horizontalAdvance(right_text)
-                    # Right-side badges describe the outgoing edge of this clip
-                    # (notably "Transition to next"), so pin them to the clip's
-                    # right edge.  This both gives long transition labels room and
-                    # visually places the label at the cut where the effect occurs.
-                    badge_right = int(right - 10)
-                    painter.drawText(max(int(left + 8), badge_right - right_w), badge_y, right_text)
-                painter.setFont(font)
-
-            painter.setPen(QColor("#f4f6f8"))
-            text_rect = QRect(text_left, prompt_y + 2, text_w, prompt_h - 4)
-            painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine), fm.elidedText(prompt, Qt.TextElideMode.ElideRight, text_w))
+                text_rect = QRect(text_left, prompt_y + 2, text_w, prompt_h - 4)
+                painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine), fm.elidedText(prompt, Qt.TextElideMode.ElideRight, text_w))
 
             if clip.get("generation_mode") == "continue" and idx > 0:
                 painter.setPen(QPen(accent, 2))
@@ -2229,16 +2231,7 @@ class TimelineTab(QWidget):
         self.right_btn = QPushButton("▶")
         for w in (self.new_btn, self.save_btn, self.load_btn, self.undo_btn, self.redo_btn, self.add_clip_btn, self.dup_clip_btn, self.del_clip_btn, self.lock_clip_btn, self.selection_btn, self.left_btn, self.right_btn):
             toolbar.addWidget(w)
-        toolbar.addSpacing(10)
-        toolbar.addWidget(QLabel("Zoom"))
-        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(16, 100)
-        self.zoom_slider.setValue(38)
-        self.zoom_slider.setFixedWidth(130)
-        toolbar.addWidget(self.zoom_slider)
         toolbar.addStretch(1)
-        self.summary_label = QLabel()
-        toolbar.addWidget(self.summary_label)
         root.addLayout(toolbar)
 
         # Timeline actions live inside the Timeline tab so the main workflow is
@@ -2303,7 +2296,36 @@ class TimelineTab(QWidget):
         runbar.addWidget(self.add_audio_btn)
         runbar.addWidget(self.soundtrack_mode_combo)
         runbar.addWidget(self.assemble_timeline_btn)
-        runbar.addWidget(self.use_generation_settings_btn)
+        runbar.addStretch(1)
+        root.addLayout(runbar)
+
+        # Third toolbar row: viewing controls and generation-setting capture are
+        # intentionally separated from the action rows so long project summaries,
+        # the zoom control and the active resolution all have room to remain visible.
+        viewbar = QHBoxLayout()
+        viewbar.setSpacing(8)
+        viewbar.addWidget(QLabel("Zoom"))
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(1, 120)
+        self.zoom_slider.setValue(38)
+        self.zoom_slider.setMinimumWidth(220)
+        self.zoom_slider.setMaximumWidth(420)
+        self.zoom_slider.setToolTip(
+            "Zoom the Timeline horizontally. The lower range now allows a much more compact overview of long projects."
+        )
+        viewbar.addWidget(self.zoom_slider, 1)
+        self.show_full_project_btn = QPushButton("Show full project")
+        self.show_full_project_btn.setMinimumHeight(36)
+        self.show_full_project_btn.setToolTip(
+            "Fit the full video project into the currently available Timeline width. "
+            "At very small clip widths labels and thumbnails are hidden automatically."
+        )
+        viewbar.addWidget(self.show_full_project_btn)
+        self.summary_label = QLabel()
+        self.summary_label.setMinimumWidth(260)
+        viewbar.addWidget(self.summary_label)
+        viewbar.addStretch(1)
+        viewbar.addWidget(self.use_generation_settings_btn)
         self.generation_resolution_label = QLabel("Resolution: —")
         self.generation_resolution_label.setToolTip(
             "Resolution currently captured for new Timeline generations. "
@@ -2312,9 +2334,8 @@ class TimelineTab(QWidget):
         self.generation_resolution_label.setStyleSheet(
             "QLabel { color: #82e7ff; font-weight: 600; padding: 0 8px; }"
         )
-        runbar.addWidget(self.generation_resolution_label)
-        runbar.addStretch(1)
-        root.addLayout(runbar)
+        viewbar.addWidget(self.generation_resolution_label)
+        root.addLayout(viewbar)
 
         self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.workspace_splitter.setChildrenCollapsible(False)
@@ -2548,6 +2569,7 @@ class TimelineTab(QWidget):
         self.left_btn.clicked.connect(lambda: self.move_clip(-1))
         self.right_btn.clicked.connect(lambda: self.move_clip(1))
         self.zoom_slider.valueChanged.connect(self.canvas.set_zoom)
+        self.show_full_project_btn.clicked.connect(self.show_full_project)
         self.canvas.clipSelected.connect(self.select_clip)
         self.canvas.clipSelectionRequested.connect(self._selection_requested)
         self.canvas.clipsReordered.connect(self._reorder_clips)
@@ -2571,6 +2593,32 @@ class TimelineTab(QWidget):
         self.add_refs_btn.clicked.connect(self._add_reference_images)
 
     # -------------------------------------------------------------- refreshers
+    def show_full_project(self):
+        """Fit the complete video timeline into the visible Timeline viewport."""
+        clips = self._clips()
+        if not clips:
+            return
+
+        # Use the real chained duration including transition overlaps. The canvas
+        # begins at x=26 and keeps a small right margin, so reserve a little space.
+        total = max(0.001, float(_timeline_total_seconds(clips)))
+        try:
+            viewport_width = max(120, int(self.timeline_scroll.viewport().width()))
+        except Exception:
+            viewport_width = max(120, int(self.timeline_scroll.width()))
+        usable = max(80.0, float(viewport_width - 72))
+        fitted_pps = max(0.25, min(120.0, usable / total))
+
+        # Keep the slider meaningful for normal ranges. For exceptionally long
+        # projects a fit can fall below its integer minimum; in that case the canvas
+        # still receives the exact fractional zoom without the slider snapping it back.
+        slider_value = max(self.zoom_slider.minimum(), min(self.zoom_slider.maximum(), int(round(fitted_pps))))
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(slider_value)
+        self.zoom_slider.blockSignals(False)
+        self.canvas.set_zoom(fitted_pps)
+        self.timeline_scroll.horizontalScrollBar().setValue(0)
+
     def _refresh_all(self, *, select_first=False):
         self._update_history_buttons()
         self._refresh_generation_resolution_label()

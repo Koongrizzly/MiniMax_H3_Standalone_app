@@ -3921,9 +3921,27 @@ class MainWindow(QMainWindow):
                     if audio_fade_out_seconds > 0.0005:
                         fade_out_start = max(0.0, final_duration - audio_fade_out_seconds)
                         audio_filters.append(f"afade=t=out:st={fade_out_start:.6f}:d={audio_fade_out_seconds:.6f}")
+                    # A source audio stream can be a few milliseconds (or more)
+                    # shorter than its video stream because of AAC packetisation,
+                    # encoder delay/padding, imported media, etc. If we concatenate
+                    # those naturally-short audio streams as-is, every tiny
+                    # difference accumulates and later clips start progressively
+                    # earlier than their video. That shows up as lip-sync drift near
+                    # the end of a long Timeline even though each source MP4 is in
+                    # sync when played by itself.
+                    #
+                    # Force every clip's processed audio segment to the exact same
+                    # effective Timeline duration as its processed video segment.
+                    # apad only contributes silence when the decoded audio is short;
+                    # atrim also caps audio that is longer. Reset PTS once more after
+                    # that normalization so concat/acrossfade always receives a
+                    # zero-based, duration-locked stream.
                     audio_filters.extend([
                         "aresample=48000",
                         "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                        "apad",
+                        f"atrim=duration={final_duration:.6f}",
+                        "asetpts=PTS-STARTPTS",
                     ])
                     filter_parts.append(aprefix + ",".join(audio_filters) + f"[{alabel}]")
                     audio_labels.append(alabel)
