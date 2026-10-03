@@ -8,8 +8,8 @@ import torch
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
 
-VRAM_MANAGER_SIGNATURE = "V11_5_EXTREME_DIFFUSION_SAFE_20260826A"
-VRAM_MANAGER_VERSION = "V11.5"
+VRAM_MANAGER_SIGNATURE = "V11_6_ULTRA_CLIP_PRESSURE_20261003A"
+VRAM_MANAGER_VERSION = "V11.6"
 
 
 @dataclass
@@ -31,6 +31,10 @@ class VRAMManagerConfig:
     disable_comfy_pinned_offload: bool = True
     managed_stages: tuple[str, ...] | None = None
     diffusion_model_path: str | None = None
+    extreme_activation_free_fraction: float = 0.72
+    ultra_activation_free_fraction: float = 0.81
+    extreme_resident_floor_gb: float = 2.50
+    ultra_resident_floor_gb: float = 1.50
 
 
 def _looks_like_hybrid_checkpoint(path) -> bool:
@@ -96,7 +100,9 @@ class VRAMManager:
         self._pinned_guard_active = False
         self._text_conditioning_target_bytes = 0
         self._extreme_diffusion_pressure = False
+        self._ultra_diffusion_pressure = False
         self._extreme_floor_logged = False
+        self._ultra_admission_logged = False
 
     @staticmethod
     def _gb(n: int) -> str:
@@ -147,7 +153,9 @@ class VRAMManager:
         self.stage = self._normalize_stage(stage)
         if self.stage != "diffusion":
             self._extreme_diffusion_pressure = False
+            self._ultra_diffusion_pressure = False
             self._extreme_floor_logged = False
+            self._ultra_admission_logged = False
             self._sampling_target_free_bytes = 0
         managed = self.is_stage_managed(self.stage)
         if managed:
@@ -276,7 +284,7 @@ class VRAMManager:
         # installed the hard CUDA ceiling for diffusion, which allowed managed text
         # runs to oversubscribe a 24 GiB card before the guard appeared in the log.
         # Install the ceiling *before loading* every managed compute-heavy stage.
-        # V11.5 also protects the reference VAE stage. Multi-image Ref2VA jobs,
+        # V11.6 also protects the reference VAE stage. Multi-image Ref2VA jobs,
         # especially at high reference resolution, demonstrated 24+ GiB transient
         # allocations before Qwen was ever reached. Leaving reference encoding
         # outside the allocator ceiling allowed WDDM to spill hard into shared RAM.
@@ -311,7 +319,7 @@ class VRAMManager:
         comfy.sd.load_clip() only creates the CLIP/Qwen object; the GPU residency
         load happens lazily from CLIP.load_model(tokens) inside encode.  V11.1 ran
         its preflight before that lazy load, so it always saw an almost-empty card.
-        V11.5 arms Comfy's EXTRA_RESERVED_VRAM with the activation target first so
+        V11.6 arms Comfy's EXTRA_RESERVED_VRAM with the activation target first so
         the lazy loader chooses partial Qwen residency from the outset.
         """
         if not self.is_stage_managed("text") or self.stage != "text":
@@ -323,7 +331,7 @@ class VRAMManager:
         self._set_comfy_reserve(target)
         free_before, total = self._cuda_free()
         self._log(
-            f"V11.5 Qwen admission armed | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"V11.6 Qwen admission armed | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
             f"reserved activation runway={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
             force=True,
         )
@@ -339,7 +347,7 @@ class VRAMManager:
         self._set_comfy_reserve(target)
         free_before, total = self._cuda_free()
         self._log(
-            f"V11.5 Qwen preflight after load | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"V11.6 Qwen preflight after load | CUDA free={self._gb(free_before) if free_before is not None else 'n/a'} | "
             f"target free={self._gb(target)} | card={self._gb(total) if total is not None else 'n/a'}",
             force=True,
         )
@@ -347,7 +355,7 @@ class VRAMManager:
         self.trim_cuda_cache(reason=reason, force=True)
         free_after, _ = self._cuda_free()
         self._log(
-            f"V11.5 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
+            f"V11.6 Qwen preflight complete | model weights offloaded={self._gb(freed)} | "
             f"CUDA free={self._gb(free_after) if free_after is not None else 'n/a'} | target={self._gb(target)}",
             force=True,
         )
@@ -357,7 +365,7 @@ class VRAMManager:
         """Release the temporary Qwen activation reserve after conditioning."""
         if self._text_conditioning_target_bytes:
             self._log(
-                f"V11.5 Qwen admission released | activation runway was={self._gb(self._text_conditioning_target_bytes)}",
+                f"V11.6 Qwen admission released | activation runway was={self._gb(self._text_conditioning_target_bytes)}",
                 force=True,
             )
         self._text_conditioning_target_bytes = 0
@@ -377,7 +385,7 @@ class VRAMManager:
                 return manager._orig_load_models_gpu(models, *args, **kwargs)
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
-            # V11.5: while Qwen conditioning admission is armed, keep the large
+            # V11.6: while Qwen conditioning admission is armed, keep the large
             # activation runway visible to *every* Comfy load call.  encode() calls
             # CLIP.load_model(tokens) again, so dropping back to the 0.5 GiB runtime
             # reserve here would simply pull the offloaded Qwen weights back in.
@@ -405,16 +413,27 @@ class VRAMManager:
                     req = float(orig_required or 0)
                     min_req = float(orig_minimum or 0) if orig_minimum is not None else 0.0
                     # Anything larger than the physical card is not realizable.
-                    # A 72%%-of-physical activation target plus Comfy's explicit
-                    # reserve leaves only a few GiB of a 24 GiB card for resident
-                    # weights, which matches the observed ~17 GiB transient DiT
-                    # workspace much better than V4's full 11.68 GiB residency.
+                    # V11.6 has two pressure tiers. The normal extreme tier preserves
+                    # V11.6's 72%% activation target and 2.50 GiB protected resident
+                    # floor. The ultra tier is reserved for pathological long/high-res
+                    # clips where Comfy asks for >2x physical VRAM, or where the minimum
+                    # request alone exceeds the whole card. Those jobs get an 81%%
+                    # activation target and a still-protected 1.50 GiB resident floor.
                     if total is not None and (req > float(total) or min_req > float(total) * 0.60):
                         manager._extreme_diffusion_pressure = bool(req > float(total) or min_req > float(total))
+                        manager._ultra_diffusion_pressure = bool(
+                            req > float(total) * 2.0 or min_req > float(total)
+                        )
                         explicit_reserve = manager.load_headroom_bytes()
+                        activation_fraction = (
+                            float(manager.cfg.ultra_activation_free_fraction)
+                            if manager._ultra_diffusion_pressure
+                            else float(manager.cfg.extreme_activation_free_fraction)
+                        )
+                        activation_fraction = min(0.90, max(0.60, activation_fraction))
                         desired_total_free = max(
                             explicit_reserve,
-                            int(float(total) * 0.72),
+                            int(float(total) * activation_fraction),
                         )
                         forwarded = max(0, desired_total_free - explicit_reserve)
                         effective_required = forwarded
@@ -429,10 +448,19 @@ class VRAMManager:
                         if 'minimum_memory_required' in kwargs or orig_minimum is not None:
                             kwargs['minimum_memory_required'] = forwarded
                         clamped = True
-                        if manager._extreme_diffusion_pressure:
+                        if manager._ultra_diffusion_pressure:
                             manager._log(
-                                "V11.5 extreme diffusion safety armed | impossible native sampling hint exceeds physical VRAM | "
-                                "synchronous offload barriers enabled and a 2.50 GiB diffusion working-set floor will be protected",
+                                "V11.6 ULTRA clip pressure armed | sampler pressure exceeds the extreme tier | "
+                                f"activation target={activation_fraction * 100.0:.0f}% of physical VRAM | "
+                                f"protected diffusion floor={manager.cfg.ultra_resident_floor_gb:.2f} GiB | "
+                                "synchronous offload barriers enabled",
+                                force=True,
+                            )
+                        elif manager._extreme_diffusion_pressure:
+                            manager._log(
+                                "V11.6 extreme diffusion safety armed | impossible native sampling hint exceeds physical VRAM | "
+                                f"activation target={activation_fraction * 100.0:.0f}% | "
+                                f"protected diffusion floor={manager.cfg.extreme_resident_floor_gb:.2f} GiB",
                                 force=True,
                             )
                 except Exception as exc:
@@ -589,9 +617,16 @@ class VRAMManager:
             size = int(patcher.model_size())
         except Exception:
             size = 0
-        # 2.5 GiB matches the observed safe boundary on the 11.68 GiB H3 W4A8 DiT.
-        # Keep the floor bounded for differently sized patchers.
-        floor = int(2.50 * _GIB)
+        # Keep a non-zero resident working set even under ultra pressure. V11.6
+        # lowers the floor only for pathological long/high-res clips so the first
+        # DiT MLP has more activation runway, while ordinary extreme jobs retain
+        # V11.6's proven 2.50 GiB floor.
+        floor_gb = (
+            float(self.cfg.ultra_resident_floor_gb)
+            if self._ultra_diffusion_pressure
+            else float(self.cfg.extreme_resident_floor_gb)
+        )
+        floor = int(max(0.50, floor_gb) * _GIB)
         if size > 0:
             floor = min(floor, max(int(0.22 * size), int(0.50 * _GIB)))
         return max(0, floor)
@@ -633,7 +668,7 @@ class VRAMManager:
             if removable <= 0:
                 if not self._extreme_floor_logged:
                     self._log(
-                        f"V11.5 extreme diffusion floor active | resident={self._gb(loaded)} | "
+                        f"V11.6 {'ULTRA' if self._ultra_diffusion_pressure else 'extreme'} diffusion floor active | resident={self._gb(loaded)} | "
                         f"protected floor={self._gb(resident_floor)}; further per-block floor messages suppressed",
                         force=True,
                     )
@@ -736,6 +771,19 @@ class VRAMManager:
         if not self.is_stage_managed():
             return
         self._block_calls += 1
+        if self.stage == "diffusion" and self._ultra_diffusion_pressure and not self._ultra_admission_logged:
+            free, total = self._cuda_free()
+            rows = self.residency_stats()
+            resident = sum(r[4] for r in rows) if rows else 0
+            self._log(
+                "V11.6 ULTRA DiT admission | "
+                f"target free={self._gb(self._sampling_target_free_bytes)} | "
+                f"actual free={self._gb(free) if free is not None else 'n/a'} | "
+                f"resident model weights={self._gb(resident)} | "
+                f"card={self._gb(total) if total is not None else 'n/a'}",
+                force=True,
+            )
+            self._ultra_admission_logged = True
         interval = max(1, int(self.cfg.block_check_interval))
         if self._block_calls % interval == 0:
             target = self.runtime_floor_bytes()
