@@ -3218,10 +3218,9 @@ class MainWindow(QMainWindow):
         mode = str(data.get("mode") or "mix")
         if mode not in {"mix", "clips_only", "soundtrack_only"}:
             mode = "mix"
-        if mode == "clips_only":
-            return None
         soundtrack_items = [x for x in (data.get("clips") or []) if isinstance(x, dict)]
-        if not soundtrack_items and mode != "soundtrack_only":
+        raw_volume_sections = [x for x in (data.get("volume_sections") or []) if isinstance(x, dict)]
+        if not soundtrack_items and mode != "soundtrack_only" and not raw_volume_sections:
             return None
         if not ffmpeg_tools_ready():
             self._ensure_ffmpeg_async()
@@ -3243,6 +3242,17 @@ class MainWindow(QMainWindow):
             clip_duration = max(0.04, source_used / speed)
             clip_end = clip_start + clip_duration
             volume_percent = max(0, min(300, int(round(float(100 if volume_percent is None else volume_percent)))))
+            volume_sections = []
+            for section in raw_volume_sections:
+                try:
+                    start = max(0.0, min(clip_duration, float(section.get("start") or 0.0)))
+                    end = max(start, min(clip_duration, float(section.get("end") or 0.0)))
+                    level = max(0, min(300, int(round(float(section.get("volume_percent", 100))))))
+                except Exception:
+                    continue
+                if end - start > 0.0005:
+                    volume_sections.append({"start": start, "end": end, "volume_percent": level})
+            volume_sections.sort(key=lambda x: (x["start"], x["end"]))
 
             overlaps = []
             for item in soundtrack_items:
@@ -3282,7 +3292,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     continue
 
-            if not overlaps and mode != "soundtrack_only":
+            if not overlaps and mode != "soundtrack_only" and not volume_sections:
                 return None
 
             stat = path.stat()
@@ -3290,7 +3300,7 @@ class MainWindow(QMainWindow):
                 "path": str(path.resolve()), "mtime": stat.st_mtime_ns, "size": stat.st_size,
                 "trim_in": source_trim_in, "trim_out": source_trim_out, "volume": volume_percent,
                 "speed": speed, "mode": mode, "clip_start": clip_start, "clip_duration": clip_duration,
-                "overlaps": overlaps,
+                "overlaps": overlaps, "volume_sections": volume_sections,
             }
             key = hashlib.sha1(json.dumps(cache_payload, sort_keys=True, default=str).encode("utf-8", "ignore")).hexdigest()[:20]
             cache_dir = ROOT / "jobs" / "timeline_soundtrack_preview"
@@ -3322,12 +3332,23 @@ class MainWindow(QMainWindow):
                 args += ["-t", f"{ov['duration']:.6f}", "-i", ov["path"]]
 
             filters = [f"[0:v:0]setpts=(PTS-STARTPTS)/{speed:.6f},fps=24,format=yuv420p[vout]"]
-            if mode == "mix" and has_audio(path):
+            if mode in {"mix", "clips_only"} and has_audio(path):
                 gain = max(0.0, min(3.0, volume_percent / 100.0))
-                filters.append(
-                    f"[0:a:0]asetpts=PTS-STARTPTS,atempo={speed:.6f},volume={gain:.6f},"
-                    f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[abase]"
-                )
+                base_audio_filters = [
+                    "asetpts=PTS-STARTPTS",
+                    f"atempo={speed:.6f}",
+                    f"volume={gain:.6f}",
+                ]
+                for section in volume_sections:
+                    section_gain = max(0.0, min(3.0, float(section["volume_percent"]) / 100.0))
+                    base_audio_filters.append(
+                        f"volume={section_gain:.6f}:enable='between(t,{section['start']:.6f},{section['end']:.6f})'"
+                    )
+                base_audio_filters += [
+                    "aresample=48000",
+                    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                ]
+                filters.append("[0:a:0]" + ",".join(base_audio_filters) + "[abase]")
             else:
                 filters.append(
                     f"anullsrc=r=48000:cl=stereo,atrim=duration={clip_duration:.6f},asetpts=PTS-STARTPTS[abase]"
@@ -3709,6 +3730,7 @@ class MainWindow(QMainWindow):
         trim_specs = []
         has_trim = False
         has_volume_adjustment = False
+        has_volume_sections = False
         has_audio_fade = False
         has_video_edge_fade = False
         has_speed_adjustment = False
@@ -3758,6 +3780,21 @@ class MainWindow(QMainWindow):
             except Exception:
                 speed_multiplier = 1.0
             final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
+            volume_sections = []
+            raw_sections = clip.get("volume_sections") if isinstance(clip.get("volume_sections"), list) else []
+            for section in raw_sections:
+                if not isinstance(section, dict):
+                    continue
+                try:
+                    section_start = max(0.0, min(final_duration, float(section.get("start") or 0.0)))
+                    section_end = max(section_start, min(final_duration, float(section.get("end") or 0.0)))
+                    section_volume = max(0, min(300, int(round(float(section.get("volume_percent", 100))))))
+                except Exception:
+                    continue
+                if section_end - section_start > 0.0005:
+                    volume_sections.append((section_start, section_end, section_volume))
+            volume_sections.sort(key=lambda x: (x[0], x[1]))
+            has_volume_sections = has_volume_sections or bool(volume_sections)
             try:
                 audio_fade_in_seconds = max(0.0, min(final_duration, float(clip.get("audio_fade_in_seconds") or 0.0)))
             except Exception:
@@ -3779,7 +3816,7 @@ class MainWindow(QMainWindow):
             has_speed_adjustment = has_speed_adjustment or abs(speed_multiplier - 1.0) > 0.0001
             transition_name = str(clip.get("transition_to_next") or "none").strip().lower()
             has_transition = has_transition or transition_name not in {"", "none"}
-            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
+            trim_specs.append((clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds, volume_sections))
 
         # The previous seam-color experiment is intentionally disabled. Testing
         # showed that correcting RGB/luma did not remove the perceptual join. Keep
@@ -3793,7 +3830,7 @@ class MainWindow(QMainWindow):
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
 
         has_auto_overlap_trim = False
-        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media or has_seam_color_match:
+        if has_trim or normalize_mixed_resolution or has_volume_adjustment or has_volume_sections or has_audio_fade or has_video_edge_fade or has_speed_adjustment or has_transition or has_soundtrack or has_loaded_media or has_seam_color_match:
             # Re-encode when Timeline editing requires it, or whenever a ready-made
             # external clip is present. Imported media may use different codecs,
             # frame rates or audio formats, so normalize it to the same 24-fps /
@@ -3816,7 +3853,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return False
 
-            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in trim_specs:
+            for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds, volume_sections in trim_specs:
                 # Input-side seek is used for ordinary user trims. When automatic
                 # overlap matching finds a repeated continuation prefix, start at
                 # source time zero and decode that extra overlap because it is
@@ -3825,7 +3862,7 @@ class MainWindow(QMainWindow):
                     args += ["-ss", f"{trim_in:.6f}"]
                 read_duration = effective_duration
                 args += ["-t", f"{read_duration:.6f}", "-i", str(path)]
-                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds))
+                input_meta.append((len(input_meta), path, effective_duration, _input_has_audio(path), volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds, volume_sections))
 
             filter_parts = []
             synthetic_audio_inputs = []
@@ -3837,7 +3874,7 @@ class MainWindow(QMainWindow):
             # stream and 48-kHz stereo audio stream. xfade is strict about frame
             # rate/timebase/geometry compatibility, so normalizing here keeps the
             # transition path deterministic while leaving source MP4s untouched.
-            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds in input_meta:
+            for i, path, effective_duration, has_audio, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds, volume_sections in input_meta:
                 final_duration = max(0.001, float(effective_duration) / float(speed_multiplier))
                 final_durations.append(final_duration)
                 vlabel = f"v{i}"
@@ -3913,6 +3950,15 @@ class MainWindow(QMainWindow):
                         f"atempo={speed_multiplier:.3f}",
                         f"volume={gain:.3f}",
                     ]
+                    # Per-range volume is relative to the clip's normal volume and
+                    # is evaluated after speed, so the entered times match what the
+                    # user sees/hears on the Timeline. 0% cleanly mutes only that
+                    # range without changing audio duration or lip-sync.
+                    for section_start, section_end, section_volume in volume_sections:
+                        section_gain = max(0.0, min(3.0, float(section_volume) / 100.0))
+                        audio_filters.append(
+                            f"volume={section_gain:.6f}:enable='between(t,{section_start:.6f},{section_end:.6f})'"
+                        )
                     # Fade is intentionally applied AFTER the clip gain. So a clip
                     # set to 75% fades from silence up to exactly 75%, never back
                     # to 100%.

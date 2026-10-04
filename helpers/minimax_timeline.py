@@ -42,6 +42,9 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QApplication,
     QMenu,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
 
 try:
@@ -71,6 +74,123 @@ TIMELINE_RESOLUTION_PRESETS = [
     "1344 × 768",
     "1920 × 1088",
 ]
+
+
+class ClipVolumeSectionsDialog(QDialog):
+    """Edit non-destructive per-range volume overrides for one Timeline clip."""
+
+    def __init__(self, duration: float, sections=None, parent=None):
+        super().__init__(parent)
+        self.duration_seconds = max(0.01, float(duration or 0.01))
+        self.setWindowTitle("Clip volume sections")
+        self.resize(650, 430)
+
+        root = QVBoxLayout(self)
+        hint = QLabel(
+            "Lower or mute only selected parts of this clip. Times are relative to the visible clip "
+            "on the Timeline after trim/speed. 0% = mute; 100% = keep the clip's normal volume."
+        )
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        self.table = QTableWidget(0, 3, self)
+        self.table.setHorizontalHeaderLabels(["Start (s)", "End (s)", "Volume (%)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        root.addWidget(self.table, 1)
+
+        actions = QHBoxLayout()
+        self.add_btn = QPushButton("+ Add section")
+        self.remove_btn = QPushButton("Remove selected")
+        self.mute_btn = QPushButton("+ Add mute section")
+        actions.addWidget(self.add_btn)
+        actions.addWidget(self.mute_btn)
+        actions.addWidget(self.remove_btn)
+        actions.addStretch(1)
+        root.addLayout(actions)
+
+        self.add_btn.clicked.connect(lambda: self._add_row(0.0, min(1.0, self.duration_seconds), 50))
+        self.mute_btn.clicked.connect(lambda: self._add_row(0.0, min(1.0, self.duration_seconds), 0))
+        self.remove_btn.clicked.connect(self._remove_selected)
+
+        for item in (sections or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = max(0.0, min(self.duration_seconds, float(item.get("start") or 0.0)))
+                end = max(start, min(self.duration_seconds, float(item.get("end") or 0.0)))
+                volume = max(0, min(300, int(round(float(item.get("volume_percent", 100))))))
+            except Exception:
+                continue
+            if end - start > 0.0005:
+                self._add_row(start, end, volume)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=self)
+        buttons.accepted.connect(self._accept_checked)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _add_row(self, start: float, end: float, volume: int):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        start_spin = QDoubleSpinBox(self.table)
+        start_spin.setRange(0.0, self.duration_seconds)
+        start_spin.setDecimals(3)
+        start_spin.setSingleStep(0.05)
+        start_spin.setValue(max(0.0, min(self.duration_seconds, float(start))))
+
+        end_spin = QDoubleSpinBox(self.table)
+        end_spin.setRange(0.0, self.duration_seconds)
+        end_spin.setDecimals(3)
+        end_spin.setSingleStep(0.05)
+        end_spin.setValue(max(0.0, min(self.duration_seconds, float(end))))
+
+        volume_spin = QSpinBox(self.table)
+        volume_spin.setRange(0, 300)
+        volume_spin.setSuffix(" %")
+        volume_spin.setValue(max(0, min(300, int(volume))))
+
+        self.table.setCellWidget(row, 0, start_spin)
+        self.table.setCellWidget(row, 1, end_spin)
+        self.table.setCellWidget(row, 2, volume_spin)
+
+    def _remove_selected(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.table.removeRow(row)
+
+    def sections(self):
+        rows = []
+        for row in range(self.table.rowCount()):
+            start = float(self.table.cellWidget(row, 0).value())
+            end = float(self.table.cellWidget(row, 1).value())
+            volume = int(self.table.cellWidget(row, 2).value())
+            if end - start <= 0.0005:
+                continue
+            rows.append({
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "volume_percent": volume,
+            })
+        rows.sort(key=lambda x: (x["start"], x["end"]))
+        return rows
+
+    def _accept_checked(self):
+        rows = self.sections()
+        for i, item in enumerate(rows):
+            if item["end"] <= item["start"]:
+                QMessageBox.warning(self, "Clip volume sections", "Every section needs an end time after its start time.")
+                return
+            if i and item["start"] < rows[i - 1]["end"] - 0.0005:
+                QMessageBox.warning(
+                    self,
+                    "Clip volume sections",
+                    "Volume sections may not overlap. Adjust the start/end times so every section has its own range.",
+                )
+                return
+        self.accept()
 
 
 class ClipTrimDialog(QDialog):
@@ -4922,6 +5042,9 @@ class TimelineTab(QWidget):
         open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
         volume_action = menu.addAction(f"Volume…  {int(round(float(100 if clip.get('volume_percent') is None else clip.get('volume_percent'))))}%")
+        volume_sections = list(clip.get("volume_sections") or []) if isinstance(clip.get("volume_sections"), list) else []
+        volume_sections_action = menu.addAction(f"Volume sections…  {len(volume_sections)}")
+        volume_sections_action.setToolTip("Mute or lower only selected time ranges inside this clip.")
         fade_in_action = menu.addAction(f"Audio fade in…  {max(0.0, float(clip.get('audio_fade_in_seconds') or 0.0)):.1f}s")
         fade_out_action = menu.addAction(f"Audio fade out…  {max(0.0, float(clip.get('audio_fade_out_seconds') or 0.0)):.1f}s")
         video_fade_in_action = None
@@ -4998,6 +5121,8 @@ class TimelineTab(QWidget):
             self._trim_clip_by_id(clip_id)
         elif chosen is volume_action:
             self._set_clip_volume_by_id(clip_id)
+        elif chosen is volume_sections_action:
+            self._set_clip_volume_sections_by_id(clip_id)
         elif chosen is fade_in_action:
             self._set_clip_audio_fade_by_id(clip_id, "in")
         elif chosen is fade_out_action:
@@ -5242,6 +5367,7 @@ class TimelineTab(QWidget):
                 "timeline_duration": float(_clip_timeline_seconds(clip)),
                 "mode": str(self.project.get("soundtrack_mode") or "mix"),
                 "clips": copy.deepcopy(list(self.project.get("soundtrack_clips") or [])),
+                "volume_sections": copy.deepcopy(list(clip.get("volume_sections") or [])),
             }
             return bool(self.preview_result_callback(
                 output,
@@ -5301,6 +5427,30 @@ class TimelineTab(QWidget):
         else:
             clip["volume_percent"] = value
         self._invalidate_assembly("Clip volume changed — assemble again.")
+        self._refresh_all()
+        return True
+
+    def _set_clip_volume_sections_by_id(self, clip_id):
+        _idx, clip = self._clip_by_id(clip_id)
+        if not clip:
+            return False
+        try:
+            duration = max(0.001, float(_clip_timeline_seconds(clip)))
+        except Exception:
+            duration = max(0.001, float(clip.get("frames") or 24) / FPS)
+        current = copy.deepcopy(list(clip.get("volume_sections") or [])) if isinstance(clip.get("volume_sections"), list) else []
+        dlg = ClipVolumeSectionsDialog(duration, current, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        sections = dlg.sections()
+        if sections == current:
+            return True
+        self._record_undo_state("Change clip volume sections")
+        if sections:
+            clip["volume_sections"] = sections
+        else:
+            clip.pop("volume_sections", None)
+        self._invalidate_assembly("Clip volume sections changed — assemble again.")
         self._refresh_all()
         return True
 
@@ -5745,6 +5895,7 @@ class TimelineTab(QWidget):
                 "timeline_duration": float(timeline_duration),
                 "mode": str(self.project.get("soundtrack_mode") or "mix"),
                 "clips": copy.deepcopy(list(self.project.get("soundtrack_clips") or [])),
+                "volume_sections": copy.deepcopy(list(clip.get("volume_sections") or [])),
             }
             self.preview_result_callback(
                 output,
