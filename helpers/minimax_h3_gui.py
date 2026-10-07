@@ -2924,6 +2924,15 @@ class MainWindow(QMainWindow):
                     if hq_wide in WIDESCREEN_21_9_PRESETS:
                         settings["widescreen_quality"] = hq_wide
 
+                # Timeline jobs rebuild/clear their Ref2VA audio inputs per clip.
+                # Never inherit the Generation-tab "Use Audio 1 as exact source / output"
+                # switch here: when a timeline clip has no standalone Audio 1, the stale
+                # lock makes generate() abort with "Source audio required" even though
+                # the reference preset itself no longer contains a voice sample. Voice
+                # samples attached to Timeline subjects are normal Ref2VA references,
+                # not exact-source/output tracks.
+                settings["lock_source_audio"] = False
+
                 # Timeline reference images are per-clip Ref2VA inputs.  They are
                 # deliberately separate from the Generation tab's global refs.
                 timeline_ref_entries = [
@@ -2931,11 +2940,33 @@ class MainWindow(QMainWindow):
                     if isinstance(item, dict) and str(item.get("path") or "").strip()
                 ]
                 timeline_refs = [str(item.get("path") or "") for item in timeline_ref_entries]
+
+                # A preset voice sample is speaker-identity conditioning, not a clip
+                # soundtrack. Ref2VA can otherwise replay the sample verbatim and
+                # even collapse generation duration to the sample length when the
+                # referenced subject has no dialogue in this clip. Only forward a
+                # subject voice sample when that subject is explicitly scripted to
+                # speak in the authored prompt.
+                def _subject_has_scripted_dialogue(prompt_text: str, subject_no: int) -> bool:
+                    text = str(prompt_text or "")
+                    token = rf"<\s*Subject\s+{int(subject_no)}\s*>"
+                    speech = (
+                        r"(?:says?|speaks?|asks?|answers?|replies?|responds?|shouts?|yells?|"
+                        r"whispers?|murmurs?|mumbles?|calls?|screams?|announces?|tells?|sings?)"
+                    )
+                    patterns = (
+                        rf"{token}\s*(?:{speech})\b",
+                        rf"{token}\s*[:\-]\s*[\"'‘’“”]",
+                        rf"{token}[^\n]{{0,90}}\b(?:{speech})\b",
+                    )
+                    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
                 timeline_voice_refs = []
                 timeline_voice_subjects = []
+                timeline_prompt = str(spec.get("compiled_prompt") or settings.get("prompt") or "")
                 for subject_no, item in enumerate(timeline_ref_entries, 1):
                     voice = str(item.get("voice_sample") or "").strip()
-                    if voice:
+                    if voice and _subject_has_scripted_dialogue(timeline_prompt, subject_no):
                         timeline_voice_refs.append(voice)
                         timeline_voice_subjects.append(subject_no)
                 use_timeline_refs = bool(spec.get("use_reference_images", False))

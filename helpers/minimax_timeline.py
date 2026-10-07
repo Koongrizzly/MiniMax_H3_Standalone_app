@@ -1148,6 +1148,14 @@ class RefPresetDialog(QDialog):
         item.setText(self._item_label(preset, item.checkState() == Qt.CheckState.Checked, int(item.data(Qt.ItemDataRole.UserRole + 1) or 1)))
         self._persist()
 
+        # Applied clips store a snapshot of the preset. Keep the voice field in
+        # those snapshots synchronized by preset_id, otherwise removing/changing
+        # a voice in the preset editor leaves old clips pointing at a stale file.
+        parent = self.parent()
+        sync = getattr(parent, "_sync_reference_preset_voice_to_clips", None)
+        if callable(sync):
+            sync(str(preset.get("id") or ""), str(preset.get("voice_sample") or ""))
+
     def _checked_items(self):
         return [self.list_widget.item(i) for i in range(self.list_widget.count()) if self.list_widget.item(i).checkState() == Qt.CheckState.Checked]
 
@@ -3759,6 +3767,32 @@ class TimelineTab(QWidget):
     def _selected_clip_locked(self):
         clip = self._selected_clip()
         return bool((clip or {}).get("locked", False))
+
+    def _sync_reference_preset_voice_to_clips(self, preset_id: str, voice_sample: str):
+        """Propagate a preset voice edit/removal to clips that already use it."""
+        preset_id = str(preset_id or "").strip()
+        if not preset_id:
+            return
+        new_voice = str(voice_sample or "").strip()
+        changed = False
+        for i, clip in enumerate(self._clips()):
+            refs = clip.get("reference_images") or []
+            clip_changed = False
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                if str(ref.get("preset_id") or "").strip() != preset_id:
+                    continue
+                if str(ref.get("voice_sample") or "").strip() == new_voice:
+                    continue
+                ref["voice_sample"] = new_voice
+                clip_changed = True
+            if clip_changed:
+                self._touch_clip(i, propagate=False)
+                changed = True
+        if changed:
+            self._refresh_settings_summary(self._selected_clip() or {})
+            self.canvas.update()
 
     # ---------------------------------------------------------- inspector slots
     def _project_name_changed(self, text):
