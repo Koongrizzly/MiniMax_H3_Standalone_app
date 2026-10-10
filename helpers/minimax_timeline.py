@@ -2022,6 +2022,7 @@ class TimelineTab(QWidget):
         self._timeline_root = app_root / "output" / "timeline"
         self._timeline_root.mkdir(parents=True, exist_ok=True)
         self._autosave_temp_path = self._timeline_root / "minimax_timeline_autosave_temp.json"
+        self._last_active_path = self._timeline_root / "minimax_timeline_last_active.json"
         # Share the application's persistent QFileDialog history file so the
         # Timeline Load dialog opens where the user last loaded a project, even
         # after GrizzlyMax has been restarted.
@@ -2031,6 +2032,7 @@ class TimelineTab(QWidget):
         self._build_ui()
         self._ensure_initial_clip()
         self._refresh_all(select_first=True)
+        self._restore_last_active_timeline()
 
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setInterval(60_000)
@@ -2982,14 +2984,131 @@ class TimelineTab(QWidget):
         tmp_path.write_text(payload, encoding="utf-8")
         tmp_path.replace(path)
 
-    def _autosave_project(self):
-        """Silent 60-second autosave. Unsaved projects use a temporary JSON file."""
+    def _remember_active_timeline(self, path: Path):
+        """Persist the last active Timeline location, only after it exists on disk."""
+        path = Path(path).resolve()
+        if not path.is_file():
+            return
+        marker = self._last_active_path
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temporary = marker.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({"path": str(path), "project_id": str(self.project.get("project_id") or "")}, indent=2), encoding="utf-8")
+        temporary.replace(marker)
+
+    def _restore_last_active_timeline(self):
+        """Restore the last opened/edited Timeline before the autosave timer starts.
+
+        The legacy recovery snapshot is used on installations without a marker.
+        Never replace the snapshot during startup and never display file dialogs.
+        """
+        candidate = None
+        marker_id = ""
         try:
-            target = self._project_path or self._autosave_temp_path
-            self._write_project_json(target)
-        except Exception:
-            # Autosave must never interrupt generation or editing with a modal error.
-            pass
+            if self._last_active_path.is_file():
+                marker = json.loads(self._last_active_path.read_text(encoding="utf-8"))
+                if isinstance(marker, dict) and marker.get("path"):
+                    candidate = Path(str(marker["path"]))
+                    marker_id = str(marker.get("project_id") or "")
+        except Exception as exc:
+            print(f"[TIMELINE] Last-active marker unreadable: {exc}", flush=True)
+
+        if candidate is None:
+            candidate = self._autosave_temp_path  # compatibility with earlier releases
+
+        # If the remembered file was moved/deleted, try a matching recovery.
+        if not candidate.is_file() and self._autosave_temp_path.is_file():
+            try:
+                recovery = json.loads(self._autosave_temp_path.read_text(encoding="utf-8"))
+                if isinstance(recovery, dict) and (not marker_id or str(recovery.get("project_id") or "") == marker_id):
+                    candidate = self._autosave_temp_path
+            except Exception:
+                pass
+        if not candidate.is_file():
+            print(f"[TIMELINE] Last active project missing: {candidate}", flush=True)
+            return
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("clips"), list):
+                raise ValueError("Not a valid Timeline project")
+            if marker_id and str(data.get("project_id") or "") != marker_id:
+                raise ValueError("The project ID differs from the last-active marker")
+            if candidate == self._autosave_temp_path and not (data.get("project_folder") or len(data["clips"]) > 1 or any(str(seg.get("prompt") or "").strip() for c in data["clips"] if isinstance(c,dict) for seg in c.get("segments", []) if isinstance(seg,dict))):
+                return
+            self.load_project(candidate, startup=True)
+            print(f"[TIMELINE] Restored last active project: {candidate}", flush=True)
+        except Exception as exc:
+            print(f"[TIMELINE] Could not restore last active project {candidate}: {exc}", flush=True)
+
+    def _timeline_has_recovery_content(self):
+        """Ignore the untouched one-clip startup placeholder."""
+        clips = self.project.get("clips") or []
+        return bool(
+            str(self.project.get("project_folder") or "").strip()
+            or len(clips) > 1
+            or (self.project.get("soundtrack_clips") or [])
+            or any(
+                str(segment.get("prompt") or "").strip()
+                for clip in clips for segment in (clip.get("segments") or [])
+            )
+            or any(
+                str(clip.get(key) or "").strip()
+                for clip in clips
+                for key in ("output", "start_source_video")
+            )
+        )
+
+    def _recovery_matches_current_project(self):
+        """Only remove or replace a recovery snapshot belonging to this project."""
+        path = self._autosave_temp_path
+        if not path.is_file():
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return (isinstance(data, dict) and bool(data.get("project_id"))
+                    and str(data["project_id"]) == str(self.project.get("project_id")))
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _write_recovery_snapshot(self):
+        """Preserve older recoveries, even when a new timeline is started.
+
+        A new app session begins with a blank placeholder and must not overwrite
+        the previous session's recovery file (regardless of file size).
+        """
+        if not self._timeline_has_recovery_content():
+            return
+        path = self._autosave_temp_path
+        if path.exists() and not self._recovery_matches_current_project():
+            # Rename first, preserving the original bytes. If a rename fails,
+            # the new project must NOT overwrite the older recovery file.
+            old_id = "unknown"
+            try:
+                old_data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(old_data, dict):
+                    old_id = str(old_data.get("project_id") or "unknown")[:12]
+            except (OSError, ValueError, TypeError):
+                pass
+            old_id = "".join(ch for ch in old_id if ch.isalnum()) or "unknown"
+            backup = path.with_name(
+                f"minimax_timeline_recovery_{old_id}_{uuid.uuid4().hex[:8]}.json"
+            )
+            path.replace(backup)
+            print(f"[TIMELINE] Preserved previous recovery at: {backup}", flush=True)
+        self._write_project_json(path)
+        self._remember_active_timeline(path)
+
+    def _autosave_project(self):
+        """Silent 60-second autosave, without destroying a previous recovery."""
+        try:
+            if self._project_path and self._project_path != self._autosave_temp_path:
+                self._write_project_json(self._project_path)
+                self._remember_active_timeline(self._project_path)
+            else:
+                self._write_recovery_snapshot()
+        except Exception as exc:
+            # Don't display a modal dialog while editing/generating, but keep
+            # failures visible in the application log for diagnosis.
+            print(f"[TIMELINE] Autosave skipped: {exc}", flush=True)
 
     def _new_project_setup_dialog(self, *, first_edit=False):
         dialog = QDialog(self)
@@ -3175,7 +3294,7 @@ class TimelineTab(QWidget):
         # Keep the recovery file in output/timeline/ as requested. Only its content
         # changes to reflect the newly named project.
         try:
-            self._write_project_json(self._autosave_temp_path)
+            self._write_recovery_snapshot()
         except Exception:
             pass
 
@@ -3226,14 +3345,8 @@ class TimelineTab(QWidget):
             return
         project_name, project_folder = setup
 
-        # The previous recovery file belongs to the project being closed. Once the
-        # user has explicitly saved or discarded it, remove it before starting a
-        # fresh recovery stream for the new project.
-        try:
-            if self._autosave_temp_path.exists():
-                self._autosave_temp_path.unlink()
-        except Exception:
-            pass
+        # Keep the previous recovery until the new project has a real snapshot.
+        # _write_recovery_snapshot archives any recovery with a different ID.
 
         self.project = self._new_project_data()
         self.project["name"] = project_name
@@ -3248,7 +3361,7 @@ class TimelineTab(QWidget):
         # Write the first recovery snapshot immediately; subsequent autosaves keep
         # updating the same file under output/timeline/.
         try:
-            self._write_project_json(self._autosave_temp_path)
+            self._write_recovery_snapshot()
         except Exception:
             pass
         self._refresh_all(select_first=True)
@@ -3293,13 +3406,14 @@ class TimelineTab(QWidget):
         # Only now commit the real project path.
         self._project_path = chosen_path
         self.project["project_folder"] = str(chosen_path.parent)
+        self._remember_active_timeline(chosen_path)
 
         # Delete the temporary recovery copy only after a distinct real save file
         # definitely exists. If cleanup fails, leave it in place; an extra recovery
         # file is safer than losing the project.
         try:
             if (
-                self._autosave_temp_path.exists()
+                self._recovery_matches_current_project()
                 and self._autosave_temp_path.resolve() != chosen_path.resolve()
             ):
                 self._autosave_temp_path.unlink()
@@ -3370,13 +3484,16 @@ class TimelineTab(QWidget):
             # File-dialog history should never stop a project from loading.
             pass
 
-    def load_project(self):
-        name, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load MiniMax timeline",
-            self._timeline_load_start_dir(),
-            "MiniMax Timeline (*.json);;JSON (*.json)",
-        )
+    def load_project(self, path=None, *, startup=False):
+        if path is None or isinstance(path, bool):
+            name, _ = QFileDialog.getOpenFileName(
+                self,
+                "Load MiniMax timeline",
+                self._timeline_load_start_dir(),
+                "MiniMax Timeline (*.json);;JSON (*.json)",
+            )
+        else:
+            name = str(path)
         if not name:
             return
         try:
@@ -3519,8 +3636,10 @@ class TimelineTab(QWidget):
                         flush=True,
                     )
 
-            self._project_path = Path(name)
-            self._remember_timeline_load_folder(self._project_path)
+            self._project_path = None if Path(name).resolve() == self._autosave_temp_path.resolve() else Path(name)
+            if self._project_path:
+                self._remember_timeline_load_folder(self._project_path)
+            self._remember_active_timeline(Path(name))
             self.selected_clip_id = self._clips()[0]["id"] if self._clips() else None
             self.selected_clip_ids = {str(self.selected_clip_id)} if self.selected_clip_id else set()
             self._selection_anchor_id = str(self.selected_clip_id) if self.selected_clip_id else None
@@ -3528,7 +3647,10 @@ class TimelineTab(QWidget):
             self._reset_history()
             self._refresh_all(select_first=True)
         except Exception as exc:
-            QMessageBox.critical(self, "Load timeline failed", str(exc))
+            if startup:
+                print(f"[TIMELINE] Startup restoration failed: {exc}", flush=True)
+            else:
+                QMessageBox.critical(self, "Load timeline failed", str(exc))
 
     # ------------------------------------------------------------- clip actions
     def add_clip(self):
