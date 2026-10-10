@@ -26,6 +26,11 @@ try:
 except ImportError:
     from minimax_timeline import TimelineTab
 
+try:
+    from .minimax_telegram_remote import GrizzlyTelegramRemote, load_config as load_telegram_config, save_config as save_telegram_config
+except ImportError:
+    from minimax_telegram_remote import GrizzlyTelegramRemote, load_config as load_telegram_config, save_config as save_telegram_config
+
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / "environments" / ".minimax_h3_int4" / "python.exe"
 PRESET_DIR = ROOT / "presets" / "setsave"
@@ -41,6 +46,7 @@ APP_UPDATE_STATE = PRESET_DIR / "minimax_h3_update_state.json"
 APP_UPDATE_EXCLUDED_TOP = {"environments", "models", "output", "logs", "jobs", ".git"}
 APP_UPDATE_EXCLUDED_PREFIXES = {"presets/setsave", "h3_prompt_builder/.runtime"}
 FILE_DIALOG_HISTORY = PRESET_DIR / "minimax_file_dialog_history.json"
+TELEGRAM_CONFIG_FILE = PRESET_DIR / "minimax_h3_telegram.json"
 
 SUPPORTED_CHECKPOINT_REPO = "koongrizzly/MiniMax_H3_int4_W4A8_ConvRot_Pruned"
 SUPPORTED_CHECKPOINT_SUBDIR = "diffusion_models"
@@ -1080,11 +1086,14 @@ class MainWindow(QMainWindow):
         self.update_check_finished.connect(self._handle_update_check_finished)
         self.update_check_failed.connect(self._handle_update_check_failed)
         self.wheel_filter = NoWheelFilter(self)
+        self.telegram_remote = None
+        self._telegram_config = {}
         self._build()
         self._apply_style()
         self._apply_first_run_defaults()
         self.load_last()
         self._load_queue_state()
+        self._init_telegram_remote()
         self._sync_resolution()
         self._sync_mode()
         QTimer.singleShot(300, self.validate_install)
@@ -4479,6 +4488,47 @@ class MainWindow(QMainWindow):
         )
         v.addWidget(self.auto_update_enabled)
 
+        tg = QGroupBox("Telegram remote control")
+        tf = QFormLayout(tg)
+        tnote = QLabel(
+            "Control the standalone Generation tab from your phone. Uses outbound Telegram long polling only; "
+            "no port forwarding is needed. Only the Telegram user IDs listed below are accepted."
+        )
+        tnote.setWordWrap(True)
+        tf.addRow(tnote)
+        self.telegram_enabled = QCheckBox("Enable Telegram remote control")
+        self.telegram_bot_token = QLineEdit()
+        self.telegram_bot_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.telegram_bot_token.setPlaceholderText("Bot token from BotFather")
+        self.telegram_allowed_users = QLineEdit()
+        self.telegram_allowed_users.setPlaceholderText("Allowed Telegram user ID(s), comma separated")
+        self.telegram_send_results = QCheckBox("Send finished clips back to Telegram")
+        self.telegram_send_results.setChecked(True)
+        self.telegram_status = QLabel("Telegram: not started")
+        self.telegram_status.setWordWrap(True)
+        tbuttons = QHBoxLayout()
+        self.telegram_connect_btn = QPushButton("Connect / restart")
+        self.telegram_disconnect_btn = QPushButton("Disconnect")
+        self.telegram_test_btn = QPushButton("Save settings")
+        self.telegram_connect_btn.clicked.connect(self._telegram_connect_from_settings)
+        self.telegram_disconnect_btn.clicked.connect(self._telegram_disconnect)
+        self.telegram_test_btn.clicked.connect(self._save_telegram_settings)
+        self.telegram_enabled.toggled.connect(lambda _v: self._save_telegram_settings(silent=True))
+        self.telegram_send_results.toggled.connect(lambda _v: self._save_telegram_settings(silent=True))
+        self.telegram_bot_token.editingFinished.connect(lambda: self._save_telegram_settings(silent=True))
+        self.telegram_allowed_users.editingFinished.connect(lambda: self._save_telegram_settings(silent=True))
+        tbuttons.addWidget(self.telegram_connect_btn)
+        tbuttons.addWidget(self.telegram_disconnect_btn)
+        tbuttons.addWidget(self.telegram_test_btn)
+        tbuttons.addStretch(1)
+        tf.addRow(self.telegram_enabled)
+        tf.addRow("Bot token", self.telegram_bot_token)
+        tf.addRow("Allowed user IDs", self.telegram_allowed_users)
+        tf.addRow(self.telegram_send_results)
+        tf.addRow("Status", self.telegram_status)
+        tf.addRow(tbuttons)
+        v.addWidget(tg)
+
         fontg = QGroupBox("Interface font size")
         fontv = QVBoxLayout(fontg)
         fontrow = QHBoxLayout()
@@ -6356,6 +6406,9 @@ exit /b %RC%
                     self.append_log(f"=== TIMELINE ASSEMBLY FINISHED ===\n{job.get('output')}\n")
                 if self.play_result_finished.isChecked():
                     play_finished_job = job
+                if job.get("telegram_chat_id") and hasattr(self, "telegram_send_results") and self.telegram_send_results.isChecked():
+                    if self.telegram_remote is not None:
+                        self.telegram_remote.send_result(str(job.get("telegram_chat_id")), str(job.get("output", "")), f"GrizzlyMax Job #{job.get('job_number','?')} finished • {job.get('resolution','')}")
             else:
                 job["state"]="failed"; job["error"]=self._extract_failure_reason(job,code); job["phase"]="Failed"
                 if job.get("job_type") == "timeline_assembly" and getattr(self, "timeline_widget", None) is not None:
@@ -6441,8 +6494,238 @@ exit /b %RC%
 
         super().changeEvent(event)
 
+    # ------------------------------------------------------------------
+    # Telegram remote control (standalone GrizzlyMax queue only)
+    # ------------------------------------------------------------------
+    def _init_telegram_remote(self):
+        try:
+            self._telegram_config = load_telegram_config(TELEGRAM_CONFIG_FILE)
+        except Exception:
+            self._telegram_config = {}
+        cfg = dict(self._telegram_config or {})
+        if hasattr(self, "telegram_bot_token"):
+            self.telegram_bot_token.setText(str(cfg.get("bot_token") or ""))
+            self.telegram_allowed_users.setText(str(cfg.get("allowed_user_ids") or ""))
+            self.telegram_enabled.setChecked(bool(cfg.get("enabled", False)))
+            self.telegram_send_results.setChecked(bool(cfg.get("send_results", True)))
+        try:
+            self.telegram_remote = GrizzlyTelegramRemote(self, ROOT, self)
+            self.telegram_remote.statusChanged.connect(self._telegram_status_changed)
+        except Exception as exc:
+            self.telegram_remote = None
+            self._telegram_status_changed(f"Telegram unavailable: {exc}")
+            return
+        if bool(cfg.get("enabled", False)):
+            QTimer.singleShot(1200, self._telegram_connect_from_settings)
+
+    def _telegram_allowed_id_list(self):
+        raw = self.telegram_allowed_users.text() if hasattr(self, "telegram_allowed_users") else ""
+        return [x.strip() for x in re.split(r"[,;\s]+", str(raw or "")) if x.strip()]
+
+    def _save_telegram_settings(self, silent=False):
+        if not hasattr(self, "telegram_bot_token"):
+            return
+        cfg = {
+            "enabled": bool(self.telegram_enabled.isChecked()),
+            "bot_token": self.telegram_bot_token.text().strip(),
+            "allowed_user_ids": self.telegram_allowed_users.text().strip(),
+            "send_results": bool(self.telegram_send_results.isChecked()),
+        }
+        try:
+            save_telegram_config(TELEGRAM_CONFIG_FILE, cfg)
+            self._telegram_config = cfg
+            if not silent:
+                self._telegram_status_changed("Telegram settings saved.")
+        except Exception as exc:
+            self._telegram_status_changed(f"Could not save Telegram settings: {exc}")
+
+    def _telegram_connect_from_settings(self):
+        self._save_telegram_settings(silent=True)
+        if not bool(self.telegram_enabled.isChecked()):
+            self._telegram_status_changed("Telegram remote control is disabled.")
+            return
+        token = self.telegram_bot_token.text().strip()
+        allowed = self._telegram_allowed_id_list()
+        if not token:
+            self._telegram_status_changed("Telegram: enter a bot token first.")
+            return
+        if not allowed:
+            self._telegram_status_changed("Telegram: enter at least one allowed Telegram user ID.")
+            return
+        if self.telegram_remote is None:
+            self._telegram_status_changed("Telegram helper is unavailable.")
+            return
+        self._telegram_status_changed("Telegram: connecting…")
+        self.telegram_remote.start(token, allowed)
+
+    def _telegram_disconnect(self):
+        if self.telegram_remote is not None:
+            self.telegram_remote.stop()
+        self._telegram_status_changed("Telegram disconnected.")
+
+    def _telegram_status_changed(self, text):
+        msg = str(text or "Telegram")
+        if hasattr(self, "telegram_status"):
+            self.telegram_status.setText(msg)
+        try:
+            self.append_log(f"[Telegram] {msg}\n")
+        except Exception:
+            pass
+
+    def _telegram_queue_summary(self):
+        running = [j for j in self.queue_jobs if j.get("state") == "running"]
+        pending = [j for j in self.queue_jobs if j.get("state") == "pending"]
+        finished = [j for j in self.queue_jobs if j.get("state") == "finished"]
+        failed = [j for j in self.queue_jobs if j.get("state") == "failed"]
+        lines = [f"GrizzlyMax queue: {len(running)} running, {len(pending)} pending, {len(finished)} finished, {len(failed)} failed."]
+        for label, jobs in (("Running", running[:2]), ("Pending", pending[:5])):
+            if jobs:
+                lines.append(label + ":")
+                for j in jobs:
+                    pct = j.get("progress")
+                    progress = f" • {pct:.0f}%" if isinstance(pct, (int, float)) else ""
+                    lines.append(f"• Job #{j.get('job_number','?')} {j.get('mode_name','MiniMax H3')} • {j.get('resolution','')} • {j.get('phase','')}{progress}")
+        return "\n".join(lines)
+
+    def _telegram_cancel_current(self):
+        running = next((j for j in self.queue_jobs if j.get("state") == "running"), None)
+        if running is not None and self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
+            number = running.get("job_number", "?")
+            self._stop_running_job("cancel")
+            return f"Cancel requested for running GrizzlyMax Job #{number}."
+        pending = next((j for j in self.queue_jobs if j.get("state") == "pending"), None)
+        if pending is not None:
+            pending["state"] = "cancelled"; pending["finished_at"] = time.time(); pending["phase"] = "Cancelled"
+            pending["error"] = "Cancelled from Telegram before start."
+            self._save_queue_state(); self._refresh_queue_views()
+            return f"Cancelled pending GrizzlyMax Job #{pending.get('job_number','?')}."
+        return "There is no running or pending GrizzlyMax job to cancel."
+
+    def _telegram_last_result(self):
+        jobs = [j for j in self.queue_jobs if j.get("state") == "finished" and Path(j.get("output", "")).is_file()]
+        if not jobs:
+            return ""
+        j = max(jobs, key=lambda x: float(x.get("finished_at") or x.get("created_at") or 0))
+        return str(j.get("output") or "")
+
+    @staticmethod
+    def _telegram_parse_resolution(text):
+        raw = str(text or "").lower().replace("×", "x").replace(" ", "")
+        if not raw or raw == "saved":
+            return None
+        aliases = {"320p": (576,320), "384p": (736,384), "448p": (832,448), "480p": (832,448),
+                   "544p": (960,544), "576p": (1024,576), "640p": (1152,640), "704p": (1280,704),
+                   "720p": (1280,704), "768p": (1344,768), "1080p": (1920,1088)}
+        if raw in aliases:
+            return aliases[raw]
+        m = re.search(r"(\d{3,4})x(\d{3,4})", raw)
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
+    @staticmethod
+    def _telegram_parse_duration(text):
+        """Resolve Telegram seconds/frames to H3's native 17k+5 frame grid.
+
+        Bare numbers are interpreted as seconds. Explicit `frame`/`frames`/`f`
+        input is interpreted as a frame request. The result is always snapped to
+        the nearest MiniMax-valid frame count and automatically uses the long
+        duration grid when necessary.
+        """
+        raw = str(text or "").strip().lower().replace(',', '.')
+        if not raw:
+            raise ValueError('Send a duration such as `10`, `10s`, `243 frames`, or `saved`.')
+
+        is_frames = bool(re.search(r'\b(frame|frames)\b', raw)) or bool(re.fullmatch(r'\s*[-+]?\d+(?:\.\d+)?\s*f\s*', raw))
+        m = re.search(r'[-+]?\d+(?:\.\d+)?', raw)
+        if not m:
+            raise ValueError('Duration needs a number, for example `10s` or `243 frames`.')
+        value = float(m.group(0))
+        if value <= 0:
+            raise ValueError('Duration must be greater than zero.')
+
+        requested_frames = int(round(value)) if is_frames else int(round(value * 24.0))
+        all_presets = EXPERIMENTAL_FRAME_PRESETS
+        nearest = min(all_presets, key=lambda n: (abs(n - requested_frames), n))
+        # The experimental grid already ends at the app's supported 99.375 s cap.
+        if requested_frames > EXPERIMENTAL_FRAME_MAX:
+            nearest = EXPERIMENTAL_FRAME_MAX
+        elif requested_frames < FRAME_PRESETS[0]:
+            nearest = FRAME_PRESETS[0]
+
+        unit = 'frames' if is_frames else 'seconds'
+        return int(nearest), f'{value:g} {unit}'
+
+    def _telegram_apply_resolution_to_dict(self, d, text):
+        wh = self._telegram_parse_resolution(text)
+        if not wh:
+            return
+        w, h = wh
+        for label, pair in WIDESCREEN_21_9_PRESETS.items():
+            if tuple(pair) == (w, h):
+                d["aspect"] = "21:9"; d["widescreen_quality"] = label; return
+        for label, aspects in RESOLUTION_PRESETS.items():
+            for aspect, pair in aspects.items():
+                if tuple(pair) == (w, h):
+                    d["resolution"] = label; d["aspect"] = aspect; return
+        best = min(RESOLUTION_PRESETS.items(), key=lambda kv: abs(kv[1]["16:9"][0]-w) + abs(kv[1]["16:9"][1]-h))
+        d["resolution"] = best[0]; d["aspect"] = "16:9"
+
+    def _telegram_enqueue_generation(self, spec, chat_id):
+        before_ids = {str(j.get("id")) for j in self.queue_jobs}
+        snapshot = copy.deepcopy(self.settings_dict())
+        temp = copy.deepcopy(snapshot)
+        mode = max(0, min(2, int(spec.get("mode", 0))))
+        temp["mode"] = mode; temp["prompt"] = str(spec.get("prompt") or "").strip()
+        temp["first"] = ""; temp["last"] = ""; temp["continue_video"] = ""; temp["continue_last_result"] = False; temp["glue_results"] = False
+        temp["ref_images"] = []; temp["ref_videos"] = []; temp["ref_audios"] = []
+        attachments = list(spec.get("attachments") or [])
+        if mode == 1:
+            source = next((a for a in attachments if a.get("kind") in ("image", "video")), None)
+            if source is None:
+                return False, "No FL2VA image/video input was supplied.", None
+            if source.get("kind") == "image": temp["first"] = str(source.get("path") or "")
+            else: temp["continue_video"] = str(source.get("path") or "")
+        elif mode == 2:
+            temp["ref_images"] = [str(a.get("path")) for a in attachments if a.get("kind") == "image"][:9]
+            temp["ref_videos"] = [str(a.get("path")) for a in attachments if a.get("kind") == "video"][:3]
+            temp["ref_audios"] = [str(a.get("path")) for a in attachments if a.get("kind") == "audio"][:3]
+            if not (temp["ref_images"] or temp["ref_videos"] or temp["ref_audios"]):
+                return False, "No usable Ref2VA reference was supplied.", None
+            if temp.get("lock_source_audio") and not temp["ref_audios"]: temp["lock_source_audio"] = False
+        if str(spec.get("settings_mode") or "saved") == "custom":
+            self._telegram_apply_resolution_to_dict(temp, spec.get("resolution"))
+            if spec.get("seed") is not None: temp["seed"] = int(spec.get("seed"))
+            if spec.get("steps") is not None: temp["steps"] = int(spec.get("steps"))
+            if spec.get("frames") is not None:
+                resolved_frames = int(spec.get("frames"))
+                temp["frames"] = resolved_frames
+                temp["experimental_long_duration"] = bool(resolved_frames > NORMAL_FRAME_MAX)
+        try:
+            self.apply_settings(temp)
+            self.generate()
+            job = next((j for j in reversed(self.queue_jobs) if str(j.get("id")) not in before_ids), None)
+            if job is None:
+                return False, "GrizzlyMax did not add the Telegram request to the queue. Check the app for a validation message.", None
+            job["telegram_chat_id"] = str(chat_id); job["telegram_remote"] = True
+            self._save_queue_state(); self._refresh_queue_views()
+            job_frames = int(job.get("frames") or 0)
+            duration_text = f" • {job_frames / 24.0:.3f}s / {job_frames} frames" if job_frames else ""
+            return True, (f"Added GrizzlyMax Job #{job.get('job_number','?')} to the internal queue.\n"
+                          f"{job.get('mode_name','MiniMax H3')} • {job.get('resolution','')}{duration_text} • {job.get('steps','?')} steps • seed {job.get('seed','?')}"), job
+        except Exception as exc:
+            return False, f"Could not queue Telegram generation: {exc}", None
+        finally:
+            try:
+                self.apply_settings(snapshot); self.save_last()
+            except Exception:
+                pass
+
     def closeEvent(self, e):
         self._closing = True
+        try:
+            if self.telegram_remote is not None:
+                self.telegram_remote.stop()
+        except Exception:
+            pass
         self.save_last()
         if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
             job=self._job_by_id(self.current_job_id)
