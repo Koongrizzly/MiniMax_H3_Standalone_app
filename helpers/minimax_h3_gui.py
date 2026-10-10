@@ -2720,6 +2720,15 @@ class MainWindow(QMainWindow):
             continue_source=str(job.get("manual_continue_video") or "")
         if continue_source:
             run_args += ["--continue-video", continue_source, "--continue-context-frames", str(int(job.get("continue_context_frames") or 90))]
+            # Apply timeline predecessor edits to BOTH explicit and queue-chained sources.
+            # The worker trims decoded frames and audio before continuation; the
+            # original untrimmed H3 latent cannot safely be used after a cut.
+            if job.get("timeline_generation_mode") == "continue":
+                for key, flag in (("timeline_previous_trim_in", "--continue-trim-in"),
+                                  ("timeline_previous_trim_out", "--continue-trim-out")):
+                    value = job.get(key)
+                    if value is not None:
+                        run_args += [flag, str(float(value))]
             if job.get("continue_last_result") and job.get("continue_audio_memory"):
                 run_args += ["--continue-audio-memory"]
             if job.get("latent_continuation"):
@@ -2980,6 +2989,12 @@ class MainWindow(QMainWindow):
                         timeline_voice_subjects.append(subject_no)
                 use_timeline_refs = bool(spec.get("use_reference_images", False))
                 if use_timeline_refs:
+                    for subject_no, item in enumerate(timeline_ref_entries, 1):
+                        voice = str(item.get("voice_sample") or "").strip()
+                        if voice:
+                            included = subject_no in timeline_voice_subjects
+                            self.append_log(f"[TIMELINE VOICE] {clip_name} Subject {subject_no}: {'FORWARDED' if included else 'SKIPPED (no recognized dialogue)'}: {voice}\n")
+                if use_timeline_refs:
                     if not timeline_refs:
                         QMessageBox.warning(self, "Timeline Ref2VA", f"{clip_name} has reference mode enabled but no reference images.")
                         return False
@@ -3176,6 +3191,8 @@ class MainWindow(QMainWindow):
                 job["timeline_clip_index"] = pos
                 job["timeline_clip_name"] = clip_name
                 job["timeline_generation_mode"] = generation_mode
+                job["timeline_previous_trim_in"] = spec.get("timeline_previous_trim_in")
+                job["timeline_previous_trim_out"] = spec.get("timeline_previous_trim_out")
                 job["timeline_edit_mode"] = str(spec.get("edit_mode") or "")
                 job["timeline_use_reference_images"] = bool(use_timeline_refs)
                 job["compiled_prompt"] = str(settings.get("prompt") or "")

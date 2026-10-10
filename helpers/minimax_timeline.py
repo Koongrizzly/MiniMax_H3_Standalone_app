@@ -6688,6 +6688,22 @@ class TimelineTab(QWidget):
                         "stale": False,
                     })
                 else:
+                    # A block can have several ordinary regenerations queued before
+                    # any MP4 exists. Preserve the superseded queue job by ID, not
+                    # only playable files, so its eventual result appears in the
+                    # Alternate candidates list when the queue finishes it.
+                    previous_job_id = str(clip.get("queue_job_id") or "")
+                    previous_state = str(clip.get("status") or "").lower()
+                    if (previous_job_id and previous_job_id != str(job_id)
+                            and previous_state in {"pending", "queued", "running", "processing", "generating"}):
+                        candidates = clip.setdefault("alternate_candidates", [])
+                        if not any(isinstance(c, dict) and str(c.get("queue_job_id") or "") == previous_job_id
+                                   for c in candidates):
+                            prior = self._candidate_snapshot_from_active(clip)
+                            prior["queue_job_id"] = previous_job_id
+                            prior["status"] = previous_state
+                            candidates.append(prior)
+                            print(f"[TIMELINE] Preserved superseded queued render {previous_job_id} as alternate for {clip.get('name') or clip.get('id')}", flush=True)
                     # Normal regeneration used to overwrite the active attempt and
                     # leave Undo as the only route back. Preserve the currently
                     # playable render as an alternate *before* replacing its queue

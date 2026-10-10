@@ -65,6 +65,8 @@ def main():
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
     ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
     ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=90); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--latent-continuation", action="store_true", help="Prefer the saved native H3 latent sidecar for continuation history; fall back to video history if unavailable/incompatible"); ap.add_argument("--combine-frames-latent", action="store_true", help="When latent continuation is active, combine saved H3 latent history with decoded source-video frame history and the exact final-frame boundary"); ap.add_argument("--glue-source"); ap.add_argument("--output")
+    ap.add_argument("--continue-trim-in", type=float, default=0.0, help="Timeline predecessor visible start in seconds")
+    ap.add_argument("--continue-trim-out", type=float, default=None, help="Timeline predecessor visible end in seconds")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
     ap.add_argument("--extended-logging", action="store_true")
@@ -356,6 +358,48 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="h3_isolated_", dir=str(ROOT / "output")) as td:
         td = Path(td); lat = td / "latents.pt"; frames_dir = td / "frames"; wav = td / "audio.wav"
+        if ns.continue_video and (ns.continue_trim_in > 0.001 or ns.continue_trim_out is not None):
+            # Create an accurate *temporary* visible segment, leaving the source
+            # MP4 untouched. This covers frame history, final-frame anchor and
+            # (when enabled) sound memory with the same exact cut boundaries.
+            start = max(0.0, float(ns.continue_trim_in))
+            end = ns.continue_trim_out
+            source = Path(ns.continue_video)
+            ffprobe_path = str(tool_path("ffprobe.exe"))
+            try:
+                duration = float(subprocess.check_output(
+                    [ffprobe_path, "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(source)],
+                    text=True, timeout=15, stderr=subprocess.DEVNULL).strip())
+            except Exception as exc:
+                raise RuntimeError(f"Cannot determine continuation source duration: {source}: {exc}") from exc
+            if end is None:
+                end = duration
+            else:
+                end = min(duration, float(end))
+            if end <= start + 0.04:
+                raise RuntimeError(f"Invalid continuation trim: start={start:.3f}s, end={end:.3f}s, source duration={duration:.3f}s")
+            if start > 0.001 or end < duration - 0.04:
+                ok, msg = ensure_ffmpeg_tools(lambda line: print(line, flush=True))
+                if not ok:
+                    raise RuntimeError(f"FFmpeg unavailable for timeline continuation trim: {msg}")
+                proxy = td / "timeline_visible_predecessor.mp4"
+                command = [str(tool_path("ffmpeg.exe")), "-y", "-nostdin", "-hide_banner",
+                           "-loglevel", "error", "-ss", f"{start:.6f}", "-i", str(source),
+                           "-t", f"{end-start:.6f}", "-map", "0:v:0", "-map", "0:a?",
+                           "-vf", "fps=24", "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+                           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                           "-avoid_negative_ts", "make_zero", str(proxy)]
+                print(f"[TIMELINE TRIM] Continuation source: {source}", flush=True)
+                print(f"[TIMELINE TRIM] Visible range: {start:.3f}s to {end:.3f}s (source {duration:.3f}s)", flush=True)
+                subprocess.check_call(command, cwd=ROOT)
+                if not proxy.is_file() or proxy.stat().st_size == 0:
+                    raise RuntimeError("FFmpeg did not create a valid trimmed continuation video")
+                ns.continue_video = str(proxy)
+                if ns.latent_continuation:
+                    print("[TIMELINE TRIM] Saved full-length latent is incompatible with the trimmed endpoint; using exact trimmed frame history instead.", flush=True)
+                    ns.latent_continuation = False
+                    ns.combine_frames_latent = False
         sample_cmd = [py, "-m", "runtime.sample_worker", "--diffusion", str(diff), "--text-encoder", str(te), "--prompt", ns.prompt, "--width", str(width), "--height", str(height), "--frames", str(ns.frames), "--steps", str(ns.steps), "--cfg", str(ns.cfg), "--seed", str(ns.seed), "--shift", str(ns.shift), "--audio-shift", str(ns.audio_shift), "--sampler", ns.sampler, "--scheduler", ns.scheduler, "--out", str(lat)]
         if ns.experimental_long_duration: sample_cmd += ["--experimental-long-duration"]
         if ns.spectrum: sample_cmd += ["--spectrum"]
