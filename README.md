@@ -33,6 +33,8 @@ Main Features :
 
 - Integrated H3 Prompt Builder with presets
 
+- Telegram bot support (use the app from your phone)
+
 - Automatic VRAM management with override features
 
 - Optional Spectrum Forecasting (use at least 6 steps to avoid bad results)
@@ -47,7 +49,26 @@ Main Features :
 
 ---
 
+- 10/10/26 :
 
+  Telegram bot support added
+  - Connect a Telegram bot from the standalone GrizzlyMax application, with persistent configuration and connect/disconnect controls.
+  - Restrict remote commands to explicitly allowed numeric Telegram user IDs; unauthorized accounts cannot use generation controls.
+  - Start a text/image/reference-to-video request remotely with /t2v, /i2v and /ref2v (or ref2va)
+
+  - Choose current saved Generation settings or customize supported options such as resolution, seed, steps and requested duration/frame count.
+
+  - Use /status or /queue to inspect the application’s internal job queue remotely.
+
+  - Use /cancel to request cancellation of the current standalone GrizzlyMax job.
+
+  - Use /last to request the most recent finished generation.
+
+  - Receive generated video files through Telegram when enabled, with a reduced-size delivery copy when needed.
+
+  - Use /help to view the commands supported by the connected bot.
+ 
+---
 - 09/24/26 :
   
   create full movies with the help of the timeline director.
@@ -72,7 +93,8 @@ Watch a 6 minute shortfilm made from scratch with the timeline director on youtu
     ▶ Watch the full video on YouTube
   </a>
 </p>
-  
+
+---  
 - 09/13/26 :
 
   Added support for several int8 models, including the singularity & SparseRef15_Hybrid checkpoints.
@@ -83,11 +105,11 @@ Watch a 6 minute shortfilm made from scratch with the timeline director on youtu
 
   Best quality/speed combination i found : use included speedup lora (use BETA instead of SIMPLE Scheduler for this particular lora) at 9 instead of 4 steps and activate Spectrum forecast in the settings, speed will be almost as fast as using 4 or 6 steps but quality is better.
 
-  
+---  
 - 08/17/26 : added support for the hybrid models (INT4/W4A8)
   Folder location now has a toggle 'use hybrid model' and the installer now has option to download the hybrid model.
 
-  
+---  
 - 08/16/26:
 
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026-09-26%2000_40_12-minimax%20H3%20Standalone.jpg)
