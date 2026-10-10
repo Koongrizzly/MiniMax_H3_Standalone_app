@@ -4346,15 +4346,23 @@ class MainWindow(QMainWindow):
                 )
             elif is_timeline:
                 self.gen.setText("Generate Timeline")
-                self.gen.setToolTip("Validate the visible timeline, queue every generation clip in order, and use existing Continue Last Result dependencies for continuation blocks.")
+                self.gen.setToolTip("Choose which timeline clips to generate. Nothing is queued until an option is selected.")
             else:
                 self.gen.setText("Generate")
                 self.gen.setToolTip("Add the current MiniMax generation job to the queue.")
 
     def _main_generate_action(self):
         if getattr(self, "timeline_tab_index", -1) == self.tabs.currentIndex():
-            if getattr(self, "timeline_widget", None) is not None:
-                self.timeline_widget.generate_timeline()
+            timeline = getattr(self, "timeline_widget", None)
+            if timeline is not None:
+                # Reuse the Timeline Director's menu and its connected actions.
+                # Never call generate_timeline() without an explicit mode: its
+                # default is "all", which would requeue existing MP4 clips.
+                menu = getattr(timeline, "generate_timeline_menu", None)
+                if menu is not None:
+                    menu.exec(self.gen.mapToGlobal(self.gen.rect().bottomLeft()))
+                else:
+                    QMessageBox.warning(self, "Generate Timeline", "Timeline generation options are unavailable.")
             return
         if (
             getattr(self, "music_clip_widget", None) is not None

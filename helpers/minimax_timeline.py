@@ -2551,10 +2551,18 @@ class TimelineTab(QWidget):
         self.edit_scroll.setWidget(edit_scroll_contents)
         edit_outer.addWidget(self.edit_scroll, 0)
 
-        self.generate_selected_btn = QPushButton("(Re)generate selected block")
+        edit_actions = QHBoxLayout()
+        edit_actions.setSpacing(6)
+        self.generate_selected_btn = QPushButton("Generate")
         self.generate_selected_btn.setFixedHeight(36)
-        self.generate_selected_btn.setToolTip("Regenerate only the selected block using the replacement continuity mode selected above.")
-        edit_outer.addWidget(self.generate_selected_btn, 0)
+        self.generate_selected_btn.setToolTip("Generate the selected block using the continuity mode selected above.")
+        self.edit_preview_btn = QPushButton("Preview clip")
+        self.edit_preview_btn.setFixedHeight(36)
+        self.edit_preview_btn.setToolTip("Preview the selected clip's existing video, including stale renders.")
+        self.edit_preview_btn.setEnabled(False)
+        edit_actions.addWidget(self.generate_selected_btn, 1)
+        edit_actions.addWidget(self.edit_preview_btn, 1)
+        edit_outer.addLayout(edit_actions)
 
         # Fixed overall height prevents this panel from expanding and forcing
         # the main timeline itself to scroll vertically.  The option list owns
@@ -2682,6 +2690,7 @@ class TimelineTab(QWidget):
         self.redo_btn.clicked.connect(self.redo_timeline)
         self.hq_restart_btn.clicked.connect(self.hq_restart)
         self.generate_selected_btn.clicked.connect(self.generate_selected)
+        self.edit_preview_btn.clicked.connect(self.preview_selected_result)
         self.assemble_timeline_btn.clicked.connect(self.assemble_timeline)
         self.use_generation_settings_btn.clicked.connect(self.use_current_generation_settings)
         self.preview_clip_btn.clicked.connect(self.preview_selected_result)
@@ -4416,6 +4425,15 @@ class TimelineTab(QWidget):
         self._refresh_all()
 
     def _refresh_edit_workflow(self, clip):
+        # Availability is determined from media on disk, not the status label:
+        # stale clips remain previewable even when regeneration is disabled.
+        has_media = bool(self._clip_preview_path(clip)) if clip is not None else False
+        self.edit_preview_btn.setEnabled(has_media)
+        self.generate_selected_btn.setText("Re-generate" if has_media else "Generate")
+        self.generate_selected_btn.setToolTip(
+            "Re-generate the selected block using the selected continuity mode."
+            if has_media else "Generate the selected block using the selected continuity mode."
+        )
         buttons = (self.edit_bridge_both, self.edit_continue_previous, self.edit_anchor_next, self.edit_standalone)
         idx = self._selected_index()
         if clip is None or idx < 0:
@@ -6183,7 +6201,7 @@ class TimelineTab(QWidget):
         if getattr(self, "_regenerate_selected_busy", False):
             return False
         self._regenerate_selected_busy = True
-        old_button_text = self.generate_selected_btn.text() if hasattr(self, "generate_selected_btn") else "(Re)generate selected block"
+        old_button_text = self.generate_selected_btn.text() if hasattr(self, "generate_selected_btn") else "Generate"
         if hasattr(self, "generate_selected_btn"):
             self.generate_selected_btn.setEnabled(False)
             self.generate_selected_btn.setText("Preparing regeneration…")
