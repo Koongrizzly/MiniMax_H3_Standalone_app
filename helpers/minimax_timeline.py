@@ -5221,16 +5221,12 @@ class TimelineTab(QWidget):
         volume_sections_action.setToolTip("Mute or lower only selected time ranges inside this clip.")
         fade_in_action = menu.addAction(f"Audio fade in…  {max(0.0, float(clip.get('audio_fade_in_seconds') or 0.0)):.1f}s")
         fade_out_action = menu.addAction(f"Audio fade out…  {max(0.0, float(clip.get('audio_fade_out_seconds') or 0.0)):.1f}s")
-        video_fade_in_action = None
-        video_fade_out_action = None
-        if idx == 0:
-            video_fade_in_action = menu.addAction(
-                f"Video fade in from black…  {max(0.0, float(clip.get('video_fade_in_seconds') or 0.0)):.1f}s"
-            )
-        if idx == len(self._clips()) - 1:
-            video_fade_out_action = menu.addAction(
-                f"Video fade out to black…  {max(0.0, float(clip.get('video_fade_out_seconds') or 0.0)):.1f}s"
-            )
+        video_fade_in_action = menu.addAction(
+            f"Video fade in from black…  {max(0.0, float(clip.get('video_fade_in_seconds') or 0.0)):.1f}s"
+        )
+        video_fade_out_action = menu.addAction(
+            f"Video fade out to black…  {max(0.0, float(clip.get('video_fade_out_seconds') or 0.0)):.1f}s"
+        )
         speed_action = menu.addAction(f"Speed…  {_clip_speed(clip):.2f}x")
         transition_name = _transition_name(clip)
         transition_suffix = "" if transition_name == "none" else f"  {_TRANSITION_LABELS.get(transition_name, transition_name)} {_transition_requested_seconds(clip):.1f}s"
@@ -5670,15 +5666,10 @@ class TimelineTab(QWidget):
         if not clip:
             return False
         direction = str(direction).lower()
-        clips = self._clips()
         if direction == "in":
-            if idx != 0:
-                return False
             key = "video_fade_in_seconds"
             label = "Video fade in from black"
         else:
-            if idx != len(clips) - 1:
-                return False
             key = "video_fade_out_seconds"
             label = "Video fade out to black"
         try:
@@ -6648,6 +6639,10 @@ class TimelineTab(QWidget):
         specs = self._generation_specs_for_indices(unlocked_indices)
         for spec in specs:
             spec["timeline_hq_override"] = copy.deepcopy(override)
+            # Only an explicit HQ Restart preserves existing timeline trims.
+            # A normal regeneration may inherit the project's HQ resolution,
+            # but must not inherit trim points from a different MP4.
+            spec["timeline_preserve_trim_on_replacement"] = True
 
         self._record_undo_state("HQ restart")
         result = self.queue_timeline_callback(specs)
@@ -6721,12 +6716,17 @@ class TimelineTab(QWidget):
                     # remain unchanged.
                     is_hq_restart = bool(
                         isinstance(job_info, dict)
-                        and isinstance(job_info.get("timeline_hq_override"), dict)
-                        and job_info.get("timeline_hq_override")
+                        and job_info.get("timeline_preserve_trim_on_replacement", False)
                     )
                     if not is_hq_restart:
-                        clip.pop("trim_in", None)
-                        clip.pop("trim_out", None)
+                        old_trim_in = clip.pop("trim_in", None)
+                        old_trim_out = clip.pop("trim_out", None)
+                        if old_trim_in is not None or old_trim_out is not None:
+                            print(
+                                f"[TIMELINE] New render for {clip.get('name') or clip.get('id')}: "
+                                f"reset old trim in={old_trim_in} out={old_trim_out}",
+                                flush=True,
+                            )
                     else:
                         print(
                             f"[TIMELINE] HQ restart preserved trim for "

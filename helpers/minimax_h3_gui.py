@@ -3193,6 +3193,7 @@ class MainWindow(QMainWindow):
                 job["timeline_generation_mode"] = generation_mode
                 job["timeline_previous_trim_in"] = spec.get("timeline_previous_trim_in")
                 job["timeline_previous_trim_out"] = spec.get("timeline_previous_trim_out")
+                job["timeline_preserve_trim_on_replacement"] = bool(spec.get("timeline_preserve_trim_on_replacement", False))
                 job["timeline_edit_mode"] = str(spec.get("edit_mode") or "")
                 job["timeline_use_reference_images"] = bool(use_timeline_refs)
                 job["compiled_prompt"] = str(settings.get("prompt") or "")
@@ -3862,11 +3863,11 @@ class MainWindow(QMainWindow):
                 audio_fade_out_seconds = 0.0
             has_audio_fade = has_audio_fade or audio_fade_in_seconds > 0.0005 or audio_fade_out_seconds > 0.0005
             try:
-                video_fade_in_seconds = max(0.0, min(final_duration, float(clip.get("video_fade_in_seconds") or 0.0))) if clip_index == 0 else 0.0
+                video_fade_in_seconds = max(0.0, min(final_duration, float(clip.get("video_fade_in_seconds") or 0.0)))
             except Exception:
                 video_fade_in_seconds = 0.0
             try:
-                video_fade_out_seconds = max(0.0, min(final_duration, float(clip.get("video_fade_out_seconds") or 0.0))) if clip_index == len(clips) - 1 else 0.0
+                video_fade_out_seconds = max(0.0, min(final_duration, float(clip.get("video_fade_out_seconds") or 0.0)))
             except Exception:
                 video_fade_out_seconds = 0.0
             has_video_edge_fade = has_video_edge_fade or video_fade_in_seconds > 0.0005 or video_fade_out_seconds > 0.0005
