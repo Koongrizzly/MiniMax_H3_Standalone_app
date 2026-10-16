@@ -2748,6 +2748,17 @@ class MainWindow(QMainWindow):
         self.proc.setProgram(queue_program if queue_program else str(PYTHON))
         self.proc.setArguments(run_args); self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._process_output); self.proc.finished.connect(self._finished)
+        if job.get("job_type") == "timeline_assembly":
+            trace_job_number = job.get("job_number")
+            def _on_assembly_started():
+                self._assembly_trace(f"QPROCESS STARTED job={trace_job_number} pid={int(self.proc.processId()) if self.proc else 'none'}")
+            def _on_assembly_error(error):
+                description = self.proc.errorString() if self.proc else str(error)
+                self._assembly_trace(f"QPROCESS ERROR job={trace_job_number} code={error} detail={description!r}")
+                self.append_log(f"[Assembly diagnostic] Process error: {description}\n")
+            self.proc.started.connect(_on_assembly_started)
+            self.proc.errorOccurred.connect(_on_assembly_error)
+            self._assembly_trace(f"QPROCESS CONFIGURED job={trace_job_number} exe={self.proc.program()!r} args={len(run_args)} workdir={str(ROOT)!r}")
         self._start_job_log_file(job)
         self.cancel.setEnabled(True); self.gen.setEnabled(True)
         if job.get("job_type") == "timeline_assembly":
@@ -2759,7 +2770,10 @@ class MainWindow(QMainWindow):
         else:
             self.status.setText("Queue: generating…")
             self.append_log(f"\n=== QUEUE START ===\nOutput: {job.get('output')}\n")
-        self._save_queue_state(); self._refresh_queue_views(); self.proc.start()
+        self._save_queue_state(); self._refresh_queue_views()
+        if job.get("job_type") == "timeline_assembly":
+            self._assembly_trace(f"QPROCESS START CALL job={job.get('job_number')}")
+        self.proc.start()
 
     def _stop_running_job(self, action):
         if not self.proc or self.proc.state()==QProcess.ProcessState.NotRunning: return
@@ -3515,9 +3529,22 @@ class MainWindow(QMainWindow):
         value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip()).strip("_.")
         return value or "minimax_timeline"
 
+    def _assembly_trace(self, message):
+        """Best-effort, append-only diagnostic file; independent of queue logging."""
+        try:
+            from datetime import datetime as _dt
+            path = ROOT / "jobs" / "timeline_assembly" / "assembly_diagnostics.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8", errors="replace") as handle:
+                handle.write(f"[{_dt.now().isoformat(timespec='seconds')}] {message}\n")
+                handle.flush()
+        except Exception:
+            pass
+
     def _assemble_timeline_project(self, project):
         """Join finished timeline clip outputs into one final MP4 without re-encoding."""
         clips = list((project or {}).get("clips") or [])
+        self._assembly_trace(f"BEGIN project={str((project or {}).get('name'))!r} clips={len(clips)}")
         if not clips:
             QMessageBox.warning(self, "Timeline assembly", "The timeline has no clips to assemble.")
             return False
@@ -3536,12 +3563,14 @@ class MainWindow(QMainWindow):
                     f"Clip {index} has no usable output file:\n\n{output}",
                 )
                 return False
+            self._assembly_trace(f"VALIDATE clip {index}/{len(clips)} {str(output)!r}")
             outputs.append(output)
             job = jobs_by_id.get(str(clip.get("queue_job_id") or ""))
             if job and job.get("resolution"):
                 resolutions.add(str(job.get("resolution")))
             elif clip.get("loaded_resolution"):
                 resolutions.add(str(clip.get("loaded_resolution")))
+        self._assembly_trace("VALIDATE complete; inspecting resolutions")
         normalize_mixed_resolution = False
         target_resolution = None
         if len(resolutions) > 1:
@@ -3592,6 +3621,7 @@ class MainWindow(QMainWindow):
             )
             return False
 
+        self._assembly_trace("FFMPEG availability verified; preparing output")
         # Keep the final assembled video with the Timeline project. Projects made
         # before project-folder support fall back to the normal standalone output.
         project_folder = str((project or {}).get("project_folder") or "").strip()
@@ -3608,6 +3638,8 @@ class MainWindow(QMainWindow):
         work_dir = ROOT / "jobs" / "timeline_assembly"
         work_dir.mkdir(parents=True, exist_ok=True)
         concat_path = work_dir / f"concat_{uuid.uuid4().hex}.txt"
+
+        self._assembly_trace(f"OUTPUT path={str(final_path)!r}; begin media inspection")
 
         def ffconcat_path(path):
             return str(path.resolve()).replace("\\", "/").replace("'", "\\'")
@@ -3883,6 +3915,7 @@ class MainWindow(QMainWindow):
         seam_color_corrections = {}
         has_seam_color_match = False
 
+        self._assembly_trace("MEDIA inspection complete; preparing FFmpeg inputs and filters")
         # The concat recipe remains useful for the unchanged fast stream-copy path.
         concat_lines = [f"file '{ffconcat_path(path)}'\n" for path in outputs]
         concat_path.write_text("".join(concat_lines), encoding="utf-8")
@@ -3912,6 +3945,7 @@ class MainWindow(QMainWindow):
                     return False
 
             for _clip, path, trim_in, trim_out, effective_duration, volume_percent, speed_multiplier, auto_overlap_drop_frames, audio_fade_in_seconds, audio_fade_out_seconds, video_fade_in_seconds, video_fade_out_seconds, volume_sections in trim_specs:
+                self._assembly_trace(f"FFMPEG input {len(input_meta)+1}/{len(trim_specs)}: {str(path)!r} duration={effective_duration:.3f} trim={trim_in:.3f}-{trim_out:.3f}")
                 # Input-side seek is used for ordinary user trims. When automatic
                 # overlap matching finds a repeated continuation prefix, start at
                 # source time zero and decode that extra overlap because it is
@@ -4185,8 +4219,19 @@ class MainWindow(QMainWindow):
 
             filter_parts.append(f"[{current_v}]setpts=PTS-STARTPTS[vout]")
             filter_parts.append(f"[{current_a}]asetpts=PTS-STARTPTS[aout]")
+            # Windows CreateProcess has a finite command-line length (~32K UTF-16
+            # characters).  Long timelines generate huge filter graphs; pass the
+            # graph through a file so adding clips cannot prevent FFmpeg starting.
+            # FFmpeg 9+ reads an option value from a file via -/filter_complex;
+            # the legacy -filter_complex_script option was removed.
+            filter_script_path = work_dir / f"filters_{uuid.uuid4().hex}.txt"
+            try:
+                filter_script_path.write_text(";".join(filter_parts), encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.warning(self, "Timeline assembly", f"Could not save the FFmpeg filter script:\n{exc}")
+                return False
             args += [
-                "-filter_complex", ";".join(filter_parts),
+                "-/filter_complex", str(filter_script_path),
                 "-map", "[vout]", "-map", "[aout]",
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-c:a", "aac", "-b:a", "192k",
@@ -4201,6 +4246,7 @@ class MainWindow(QMainWindow):
                 str(final_path),
             ]
 
+        self._assembly_trace(f"COMMAND READY input_count={len(outputs)} args_count={len(args)} chars={sum(len(str(v)) for v in args)}")
         # Assembly is a first-class queue job.  This gives it the same persistent
         # Pending/Running/Finished lifecycle, cancellation controls and finished-
         # result autoplay behavior as normal MiniMax renders.
@@ -4260,6 +4306,7 @@ class MainWindow(QMainWindow):
             "manual_continue_video": "",
             "glue_results": False,
             "timeline_assembly_concat": str(concat_path),
+            "timeline_assembly_filter_script": str(filter_script_path) if "filter_script_path" in locals() else "",
             "timeline_soundtrack_mode": soundtrack_mode,
             "timeline_assembly_clip_count": len(outputs),
             "timeline_assembly_soundtrack_count": len(soundtrack_specs),
@@ -4269,6 +4316,7 @@ class MainWindow(QMainWindow):
             "timeline_assembly_auto_overlap_frames": 0,
             "timeline_assembly_soundtrack": copy.deepcopy(list((project or {}).get("soundtrack_clips") or [])),
         }
+        self._assembly_trace(f"QUEUE append job={job['job_number']} ffmpeg={job['queue_program']!r}")
         self.queue_jobs.append(job)
         self._save_queue_state()
         self._refresh_queue_views()
@@ -4281,6 +4329,7 @@ class MainWindow(QMainWindow):
             f"Assembly timing: exact Timeline trims; hidden overlap trimming disabled\n"
             f"Output: {final_path}\n"
         )
+        self._assembly_trace("QUEUE asking to start next pending job")
         self._start_next_pending()
         return True
 
@@ -6411,6 +6460,9 @@ exit /b %RC%
         self._load_preview(job, autoplay=True)
 
     def _finished(self, code, status):
+        diagnostic_job = self._job_by_id(self.current_job_id) if self.current_job_id else None
+        if diagnostic_job and diagnostic_job.get("job_type") == "timeline_assembly":
+            self._assembly_trace(f"QPROCESS FINISHED job={diagnostic_job.get('job_number')} exit_code={code} status={status}")
         self._process_output()
         if self._closing:
             self.proc=None; return
