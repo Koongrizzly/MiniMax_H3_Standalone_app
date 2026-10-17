@@ -4034,7 +4034,9 @@ class MainWindow(QMainWindow):
                         f",scale={tw}:{th}:force_original_aspect_ratio=decrease"
                         f",pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2"
                     )
-                vchain += ",format=yuv420p"
+                # Normalize square pixels for every input after any scale/pad.
+                # FFmpeg concat/xfade requires identical SAR, not just dimensions.
+                vchain += ",setsar=1,format=yuv420p"
                 correction = seam_color_corrections.get(i)
                 if correction:
                     base_label = f"vbase{i}"
