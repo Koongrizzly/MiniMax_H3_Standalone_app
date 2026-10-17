@@ -5008,7 +5008,7 @@ class TimelineTab(QWidget):
         idx, item = self._soundtrack_by_id(audio_id)
         if item is None: return
         current = int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))
-        value, ok = QInputDialog.getInt(self, "Soundtrack volume", "Volume", current, 0, 150, 1)
+        value, ok = QInputDialog.getInt(self, "Soundtrack volume", "Volume", current, 0, 300, 1)
         if not ok or value == current: return
         self._record_undo_state("Change soundtrack volume")
         item["volume_percent"] = int(value)

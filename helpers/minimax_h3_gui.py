@@ -2724,11 +2724,23 @@ class MainWindow(QMainWindow):
             # The worker trims decoded frames and audio before continuation; the
             # original untrimmed H3 latent cannot safely be used after a cut.
             if job.get("timeline_generation_mode") == "continue":
-                for key, flag in (("timeline_previous_trim_in", "--continue-trim-in"),
-                                  ("timeline_previous_trim_out", "--continue-trim-out")):
-                    value = job.get(key)
-                    if value is not None:
-                        run_args += [flag, str(float(value))]
+                # Do not use an MP4's physical ending when the predecessor is
+                # visibly trimmed on the timeline. Log the exact effective cut.
+                trim_start = job.get("timeline_previous_trim_in")
+                trim_end = job.get("timeline_previous_trim_out")
+                if trim_start is not None:
+                    run_args += ["--continue-trim-in", str(float(trim_start))]
+                if trim_end is not None:
+                    run_args += ["--continue-trim-out", str(float(trim_end))]
+                self.append_log(
+                    f"[TIMELINE CONTINUATION] Clip {job.get('timeline_clip_name')}: "
+                    f"source={continue_source} | visible range "
+                    f"{float(trim_start or 0.0):.3f}s to "
+                    f"{float(trim_end):.3f}s" if trim_end is not None else
+                    f"[TIMELINE CONTINUATION] Clip {job.get('timeline_clip_name')}: "
+                    f"source={continue_source} | start={float(trim_start or 0.0):.3f}s, natural end"
+                )
+                self.append_log("\n")
             if job.get("continue_last_result") and job.get("continue_audio_memory"):
                 run_args += ["--continue-audio-memory"]
             if job.get("latent_continuation"):
@@ -3351,7 +3363,7 @@ class MainWindow(QMainWindow):
                     source_offset = track_trim_in + (ov_start - track_start)
                     used = ov_end - ov_start
                     delay = ov_start - clip_start
-                    gain = max(0.0, min(1.5, float(100 if item.get("volume_percent") is None else item.get("volume_percent")) / 100.0))
+                    gain = max(0.0, min(3.0, float(100 if item.get("volume_percent") is None else item.get("volume_percent")) / 100.0))
                     fade_in = max(0.0, float(item.get("fade_in_seconds") or 0.0))
                     fade_out = max(0.0, float(item.get("fade_out_seconds") or 0.0))
                     overlaps.append({
@@ -3790,7 +3802,7 @@ class MainWindow(QMainWindow):
             if used <= 0.0005:
                 continue
             try:
-                volume_percent = max(0, min(150, int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))))
+                volume_percent = max(0, min(300, int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))))
             except Exception:
                 volume_percent = 100
             try:
@@ -4112,7 +4124,7 @@ class MainWindow(QMainWindow):
                 input_index = next_input
                 next_input += 1
                 label = f"st{sidx}"
-                gain = max(0.0, min(1.5, float(volume_percent) / 100.0))
+                gain = max(0.0, min(3.0, float(volume_percent) / 100.0))
                 delay_ms = max(0, int(round(float(timeline_start) * 1000.0)))
                 audio_filters = [
                     "asetpts=PTS-STARTPTS",

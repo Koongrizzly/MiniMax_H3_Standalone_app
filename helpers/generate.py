@@ -395,6 +395,18 @@ def main():
                 subprocess.check_call(command, cwd=ROOT)
                 if not proxy.is_file() or proxy.stat().st_size == 0:
                     raise RuntimeError("FFmpeg did not create a valid trimmed continuation video")
+                # Validate the produced proxy before sampling: all continuation
+                # history must end at the *visible* timeline boundary.
+                proxy_duration = float(subprocess.check_output(
+                    [ffprobe_path, "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(proxy)],
+                    text=True, timeout=15, stderr=subprocess.DEVNULL).strip())
+                if abs(proxy_duration - (end - start)) > 0.15:
+                    raise RuntimeError(
+                        f"Continuation trim proxy duration mismatch: requested {end-start:.3f}s, "
+                        f"got {proxy_duration:.3f}s. Refusing to use the wrong ending.")
+                print(f"[TIMELINE TRIM] VERIFIED proxy={proxy} duration={proxy_duration:.3f}s "
+                      f"visible_end={end:.3f}s context_frames={ns.continue_context_frames}", flush=True)
                 ns.continue_video = str(proxy)
                 if ns.latent_continuation:
                     print("[TIMELINE TRIM] Saved full-length latent is incompatible with the trimmed endpoint; using exact trimmed frame history instead.", flush=True)
