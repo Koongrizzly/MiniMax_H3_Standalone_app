@@ -2728,6 +2728,29 @@ class MainWindow(QMainWindow):
                 # visibly trimmed on the timeline. Log the exact effective cut.
                 trim_start = job.get("timeline_previous_trim_in")
                 trim_end = job.get("timeline_previous_trim_out")
+                # Resolve the currently visible predecessor at execution time. Saved
+                # queue jobs may predate the trim metadata, or their metadata may
+                # be stale after the user adjusts a clip while jobs are pending.
+                # Do not silently fall back to the original MP4's physical end.
+                timeline_project = getattr(getattr(self, "timeline_widget", None), "project", {}) or {}
+                timeline_clips = timeline_project.get("clips") or []
+                target_id = str(job.get("timeline_clip_id") or "")
+                target_index = next((i for i, item in enumerate(timeline_clips)
+                                     if str(item.get("id") or "") == target_id), -1)
+                if target_index > 0:
+                    predecessor = timeline_clips[target_index - 1]
+                    predecessor_output = str(predecessor.get("output") or predecessor.get("start_source_video") or "")
+                    if predecessor_output and Path(predecessor_output).resolve() == Path(continue_source).resolve():
+                        trim_start = predecessor.get("trim_in")
+                        trim_end = predecessor.get("trim_out")
+                        self.append_log(
+                            f"[TIMELINE CONTINUATION] Live predecessor trim for {job.get('timeline_clip_name')}: "
+                            f"{float(trim_start or 0.0):.3f}s to "
+                            f"{float(trim_end):.3f}s\n" if trim_end is not None else
+                            f"[TIMELINE CONTINUATION] Live predecessor has natural endpoint for {job.get('timeline_clip_name')}\n"
+                        )
+                    else:
+                        self.append_log("[TIMELINE CONTINUATION] Source mismatch; using queued predecessor trim metadata.\n")
                 if trim_start is not None:
                     run_args += ["--continue-trim-in", str(float(trim_start))]
                 if trim_end is not None:
