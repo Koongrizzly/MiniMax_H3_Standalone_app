@@ -1858,8 +1858,8 @@ class MainWindow(QMainWindow):
         self.queue_summary.setToolTip("Live queue counts. Jobs are persisted in presets\\setsave\\minimax_h3_queue.json.")
         right_layout.addWidget(self.queue_summary)
 
-        self.running_tree = self._make_queue_tree(["Job", "Started", "Elapsed", "Progress", "Resolution", "Seed", "Dependency", "Source resolved", "Output", "Model"])
-        self.pending_tree = self._make_queue_tree(["Job", "Queued", "Status", "Resolution", "Seed", "Dependency", "Source resolved", "Output", "Model"])
+        self.running_tree = self._make_queue_tree(["Job", "Started", "Elapsed", "Progress", "Resolution", "Duration", "Seed", "Dependency", "Source resolved", "Output", "Model"])
+        self.pending_tree = self._make_queue_tree(["Job", "Queued", "Status", "Resolution", "Duration", "Seed", "Dependency", "Source resolved", "Output", "Model"])
         self.finished_tree = self._make_queue_tree(["Job", "Done at", "Status", "Took", "Resolution", "Duration", "Seed", "Dependency", "Source resolved", "Output", "Model"])
 
         # Enough room to inspect several jobs at once.  Each tree keeps its own
@@ -2112,6 +2112,18 @@ class MainWindow(QMainWindow):
             return f"{mins:02d}:{secs:04.1f}"
         return f"{secs:.1f}s"
 
+    def _planned_queue_duration(self, job):
+        """Requested clip length for jobs that have not finished rendering yet."""
+        try:
+            frames = int(job.get("frames") or 0)
+            if frames > 0:
+                return frames / 24.0
+        except (TypeError, ValueError, OverflowError):
+            pass
+        # Assemblies and jobs without frame counts have no trustworthy
+        # expected duration; never inspect an incomplete output file.
+        return None
+
     def _refresh_queue_views(self):
         if not hasattr(self,"running_tree"): return
         self._ensure_queue_job_numbers()
@@ -2133,12 +2145,12 @@ class MainWindow(QMainWindow):
                 dependency=self._dependency_display(j)
                 source=self._resolved_source_display(j)
                 seed=str(j.get("actual_seed") if j.get("actual_seed") is not None else j.get("seed","—"))
-                res=j.get("resolution","—"); out=Path(j.get("output","")).name or "—"; model=self._short_model(j)
+                res=j.get("resolution","—"); duration=self._fmt_clip_duration(self._planned_queue_duration(j)); out=Path(j.get("output","")).name or "—"; model=self._short_model(j)
                 item=None
                 if state=="running":
                     counts["running"]+=1
                     elapsed=now-float(j.get("started_at") or now)
-                    vals=[job_label,self._fmt_clock(j.get("started_at")),self._fmt_elapsed(elapsed),"",res,seed,dependency,source,out,model]
+                    vals=[job_label,self._fmt_clock(j.get("started_at")),self._fmt_elapsed(elapsed),"",res,duration,seed,dependency,source,out,model]
                     item=QTreeWidgetItem(vals); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.running_tree.addTopLevelItem(item)
                     pb=QProgressBar(); p=j.get("progress")
                     if p is None:
@@ -2147,7 +2159,7 @@ class MainWindow(QMainWindow):
                         pb.setRange(0,100); pb.setValue(int(p)); pb.setFormat(f"Sampling %p%")
                     pb.setStyleSheet("QProgressBar{background:#111820;color:#e8eef6;border:1px solid #334556;text-align:center;} QProgressBar::chunk{background:#126680;}")
                     self.running_tree.setItemWidget(item,3,pb)
-                    self._apply_queue_dependency_tooltips(item,j,6,7)
+                    self._apply_queue_dependency_tooltips(item,j,7,8)
                 elif state=="pending":
                     counts["pending"]+=1
                     pending_status = j.get("phase") or "Waiting"
@@ -2155,8 +2167,8 @@ class MainWindow(QMainWindow):
                         pending_status = "Waiting for FFmpeg setup…"
                     elif self._ffmpeg_setup_failed and not ffmpeg_tools_ready():
                         pending_status = "FFmpeg setup failed"
-                    item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("created_at")),pending_status,res,seed,dependency,source,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
-                    self._apply_queue_dependency_tooltips(item,j,5,6)
+                    item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("created_at")),pending_status,res,duration,seed,dependency,source,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
+                    self._apply_queue_dependency_tooltips(item,j,6,7)
                 elif state in ("finished","failed","cancelled"):
                     counts["finished"]+=1
                     status="Finished" if state=="finished" else ("Cancelled" if state=="cancelled" else "Failed")
@@ -2171,9 +2183,9 @@ class MainWindow(QMainWindow):
                     for c in range(item.columnCount()): item.setForeground(c,brush)
                 elif state=="interrupted":
                     counts["pending"]+=1
-                    item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("created_at")),"Recovery pending",res,seed,dependency,source,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
+                    item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("created_at")),"Recovery pending",res,duration,seed,dependency,source,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
                     item.setToolTip(0,"Interrupted by the previous application shutdown; recovery decision pending.")
-                    self._apply_queue_dependency_tooltips(item,j,5,6)
+                    self._apply_queue_dependency_tooltips(item,j,6,7)
                 if item is not None and state not in ("finished","failed","cancelled"):
                     for c in range(item.columnCount()): item.setForeground(c,normal_brush)
             if hasattr(self,"running_group"): self.running_group.setTitle(f"Running jobs ({counts['running']})")
