@@ -126,6 +126,8 @@ Watch a 6 minute shortfilm made from scratch with the timeline director on youtu
   Add an idea, extra details, camera shots, location(s) in the idea tab and a music track and click start
   to create a full music videoclip with the click of a button.
 
+  Tip : if you have for example 25 clips, add many (up to 25 for this example) locations and lot's of camera effects to get a non stop change in the finished videoclip
+
 
 ---
 
