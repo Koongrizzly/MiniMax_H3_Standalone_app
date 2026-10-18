@@ -3,7 +3,7 @@ import sys,subprocess,zipfile,urllib.request,shutil,tempfile,os
 from pathlib import Path
 _APP_ROOT = Path(__file__).resolve().parents[2]
 if str(_APP_ROOT) not in sys.path: sys.path.insert(0,str(_APP_ROOT))
-from models.nvidia_vsr.runtime.core import ROOT,repo,python_env
+from runtime.nvidia_vsr.core import ROOT,repo,python_env
 
 def say(s):print(s,flush=True)
 def run(args,cwd=None):
