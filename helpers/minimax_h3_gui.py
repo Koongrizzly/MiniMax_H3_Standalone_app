@@ -3027,7 +3027,7 @@ class MainWindow(QMainWindow):
         if not ffmpeg.is_file() or not ffprobe.is_file():
             QMessageBox.warning(self, "NVIDIA VSR", "FFmpeg and FFprobe must be installed in presets/bin.")
             return False
-        runner = ROOT / "models" / "nvidia_vsr" / "runtime" / "runner.py"
+        runner = ROOT / "runtime" / "nvidia_vsr" / "runner.py"
         if not runner.is_file(): return False
         out_dir = ROOT / "output" / "nvidia_vsr"
         out_dir.mkdir(parents=True, exist_ok=True)

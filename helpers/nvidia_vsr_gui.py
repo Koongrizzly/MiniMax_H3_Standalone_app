@@ -4,7 +4,7 @@ _APP_ROOT = Path(__file__).resolve().parents[1]
 if str(_APP_ROOT) not in sys.path: sys.path.insert(0,str(_APP_ROOT))
 from PySide6.QtCore import Qt,QProcess,QTimer
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QTabWidget,QScrollArea,QLabel,QLineEdit,QPushButton,QFileDialog,QComboBox,QDoubleSpinBox,QTextEdit,QProgressBar,QMessageBox,QGroupBox,QFormLayout,QCheckBox)
-from models.nvidia_vsr.runtime.core import ROOT,CONFIG,load,save,repo,python_env,find_exe,run_capture
+from runtime.nvidia_vsr.core import ROOT,CONFIG,load,save,repo,python_env,find_exe,run_capture
 
 class NoWheelCombo(QComboBox):
     def wheelEvent(self,event):event.ignore()
@@ -151,7 +151,7 @@ class Window(QMainWindow):
         outpath=Path(out)
         if source.resolve()==outpath.resolve():QMessageBox.warning(self,'Output invalid','Choose an output different from the source.');return
         if outpath.exists() and QMessageBox.question(self,'Overwrite output','Replace existing output?')!=QMessageBox.Yes:return
-        self.run_process('upscale',[sys.executable,'-u',ROOT/'models/nvidia_vsr/runtime/runner.py','--input',source,'--output',outpath,'--scale',str(self.res.currentIndex()+2),'--quality',self.quality.currentText(),'--strength',str(self.strength.value()),'--ffmpeg',ffmpeg,'--ffprobe',ffprobe],ROOT)
+        self.run_process('upscale',[sys.executable,'-u',ROOT/'runtime/nvidia_vsr/runner.py','--input',source,'--output',outpath,'--scale',str(self.res.currentIndex()+2),'--quality',self.quality.currentText(),'--strength',str(self.strength.value()),'--ffmpeg',ffmpeg,'--ffprobe',ffprobe],ROOT)
     def cancel(self):
         if self.process and self.process.state()!=QProcess.NotRunning:
             self.append('Cancellation requested')
