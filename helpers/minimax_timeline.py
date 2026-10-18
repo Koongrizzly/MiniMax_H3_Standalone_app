@@ -1977,6 +1977,7 @@ class TimelineTab(QWidget):
         *,
         settings_provider=None,
         queue_timeline_callback=None,
+        queue_vsr_callback=None,
         assemble_timeline_callback=None,
         preview_result_callback=None,
         open_output_callback=None,
@@ -1988,6 +1989,7 @@ class TimelineTab(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.settings_provider = settings_provider
         self.queue_timeline_callback = queue_timeline_callback
+        self.queue_vsr_callback = queue_vsr_callback
         self.assemble_timeline_callback = assemble_timeline_callback
         self.preview_result_callback = preview_result_callback
         self.open_output_callback = open_output_callback
@@ -2390,6 +2392,13 @@ class TimelineTab(QWidget):
         self.hq_restart_btn.setToolTip(
             "Use the HQ restart feature when your timeline is tested on a low resolution and results look good."
         )
+        self.vsr_upscale_btn = QPushButton("Upscale")
+        self.vsr_upscale_btn.setMinimumHeight(36)
+        self.vsr_upscale_btn.setToolTip(
+            "Queue NVIDIA VSR upscales for all clips or only selected clips, in timeline order. "
+            "Finished upscales become alternative generations; originals and timeline edits are preserved."
+        )
+        self.vsr_upscale_btn.clicked.connect(self._show_vsr_batch_menu)
         self.ref_presets_btn = QPushButton("Ref presets")
         self.ref_presets_btn.setMinimumHeight(36)
         self.ref_presets_btn.setToolTip(
@@ -2422,6 +2431,7 @@ class TimelineTab(QWidget):
         )
         runbar.addWidget(self.generate_timeline_btn)
         runbar.addWidget(self.hq_restart_btn)
+        runbar.addWidget(self.vsr_upscale_btn)
         runbar.addWidget(self.ref_presets_btn)
         runbar.addWidget(self.add_audio_btn)
         runbar.addWidget(self.soundtrack_mode_combo)
@@ -2792,6 +2802,7 @@ class TimelineTab(QWidget):
         self.summary_label.setText(f"{len(self._clips())} clips  •  {total:.2f}s  •  {round(total * FPS)} timeline frames{selection_suffix}{lock_suffix}")
         self.generate_timeline_btn.setEnabled(bool(self._clips()))
         self.hq_restart_btn.setEnabled(bool(self._clips()))
+        self.vsr_upscale_btn.setEnabled(bool(self._clips()) and callable(self.queue_vsr_callback))
         ready, reason = self._assembly_ready()
         self.assemble_timeline_btn.setEnabled(
             bool(self._clips()) and not bool(getattr(self, "_timeline_assemble_click_busy", False))
@@ -5206,6 +5217,17 @@ class TimelineTab(QWidget):
             action = resolution_menu.addAction(preset)
             action.setToolTip(f"Recreate only this clip at {preset}, keeping its other Timeline settings unchanged.")
             resolution_actions[action] = preset
+        vsr_menu = menu.addMenu("Upscale clip with NVIDIA VSR")
+        vsr_actions = {}
+        vsr_source = self._clip_preview_path(clip)
+        vsr_dimensions = self._vsr_probe_dimensions(vsr_source) if vsr_source else None
+        for factor in (1, 2, 3):
+            dims = (f"{vsr_dimensions[0] * factor} × {vsr_dimensions[1] * factor}"
+                    if vsr_dimensions else "source resolution unknown")
+            a = vsr_menu.addAction(f"VSR x{factor} — {dims}")
+            a.setEnabled(bool(vsr_dimensions) and not locked)
+            vsr_actions[a] = factor
+        vsr_menu.setEnabled(bool(vsr_dimensions) and not locked)
         ref_presets = menu.addAction("Ref presets…")
 
         candidates_menu = menu.addMenu("Alternate candidates")
@@ -5279,6 +5301,8 @@ class TimelineTab(QWidget):
             self._generate_low_res_test_by_id(clip_id)
         elif chosen in resolution_actions:
             self._create_clip_at_resolution_by_id(clip_id, resolution_actions[chosen])
+        elif chosen in vsr_actions:
+            self._queue_vsr_for_clip(clip_id, vsr_actions[chosen])
         elif chosen is ref_presets:
             self._open_ref_presets()
         elif chosen is load_clip_action:
@@ -5315,6 +5339,147 @@ class TimelineTab(QWidget):
             self._edit_clip_notes(clip_id)
         elif chosen is info:
             self._show_clip_info(clip_id)
+
+    def _show_vsr_batch_menu(self):
+        """Choose target scope first, then the native VSR multiplier."""
+        menu = QMenu(self)
+        all_menu = menu.addMenu("Upscale whole project")
+        selected_menu = menu.addMenu("Upscale selected clip(s)")
+        actions = {}
+        clips = self._clips()
+        selected = {str(value) for value in self.selected_clip_ids}
+        eligible_all = [
+            clip for clip in clips
+            if not clip.get("locked") and self._clip_preview_path(clip)
+        ]
+        eligible_selected = [
+            clip for clip in eligible_all if str(clip.get("id")) in selected
+        ]
+        for submenu, scope, count in (
+            (all_menu, "all", len(eligible_all)),
+            (selected_menu, "selected", len(eligible_selected)),
+        ):
+            submenu.setEnabled(count > 0)
+            submenu.setToolTipsVisible(True)
+            for scale in (1, 2, 3):
+                action = submenu.addAction(f"VSR x{scale}  —  {count} clip(s)")
+                action.setToolTip("Jobs are queued from left to right in timeline order.")
+                actions[action] = (scope, scale)
+        picked = menu.exec(self.vsr_upscale_btn.mapToGlobal(self.vsr_upscale_btn.rect().bottomLeft()))
+        if picked in actions:
+            scope, scale = actions[picked]
+            self._queue_vsr_batch(scope, scale)
+
+    def _queue_vsr_batch(self, scope, scale):
+        """Submit a snapshot of eligible timeline clips, ordered from first to last."""
+        selected = {str(value) for value in self.selected_clip_ids}
+        clips = list(self._clips())
+        targets = [
+            clip for clip in clips
+            if (scope == "all" or str(clip.get("id")) in selected)
+            and not clip.get("locked")
+            and self._clip_preview_path(clip)
+        ]
+        if not targets:
+            QMessageBox.information(self, "NVIDIA VSR", "No eligible clips with playable source videos were found.")
+            return
+        submitted = 0
+        failed = 0
+        for clip in targets:
+            if self._queue_vsr_for_clip(str(clip.get("id")), scale, quiet=True):
+                submitted += 1
+            else:
+                failed += 1
+        if failed:
+            QMessageBox.warning(
+                self, "NVIDIA VSR",
+                f"Queued {submitted} clip(s) in timeline order. "
+                f"{failed} clip(s) could not be queued. Check the queue and logs."
+            )
+
+    @staticmethod
+    def _vsr_probe_dimensions(source):
+        """Return decoded display dimensions; never guess based on generation metadata."""
+        if not source or not Path(source).is_file():
+            return None
+        root = Path(__file__).resolve().parents[1]
+        ffprobe = root / "presets" / "bin" / "ffprobe.exe"
+        if not ffprobe.is_file():
+            return None
+        try:
+            proc = subprocess.run([str(ffprobe), "-v", "error", "-select_streams", "v:0",
+                                   "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(source)],
+                                  capture_output=True, text=True, timeout=10, check=True)
+            w, h = map(int, proc.stdout.strip().splitlines()[0].split("x"))
+            return (w, h) if w > 0 and h > 0 else None
+        except Exception:
+            return None
+
+    def _queue_vsr_for_clip(self, clip_id, factor, quiet=False):
+        _, clip = self._clip_by_id(clip_id)
+        if not clip or clip.get("locked"):
+            return False
+        source = self._clip_preview_path(clip)
+        dims = self._vsr_probe_dimensions(source)
+        if not dims or not callable(self.queue_vsr_callback):
+            if not quiet:
+                QMessageBox.warning(self, "NVIDIA VSR", "A playable video, FFprobe and the VSR queue integration are required.")
+            return False
+        return bool(self.queue_vsr_callback({
+            "timeline_clip_id": str(clip_id),
+            "timeline_project_id": str(self.project.get("project_id") or ""),
+            "source": str(Path(source).resolve()), "scale": int(factor),
+            "width": dims[0], "height": dims[1],
+        }))
+
+    def vsr_job_completed(self, job):
+        """Promote a verified upscale to an alternate, never reset timeline edits."""
+        idx, clip = self._clip_by_id(str(job.get("timeline_clip_id") or ""))
+        if clip is None or str(self.project.get("project_id") or "") != str(job.get("timeline_project_id") or ""):
+            return False
+        output = Path(str(job.get("output") or ""))
+        if not output.is_file() or output.stat().st_size < 1024:
+            return False
+        self._record_undo_state("NVIDIA VSR alternate finished")
+        active = self._clip_preview_path(clip)
+        candidates = clip.setdefault("alternate_candidates", [])
+        if active and Path(active).is_file():
+            if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
+                # Loaded media still needs a restorable original candidate.
+                active_key = str(Path(active).resolve()).lower()
+                if not any(str(Path(str(c.get("output") or "")).resolve()).lower() == active_key
+                           for c in candidates if isinstance(c, dict) and c.get("output")):
+                    snapshot = self._candidate_snapshot_from_active(clip)
+                    snapshot["output"] = str(Path(active).resolve())
+                    snapshot["status"] = "finished"
+                    candidates.append(snapshot)
+            else:
+                self._archive_active_candidate_before_replacement(clip, str(output))
+        # The user may have selected another alternative while the job was running.
+        # Keep that choice and add the upscale to alternatives instead.
+        queued_source = str(job.get("vsr_source") or "")
+        if active and Path(active).resolve() != Path(queued_source).resolve():
+            snapshot = {"candidate_id": uuid.uuid4().hex, "output": str(output),
+                        "status": "finished", "queue_job_id": str(job.get("id") or ""),
+                        "last_generation_info": {"output": str(output), "resolution": str(job.get("resolution") or ""),
+                                                  "upscale_engine": "nvidia_vsr", "source": queued_source,
+                                                  "scale": int(job.get("vsr_scale") or 1)}}
+            candidates.append(snapshot)
+            self._refresh_all()
+            return True
+        clip["output"] = str(output)
+        clip["queue_job_id"] = str(job.get("id") or "")
+        clip["status"] = "finished"
+        clip["stale"] = False
+        clip["last_generation_info"] = {
+            "output": str(output), "resolution": str(job.get("resolution") or ""),
+            "upscale_engine": "nvidia_vsr", "source": str(job.get("vsr_source") or ""),
+            "scale": int(job.get("vsr_scale") or 1), "strength": float(job.get("vsr_strength") or 0.75),
+        }
+        # Do not change trim_in/out, volume, audio/video fades, speed or transitions.
+        self._invalidate_assembly("Clip upscaled — assemble again.")
+        self._refresh_all()
+        return True
 
     @staticmethod
     def _candidate_snapshot_from_active(clip: dict) -> dict:
@@ -6785,7 +6950,8 @@ class TimelineTab(QWidget):
                 output = str(job.get("output") or "")
                 if output and clip.get("output") != output:
                     clip["output"] = output; changed = True
-                job_info = self._generation_info_from_job(job)
+                job_info = (clip.get("last_generation_info") if job.get("job_type") == "nvidia_vsr"
+                            else self._generation_info_from_job(job))
                 if job_info and clip.get("last_generation_info") != job_info:
                     clip["last_generation_info"] = job_info; changed = True
 

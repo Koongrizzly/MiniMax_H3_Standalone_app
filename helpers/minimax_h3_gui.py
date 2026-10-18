@@ -2881,6 +2881,7 @@ class MainWindow(QMainWindow):
             self,
             settings_provider=self.settings_dict,
             queue_timeline_callback=self._queue_timeline_jobs,
+            queue_vsr_callback=self._enqueue_timeline_vsr,
             assemble_timeline_callback=self._assemble_timeline_project,
             preview_result_callback=self._preview_timeline_result,
             open_output_callback=self._open_timeline_output_folder,
@@ -2942,6 +2943,119 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Timeline bridge", detail[-1] if detail else "FFmpeg frame extraction failed.")
             return ""
         return str(out)
+
+    def _vsr_config_path(self):
+        return ROOT / "presets" / "setsave" / "maxine_vsr.json"
+
+    def _vsr_strength(self):
+        try:
+            data = json.loads(self._vsr_config_path().read_text(encoding="utf-8"))
+            value = float(data.get("strength", 0.75))
+            return value if value in (0.5, 0.75, 1.0) else 0.75
+        except Exception:
+            return 0.75
+
+    def _save_vsr_strength(self):
+        path = self._vsr_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict): data = {}
+        except Exception:
+            data = {}
+        data["strength"] = float(self.vsr_strength_combo.currentData())
+        temp = path.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temp.replace(path)
+
+    def _vsr_install_status(self):
+        env = ROOT / "environments" / "maxine_vfx" / "Scripts" / "python.exe"
+        sample = ROOT / "models" / "nvidia_vsr" / "nvidia-vfx-python-samples" / "video_super_resolution.py"
+        ready = env.is_file() and sample.is_file()
+        if hasattr(self, "vsr_install_status"):
+            self.vsr_install_status.setText("Python environment and repository detected" if ready else "Installation required")
+        return ready
+
+    def _vsr_install(self):
+        if getattr(self, "_vsr_install_proc", None) and self._vsr_install_proc.state() != QProcess.ProcessState.NotRunning:
+            return
+        script = ROOT / "presets" / "extra_env" / "nvidia_vsr_installer.py"
+        if not script.is_file():
+            QMessageBox.warning(self, "NVIDIA VSR", f"Installer missing: {script}")
+            return
+        self._vsr_install_proc = QProcess(self)
+        self._vsr_install_proc.setWorkingDirectory(str(ROOT))
+        self._vsr_install_proc.setProgram(str(PYTHON if PYTHON.is_file() else sys.executable))
+        self._vsr_install_proc.setArguments(["-u", str(script)])
+        self._vsr_install_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.vsr_install_progress.setRange(0, 0)
+        self.vsr_install_button.setEnabled(False)
+        self._vsr_install_proc.readyReadStandardOutput.connect(self._vsr_install_output)
+        self._vsr_install_proc.finished.connect(self._vsr_install_finished)
+        self._vsr_install_proc.start()
+
+    def _vsr_install_output(self):
+        txt = bytes(self._vsr_install_proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not txt: return
+        self.append_log("[NVIDIA VSR] " + txt)
+        log = ROOT / "logs" / "nvidia_vsr_install.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as f: f.write(txt)
+        m = re.findall(r"STAGE (\d+)/5", txt)
+        if m:
+            self.vsr_install_progress.setRange(0, 5)
+            self.vsr_install_progress.setValue(int(m[-1]) - 1)
+
+    def _vsr_install_finished(self, code, status):
+        self._vsr_install_output()
+        self.vsr_install_button.setEnabled(True)
+        self.vsr_install_progress.setRange(0, 5)
+        self.vsr_install_progress.setValue(5 if code == 0 else 0)
+        self._vsr_install_status()
+        if code != 0:
+            QMessageBox.warning(self, "NVIDIA VSR", "Installation failed. See the Logs tab or logs/nvidia_vsr_install.log.")
+
+    def _enqueue_timeline_vsr(self, spec):
+        source = Path(str(spec.get("source") or ""))
+        scale = int(spec.get("scale") or 0)
+        if not source.is_file() or scale not in (1, 2, 3): return False
+        if not self._vsr_install_status():
+            QMessageBox.information(self, "NVIDIA VSR", "Install NVIDIA VSR from Settings before upscaling clips.")
+            return False
+        ffmpeg = ROOT / "presets" / "bin" / "ffmpeg.exe"
+        ffprobe = ROOT / "presets" / "bin" / "ffprobe.exe"
+        if not ffmpeg.is_file() or not ffprobe.is_file():
+            QMessageBox.warning(self, "NVIDIA VSR", "FFmpeg and FFprobe must be installed in presets/bin.")
+            return False
+        runner = ROOT / "models" / "nvidia_vsr" / "runtime" / "runner.py"
+        if not runner.is_file(): return False
+        out_dir = ROOT / "output" / "nvidia_vsr"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        job_id = uuid.uuid4().hex
+        outfile = out_dir / f"{source.stem}_vsr_x{scale}_{job_id[:8]}.mp4"
+        strength = self._vsr_strength()
+        w, h = int(spec["width"]), int(spec["height"])
+        args = [str(runner), "--input", str(source), "--output", str(outfile),
+                "--scale", str(scale), "--quality", "ULTRA", "--strength", str(strength),
+                "--ffmpeg", str(ffmpeg), "--ffprobe", str(ffprobe)]
+        job = {"id": job_id, "job_number": self._take_next_job_number(), "job_type": "nvidia_vsr",
+               "state": "pending", "created_at": time.time(), "started_at": None, "finished_at": None,
+               "elapsed": 0, "mode": -1, "mode_name": "NVIDIA VSR", "model_label": "NVIDIA VSR",
+               "output": str(outfile), "seed": "—", "actual_seed": None,
+               "resolution": f"{w * scale}×{h * scale}", "frames": None, "steps": None,
+               "prompt": f"NVIDIA VSR x{scale}: {source.name}", "args": args,
+               "queue_program": str(PYTHON if PYTHON.is_file() else sys.executable),
+               "progress": None, "phase": "Waiting", "error": "", "cancel_reason": "", "settings": {},
+               "log_tail": "", "continue_last_result": False, "manual_continue_video": "",
+               "vsr_source": str(source), "vsr_scale": scale, "vsr_strength": strength,
+               "timeline_clip_id": spec["timeline_clip_id"],
+               "timeline_project_id": spec["timeline_project_id"]}
+        self.queue_jobs.append(job)
+        self._save_queue_state()
+        self._refresh_queue_views()
+        self.append_log(f"[NVIDIA VSR] Queued {source.name} → {outfile.name} at {strength} strength\n")
+        self._start_next_pending()
+        return True
 
     def _queue_timeline_jobs(self, specs):
         """Translate timeline generation chunks into normal standalone queue jobs.
@@ -4611,6 +4725,32 @@ class MainWindow(QMainWindow):
             "When enabled, checks for application updates 10 seconds after startup."
         )
         v.addWidget(self.auto_update_enabled)
+
+        vsrg = QGroupBox("NVIDIA VSR upscaler")
+        vsrf = QFormLayout(vsrg)
+        self.vsr_install_status = QLabel("Checking installation...")
+        self.vsr_install_progress = QProgressBar()
+        self.vsr_install_progress.setRange(0, 5)
+        self.vsr_install_progress.setValue(0)
+        self.vsr_install_button = QPushButton("Install / Repair NVIDIA VSR")
+        self.vsr_install_button.clicked.connect(self._vsr_install)
+        self.vsr_strength_combo = QComboBox()
+        for label, value in (("Medium", 0.5), ("Normal", 0.75), ("High", 1.0)):
+            self.vsr_strength_combo.addItem(label, value)
+        index = self.vsr_strength_combo.findData(self._vsr_strength())
+        self.vsr_strength_combo.setCurrentIndex(max(0, index))
+        self.vsr_strength_combo.currentIndexChanged.connect(self._save_vsr_strength)
+        self.vsr_strength_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.vsr_strength_combo.wheelEvent = lambda event: event.ignore()
+        vsrf.addRow("Installation", self.vsr_install_status)
+        vsrf.addRow(self.vsr_install_progress)
+        vsrf.addRow(self.vsr_install_button)
+        vsrf.addRow("AI strength", self.vsr_strength_combo)
+        note = QLabel("Quality is fixed to ULTRA. Progress details are written to logs/nvidia_vsr_install.log. NVIDIA's SDK components may require additional licensed installation.")
+        note.setWordWrap(True)
+        vsrf.addRow(note)
+        v.addWidget(vsrg)
+        self._vsr_install_status()
 
         tg = QGroupBox("Telegram remote control")
         tf = QFormLayout(tg)
@@ -6526,6 +6666,9 @@ exit /b %RC%
             elif code in (0,3) and Path(job.get("output","")).is_file():
                 job["state"]="finished"; job["phase"]="Finished"
                 job["clip_duration"] = self._probe_clip_duration(job.get("output"), job.get("frames"))
+                if job.get("job_type") == "nvidia_vsr" and getattr(self, "timeline_widget", None) is not None:
+                    if not self.timeline_widget.vsr_job_completed(job):
+                        self.append_log("[NVIDIA VSR] Output ready, but original Timeline project/clip is no longer active. Output preserved in output/nvidia_vsr.\n")
                 if job.get("job_type") == "timeline_assembly":
                     if getattr(self, "timeline_widget", None) is not None:
                         self.timeline_widget.mark_assembly_finished(job.get("output"))
