@@ -2955,6 +2955,27 @@ class MainWindow(QMainWindow):
         except Exception:
             return 0.75
 
+    def _vsr_unblur_enabled(self):
+        try:
+            data = json.loads(self._vsr_config_path().read_text(encoding="utf-8"))
+            return data.get("unblur_enabled", False) is True
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _save_vsr_unblur(self, checked):
+        path = self._vsr_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError, TypeError):
+            data = {}
+        data["unblur_enabled"] = bool(checked)
+        temp = path.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temp.replace(path)
+
     def _save_vsr_strength(self):
         path = self._vsr_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3035,9 +3056,12 @@ class MainWindow(QMainWindow):
         outfile = out_dir / f"{source.stem}_vsr_x{scale}_{job_id[:8]}.mp4"
         strength = self._vsr_strength()
         w, h = int(spec["width"]), int(spec["height"])
+        unblur = self._vsr_unblur_enabled()
         args = [str(runner), "--input", str(source), "--output", str(outfile),
                 "--scale", str(scale), "--quality", "ULTRA", "--strength", str(strength),
                 "--ffmpeg", str(ffmpeg), "--ffprobe", str(ffprobe)]
+        if unblur:
+            args += ["--cleanup", "DEBLUR_ULTRA", "--cleanup-strength", "0.5"]
         job = {"id": job_id, "job_number": self._take_next_job_number(), "job_type": "nvidia_vsr",
                "state": "pending", "created_at": time.time(), "started_at": None, "finished_at": None,
                "elapsed": 0, "mode": -1, "mode_name": "NVIDIA VSR", "model_label": "NVIDIA VSR",
@@ -3048,12 +3072,13 @@ class MainWindow(QMainWindow):
                "progress": None, "phase": "Waiting", "error": "", "cancel_reason": "", "settings": {},
                "log_tail": "", "continue_last_result": False, "manual_continue_video": "",
                "vsr_source": str(source), "vsr_scale": scale, "vsr_strength": strength,
+               "vsr_unblur": unblur,
                "timeline_clip_id": spec["timeline_clip_id"],
                "timeline_project_id": spec["timeline_project_id"]}
         self.queue_jobs.append(job)
         self._save_queue_state()
         self._refresh_queue_views()
-        self.append_log(f"[NVIDIA VSR] Queued {source.name} → {outfile.name} at {strength} strength\n")
+        self.append_log(f"[NVIDIA VSR] Queued {source.name} → {outfile.name} at {strength} strength; unblur={'on' if unblur else 'off'}\n")
         self._start_next_pending()
         return True
 
@@ -4746,6 +4771,10 @@ class MainWindow(QMainWindow):
         vsrf.addRow(self.vsr_install_progress)
         vsrf.addRow(self.vsr_install_button)
         vsrf.addRow("AI strength", self.vsr_strength_combo)
+        self.vsr_unblur_toggle = QCheckBox("2nd pass to unblur upscaled result.")
+        self.vsr_unblur_toggle.setChecked(self._vsr_unblur_enabled())
+        self.vsr_unblur_toggle.toggled.connect(self._save_vsr_unblur)
+        vsrf.addRow(self.vsr_unblur_toggle)
         note = QLabel("Quality is fixed to ULTRA. Progress details are written to logs/nvidia_vsr_install.log. NVIDIA's SDK components may require additional licensed installation.")
         note.setWordWrap(True)
         vsrf.addRow(note)
