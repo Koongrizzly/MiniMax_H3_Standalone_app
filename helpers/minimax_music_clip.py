@@ -757,6 +757,7 @@ class MusicProject:
     turbo_lora_path: str = ""
     turbo_lora_strength: float = 1.0
     randomize_reference_characters: bool = False
+    fixed_cast_prompt_mode: bool = False
     unlimited_random_references: bool = False
     single_character_reference_per_clip: bool = False
     reference_random_seed: int = -1
@@ -1268,31 +1269,56 @@ def _selected_refs_for_shot(project: MusicProject, shot: MusicShot) -> List[Refe
     return [by_name[name] for name in names if name in by_name][:9]
 
 
+def _h3_picture_definition_line(ref: ReferenceAsset, picture_no: int) -> str:
+    name = (ref.name or f"reference {picture_no}").strip()
+    kind = _normalise_reference_kind(ref.kind)
+    if kind == "Character":
+        return f"<Picture {picture_no}>: Multi-view character reference sheet of {name}."
+    if kind == "Background / Location":
+        return f"<Picture {picture_no}>: Interior/background location reference image of {name}."
+    if kind == "Object / Prop":
+        return f"<Picture {picture_no}>: Object/prop reference image of {name}."
+    if kind == "Style / Mood":
+        return f"<Picture {picture_no}>: Style/mood reference image of {name}."
+    if kind == "Picture / Composition anchor":
+        detail = re.sub(r"\s+", " ", (ref.description or "").strip())
+        if detail:
+            return f"<Picture {picture_no}>: {name}. {detail}."
+        return f"<Picture {picture_no}>: {name}, framing and composition reference."
+    return f"<Picture {picture_no}>: Reference image of {name}."
+
+
 def _h3_ref_subject_definitions(project: MusicProject, refs: Sequence[ReferenceAsset], *, has_lyrics: bool = True) -> List[str]:
-    lines: List[str] = []
+    picture_lines: List[str] = []
+    subject_lines: List[str] = []
     subject_no = 0
     for picture_no, ref in enumerate(refs, 1):
         name = (ref.name or f"reference {picture_no}").strip()
         detail = re.sub(r"\s+", " ", (ref.description or "").strip())
         kind = _normalise_reference_kind(ref.kind)
+        picture_lines.append(_h3_picture_definition_line(ref, picture_no))
         if kind == "Picture / Composition anchor":
-            text = f"<Picture {picture_no}> is the composition/shot-planning reference named {name}. Use its framing, spatial arrangement and visual layout as a concrete shot anchor."
+            continue
+        subject_no += 1
+        if kind == "Character":
+            purpose = "reusable character/person"
+        elif kind == "Background / Location":
+            purpose = "reusable background/location environment"
+        elif kind == "Object / Prop":
+            purpose = "reusable object/prop"
+        elif kind == "Style / Mood":
+            purpose = "reusable visual style/mood reference"
         else:
-            subject_no += 1
-            if kind == "Character":
-                purpose = "reusable character/person"
-            elif kind == "Background / Location":
-                purpose = "reusable background/location environment"
-            elif kind == "Object / Prop":
-                purpose = "reusable object/prop"
-            elif kind == "Style / Mood":
-                purpose = "reusable visual style/mood reference"
-            else:
-                purpose = "reusable referenced subject"
-            text = f"<Subject {subject_no}> is {name}, the {purpose} defined by <Picture {picture_no}>."
+            purpose = "reusable referenced subject"
+        text = f"<Subject {subject_no}> is {name}, the {purpose} defined by <Picture {picture_no}>."
         if detail:
             text += f" Purpose/details: {detail}."
-        lines.append(text)
+        subject_lines.append(text)
+    lines: List[str] = []
+    lines.extend(picture_lines)
+    if picture_lines and subject_lines:
+        lines.append("")
+    lines.extend(subject_lines)
     if project.characters_subjects.strip():
         lines.append(
             "Project reference-purpose details: "
@@ -1416,6 +1442,88 @@ def _creative_pool_choice(value: str, shot_index: int, *, allow_commas: bool = F
     return items[idx], len(items)
 
 
+def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_refs: Sequence[ReferenceAsset]) -> str:
+    """Direct, positive Ref2VA staging for a stable cast and one location.
+
+    One sheet is one performer; each detailed reference description appears once.
+    Audio transcription event markers are not treated as vocals.
+    """
+    refs = list(selected_refs)[:9]
+    lyrics = _clean_whisper_lyric_text(shot.lyrics)
+    groups = _h3_reference_labels(refs)
+    picture_lines = []
+    subject_lines = []
+    for pic_no, ref in enumerate(refs, 1):
+        kind = _normalise_reference_kind(ref.kind)
+        name = (ref.name or f"Reference {pic_no}").strip()
+        detail = re.sub(r"\s+", " ", (ref.description or "").strip()).rstrip(" .")
+        picture_lines.append(_h3_picture_definition_line(ref, pic_no))
+        # The numbered subject mapping is shared with the existing generator.
+        subject_no = next((num for group in groups.values() for num, picture, item in group if picture == pic_no and item is ref), 0)
+        if kind == "Picture / Composition anchor":
+            continue
+        if kind == "Character":
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. This reference sheet contains different views of one individual performer. Show this person as one living character in the scene. Preserve the same face, hair, outfit and body proportions."
+        elif kind == "Background / Location":
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. This is the physical location for this clip, with its architecture, floor, walls, furniture and lighting."
+        elif kind == "Object / Prop":
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Use this referenced item as a physical prop."
+        elif kind == "Style / Mood":
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Apply its visual styling to the scene."
+        else:
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>."
+        subject_lines.append(base + (" " + detail + "." if detail else ""))
+
+    lines = []
+    lines.extend(picture_lines)
+    if picture_lines and subject_lines:
+        lines.append("")
+    lines.extend(subject_lines)
+    lines.extend(["", "<Audio 1>: The original supplied song segment. Preserve its timing, instruments and any original recorded voices.",
+                  "", "SELECTED VISUAL STYLE LOCK", "Photorealistic live-action music-video cinema. Natural human motion, realistic instrument playing, coherent room lighting and consistent performer appearances.",
+                  "", "SCENE"])
+    characters = groups["characters"]
+    backgrounds = groups["backgrounds"]
+    if backgrounds:
+        labels = ", ".join(f"<Subject {n}>" for n, _, _ in backgrounds)
+        lines.append(f"The camera and performers are physically inside {labels}. The selected location supplies the complete visible environment throughout the shot.")
+    if characters:
+        lines.append(f"Show exactly {len(characters)} distinct referenced performer{'s' if len(characters)!=1 else ''}, each appearing once as one real person.")
+        for n, _, ref in characters:
+            name = (ref.name or "The performer").strip()
+            desc = f"{name} {ref.description}".lower()
+            if any(t in desc for t in ("drum", "percussion")):
+                action = "plays the drum kit in time with the beat, seated behind the kit"
+            elif any(t in desc for t in ("guitar", "bass")):
+                action = "plays their guitar or bass with natural finger and strumming movements"
+            elif any(t in desc for t in ("singer", "vocal", "lead voice")):
+                action = ("performs the original sung words in sync with <Audio 1>" if lyrics else "moves rhythmically and expresses the instrumental energy with natural facial expressions")
+            else:
+                action = "performs natural physical actions appropriate to their defined role"
+            lines.append(f"<Subject {n}> {action}.")
+    if groups["objects"]:
+        lines.append("Physical props: " + ", ".join(f"<Subject {n}>" for n,_,_ in groups["objects"]) + ".")
+    story, _ = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
+    if story.strip():
+        lines.append(re.sub(r"\s+", " ", story.strip()).rstrip(".") + ".")
+    lines.append(f"This is the {shot.section or 'current'} musical section.")
+    lines.extend(["", "PERFORMANCE"])
+    if lyrics:
+        singer = next((n for n,_,ref in characters if any(x in (ref.name + ' ' + ref.description).lower() for x in ('lead singer','lead vocal','singer'))), None)
+        if singer:
+            lines.append(f"<Subject {singer}> performs the lyric <d>[Original language] {lyrics}</d> in sync with the supplied song.")
+        else:
+            lines.append(f"Perform the original song lyric <d>[Original language] {lyrics}</d> in sync with the supplied audio.")
+    else:
+        lines.append("Instrumental passage: performers play their instruments and move naturally to the beat. The lead singer dances, reacts and engages with the other musicians using relaxed facial expressions and natural breathing.")
+    camera, _ = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
+    lines.extend(["", "CAMERA", (camera.strip().rstrip(".") + ".") if camera.strip() else "One coherent cinematic camera move featuring the referenced performers inside the selected location."])
+    lines.extend(["", "ENDING", "End on a clear, natural performance moment inside the established location.",
+                  "", "overall_soundscape:", "<Audio 1> remains the dominant, continuous, synchronized original music track.",
+                  "", "non_diegetic_music:", "Reuse <Audio 1> as the complete music soundtrack."])
+    return "\n".join(lines)
+
+
 def build_h3_reference_prompt(
     project: MusicProject,
     shot: MusicShot,
@@ -1428,6 +1536,8 @@ def build_h3_reference_prompt(
     pictures anchor framing. This prevents a background reference from being treated as
     another visible person/performer.
     """
+    if bool(getattr(project, "fixed_cast_prompt_mode", False)) and not bool(getattr(project, "randomize_reference_characters", False)):
+        return build_fixed_cast_prompt(project, shot, selected_refs)
     refs = list(selected_refs)[:9]
     lyric_text = _clean_whisper_lyric_text(shot.lyrics)
     has_lyrics = bool(lyric_text)
@@ -1480,7 +1590,9 @@ def build_h3_reference_prompt(
         else:
             summary_bits.append(f"Use {labels(characters)} as the visible character reference{'s' if len(characters) != 1 else ''}; this interval is instrumental-only, so the character action is visual rather than vocal.")
     if backgrounds:
-        summary_bits.append(f"Use {labels(backgrounds)} only as the scene environment/background reference{'s' if len(backgrounds) != 1 else ''}, not as additional people or performers.")
+        summary_bits.append(f"Use {labels(backgrounds)} as the authoritative physical location for the entire shot, from the first frame through the final frame. All visible walls, floors, depth, and room lighting belong to this location.")
+        if characters:
+            summary_bits.append("Character reference sheets supply only each performer's identity, hairstyle, clothing and appearance. Compose those performers as people physically present inside the referenced location; the neutral studio/photo-sheet surfaces surrounding them are reference-sheet presentation, not scenery.")
     if objects:
         summary_bits.append(f"Use {labels(objects)} only as referenced objects/props when they belong in the scene.")
     if styles:
@@ -1505,7 +1617,7 @@ def build_h3_reference_prompt(
             detail = re.sub(r"\s+", " ", (ref.description or "").strip())
             kind = _normalise_reference_kind(ref.kind)
             if kind == "Background / Location":
-                rule = f"<Subject {i}>: fully_preserved - keep {name} strictly as the referenced environment/background, preserving its recognizable room design, lighting, layout and named recurring features; it is not a person or performer."
+                rule = f"<Subject {i}>: fully_preserved - this is the single authoritative scene environment. Preserve {name}'s recognizable room design, spatial depth, walls, floor, lighting, layout and named recurring features in every frame and every camera angle. Place performers directly within this continuous location."
             elif kind == "Object / Prop":
                 rule = f"<Subject {i}>: fully_preserved - keep {name} strictly as the referenced object/prop with its recognizable appearance and intended purpose; it is not an additional person or performer."
             elif kind == "Style / Mood":
@@ -1561,7 +1673,7 @@ def build_h3_reference_prompt(
         else:
             shot1.append(f"The visible characters are {labels(characters)}; preserve their identities and roles.")
     if backgrounds:
-        shot1.append(f"Place the character action inside {labels(backgrounds)} as the referenced background/location; preserve the environment but do not create a second person from it.")
+        shot1.append(f"The camera is physically inside {labels(backgrounds)} for the complete shot. Show the referenced room's actual walls, floor, lighting and depth behind and around every performer across all camera framings. Integrate the performers into that room with matching perspective, contact shadows, and scene lighting. Character sheet backgrounds are only neutral presentation surfaces for identity reference. Maintain the room continuously during camera movement and close-ups.")
     if objects:
         shot1.append(f"Use {labels(objects)} only as props/objects where relevant to the action.")
     if styles:
@@ -1620,6 +1732,8 @@ def build_h3_reference_prompt(
             "Do not interpret phrases such as asks, tells, explains, argues, jokes, calls, sings or says as permission to create audible speech; express the intended meaning silently through action and reaction instead."
         )
     sections.append(" ".join(shot1))
+    if backgrounds:
+        sections.append("location_continuity_lock: The selected background/location picture defines the physical set for all frames. Character sheet images define people, not sets. The set remains the same continuous environment through wide shots, close-ups, camera movements and shot transitions.")
 
     for cut_no, absolute in enumerate(shot.internal_cuts[:4], start=2):
         rel = max(0.0, absolute - shot.generation_start)
@@ -1799,7 +1913,7 @@ def _limit_character_reference_names(project: MusicProject, names: Sequence[str]
     Composition anchor, and one Other.
     """
     ordered = list(names)
-    if not bool(getattr(project, "single_character_reference_per_clip", False)):
+    if not (bool(getattr(project, "randomize_reference_characters", False)) and bool(getattr(project, "single_character_reference_per_clip", False))):
         # Normal mode keeps the existing project/router order, de-duplicated, up to
         # the MiniMax per-shot image ceiling.
         result: List[str] = []
@@ -1891,6 +2005,24 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
     source_refs = project.references if unlimited_pool else project.references[:9]
     enabled = [r for r in source_refs if r.enabled and Path(r.path).is_file()]
     randomize_chars = bool(getattr(project, "randomize_reference_characters", False))
+    if not randomize_chars:
+        # Fixed-cast mode: retain every enabled character/prop/style/etc. up to
+        # MiniMax's nine-image limit. Location refs are alternatives, not nine
+        # environments to superimpose in a single shot. Rotate locations in the
+        # order shown in the reference table, deterministically per shot index.
+        backgrounds = [r for r in enabled if _normalise_reference_kind(r.kind) == "Background / Location"]
+        others = [r.name for r in enabled if r.name and _normalise_reference_kind(r.kind) != "Background / Location"]
+        try:
+            index = max(1, int(getattr(shot, "index", 1) or 1))
+        except (TypeError, ValueError):
+            index = 1
+        active_background = backgrounds[(index - 1) % len(backgrounds)].name if backgrounds else None
+        # Reserve a slot for the selected scene if a background exists.
+        slots_for_others = 8 if active_background else 9
+        chosen_fixed = list(dict.fromkeys(others))[:slots_for_others]
+        if active_background and active_background not in chosen_fixed:
+            chosen_fixed.append(active_background)
+        return chosen_fixed[:9]
     blob = " ".join((shot.prompt, shot.lyrics, project.characters_subjects, project.main_idea)).lower()
     chosen: List[str] = []
     for ref in enabled:
@@ -2082,6 +2214,8 @@ _WHISPER_NON_LYRIC_EVENTS = {
     "music", "instrumental", "instrumental music", "intro", "outro", "silence",
     "silent", "noise", "background music", "applause", "clapping", "cheering",
     "laughter", "laughing", "singing", "vocalizing", "humming", "hum",
+    "upbeat music", "upbeat instrumental", "upbeat instrumental music", "rock music",
+    "punk rock music", "background instrumental", "fast music", "energetic music",
 }
 
 
@@ -2104,6 +2238,9 @@ def _clean_whisper_lyric_text(text: str) -> str:
             break
         value = value[match.end():].strip(" -–—:;,.\t")
 
+    # Generic sound/music event notes are not sung words (including (upbeat music)).
+    if re.fullmatch(r"[\[(]?\s*(?:[\w -]+\s+)?(?:music|instrumental|instrumental music|guitar solo|drum solo|applause|silence)\s*[\])]?!?", value, re.IGNORECASE):
+        return ""
     # A segment consisting solely of a non-lyrical marker is intentionally empty.
     bare = re.sub(r"^[\[(]|[\])]$", "", value.strip()).strip().lower()
     bare = re.sub(r"[^a-z ]+", " ", bare)
@@ -2884,11 +3021,15 @@ class MiniMaxMusicClipWidget(QWidget):
         info = QLabel(
             "Project references are sent directly to MiniMax Ref2VA. Choose what each image is for: Character, Background / Location, Object / Prop, Style / Mood, or Picture / Composition anchor. "
             "MiniMax then receives the correct <Subject N> or <Picture N> relationship automatically. For Character refs, add a short identity/appearance description so multi-reference shots can keep the characters distinct. "
-            "Each shot can use a different subset; up to 9 images can be passed to one Ref2VA job.",
+            "With Randomize off, all enabled cast/other refs are included up to 9 total, and multiple background locations rotate between shots. "
+            "With Randomize on, each shot can use a different subset. Up to 9 images can be passed to one Ref2VA job.",
             body,
         )
         info.setWordWrap(True); lay.addWidget(info)
         ref_toggle_row = QHBoxLayout()
+        self.check_fixed_cast_prompt = QCheckBox("Fixed cast", body)
+        self.check_fixed_cast_prompt.setToolTip("Keep selected characters and their roles consistent across clips, using clear scene and camera instructions. Randomized reference mode uses its own behavior.")
+        lay.addWidget(self.check_fixed_cast_prompt)
         self.check_randomize_ref_characters = QCheckBox("Randomize references per clip", body)
         self.check_randomize_ref_characters.setToolTip(
             "Randomize reference selection per shot. Character references keep the existing one-or-two random behavior. "
@@ -2897,9 +3038,9 @@ class MiniMaxMusicClipWidget(QWidget):
         )
         self.check_single_character_ref = QCheckBox("Use only 1 ref per clip", body)
         self.check_single_character_ref.setToolTip(
-            "Limit each clip to at most one reference per role/type. For example: one Character, one Background / Location, "
-            "one Object / Prop, one Style / Mood, one Picture / Composition anchor and one Other. "
-            "If multiple enabled refs share the same role, only one of that role is kept in the final prompt for that clip."
+            "Used with Randomize references per clip: limit each clip to one reference per role/type. "
+            "With Randomize disabled, all enabled cast/prop/style refs are used (up to 9 images total), "
+            "and multiple backgrounds rotate between clips."
         )
         ref_toggle_row.addWidget(self.check_randomize_ref_characters)
         ref_toggle_row.addWidget(self.check_single_character_ref)
@@ -3236,6 +3377,7 @@ class MiniMaxMusicClipWidget(QWidget):
         # Generation/runtime options come from the main MiniMax GUI and are
         # snapshotted only when a generation job is actually prepared. This keeps
         # an old project's historical generation snapshot intact while merely reviewing it.
+        self.project.fixed_cast_prompt_mode = bool(self.check_fixed_cast_prompt.isChecked())
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.unlimited_random_references = bool(self.project.randomize_reference_characters and self.check_unlimited_random_refs.isChecked())
         self.project.single_character_reference_per_clip = bool(self.check_single_character_ref.isChecked())
@@ -3253,6 +3395,7 @@ class MiniMaxMusicClipWidget(QWidget):
         nearest_idx = min(range(len(MUSIC_FRAME_GRID)), key=lambda i: abs(MUSIC_FRAME_GRID[i] - int(p.max_frames or MUSIC_FRAME_DEFAULT_MAX)))
         self.slider_frames.setValue(nearest_idx)
         self.spin_head.setValue(p.head_padding); self.spin_tail.setValue(p.tail_padding); self.spin_snap.setValue(p.phrase_snap_tolerance)
+        self.check_fixed_cast_prompt.setChecked(bool(getattr(p, "fixed_cast_prompt_mode", False)))
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self.check_unlimited_random_refs.setChecked(bool(getattr(p, "unlimited_random_references", False)))
         self.check_single_character_ref.setChecked(bool(getattr(p, "single_character_reference_per_clip", False)))
@@ -3409,7 +3552,7 @@ class MiniMaxMusicClipWidget(QWidget):
         for name in (
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
             "phrase_snap_tolerance", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
-            "randomize_reference_characters", "unlimited_random_references", "single_character_reference_per_clip",
+            "randomize_reference_characters", "fixed_cast_prompt_mode", "unlimited_random_references", "single_character_reference_per_clip",
         ):
             setattr(self.project, name, getattr(old, name))
         self._refresh_generation_settings_snapshot()
