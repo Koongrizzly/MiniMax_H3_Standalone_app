@@ -1283,7 +1283,16 @@ class MainWindow(QMainWindow):
         self.steps = QSpinBox(); self.steps.setRange(1, 100); self.steps.setValue(15)
         self.seed = QSpinBox(); self.seed.setRange(-1, 98_999_999); self.seed.setValue(-1); self.seed.setSpecialValueText("-1 (random)")
         form.addRow("Mode", self.mode)
-        rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.widescreen_quality); rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
+        rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.widescreen_quality)
+        self.gen_vsr_toggle = QCheckBox("Upscale result with NVIDIA VSR")
+        self.gen_vsr_toggle.setToolTip("Can add detail and unblur pixels, but cannot magically fix footage that looked bad to start with.")
+        self.gen_vsr_scale = QComboBox()
+        for scale in (1, 2, 3): self.gen_vsr_scale.addItem(f"x{scale}", scale)
+        self.gen_vsr_scale.setToolTip("NVIDIA VSR output multiplier. Optional unblur is controlled in Settings.")
+        self.gen_vsr_scale.setEnabled(False)
+        self.gen_vsr_toggle.toggled.connect(self.gen_vsr_scale.setEnabled)
+        rr.addWidget(self.gen_vsr_toggle); rr.addWidget(self.gen_vsr_scale)
+        rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
         form.addRow("Frames", self.frames); form.addRow("", self.experimental_long_duration); form.addRow("Steps", self.steps); form.addRow("Seed", self.seed)
         v.addWidget(basic)
 
@@ -2288,6 +2297,8 @@ class MainWindow(QMainWindow):
         else:
             if job.get("state")=="finished" and Path(job.get("output","")).is_file():
                 play=menu.addAction("Play clip")
+                vsr_menu=menu.addMenu("Upscale with NVIDIA VSR")
+                vsr_actions={vsr_menu.addAction(f"VSR x{k}"):k for k in (1,2,3)}
                 loaded=(self.preview_path and Path(self.preview_path)==Path(job.get("output","")))
                 delete_disk=menu.addAction("Delete from disk + queue" + (" (currently loaded)" if loaded else ""))
             if job.get("state") in ("failed","cancelled"):
@@ -2309,6 +2320,8 @@ class MainWindow(QMainWindow):
                 if getattr(self, "timeline_widget", None) is not None:
                     self.timeline_widget.mark_assembly_failed("Removed from queue")
             self.queue_jobs=[j for j in self.queue_jobs if j.get("id")!=job.get("id")]; self._save_queue_state(); self._refresh_queue_views()
+        elif section=="finished" and 'vsr_actions' in locals() and act in vsr_actions:
+            self._queue_vsr_finished_job(job, vsr_actions[act])
         elif section=="finished" and 'play' in locals() and act==play: self._load_preview(job,autoplay=True)
         elif section=="finished" and 'delete_disk' in locals() and act==delete_disk: self._delete_job_output(job)
         elif section=="finished" and 'reason' in locals() and act==reason: QMessageBox.information(self,"Job failure / stop reason",job.get("error") or job.get("cancel_reason") or "No detailed reason was recorded.")
@@ -2707,7 +2720,7 @@ class MainWindow(QMainWindow):
         for candidate in self.queue_jobs:
             if candidate.get("state") != "pending":
                 continue
-            dep_id = candidate.get("continue_from_job_id") if candidate.get("continue_last_result") else None
+            dep_id = candidate.get("vsr_after_job_id") or (candidate.get("continue_from_job_id") if candidate.get("continue_last_result") else None)
             if dep_id:
                 dep = self._job_by_id(dep_id)
                 if dep is None:
@@ -3036,10 +3049,27 @@ class MainWindow(QMainWindow):
         if code != 0:
             QMessageBox.warning(self, "NVIDIA VSR", "Installation failed. See the Logs tab or logs/nvidia_vsr_install.log.")
 
+    def _queue_vsr_finished_job(self, source_job, scale):
+        source = Path(str(source_job.get("output") or ""))
+        if not source.is_file():
+            QMessageBox.warning(self, "NVIDIA VSR", "The finished video is missing.")
+            return False
+        ffprobe = ROOT / "presets" / "bin" / "ffprobe.exe"
+        try:
+            result = subprocess.run([str(ffprobe), "-v", "error", "-select_streams", "v:0",
+                                     "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(source)],
+                                    capture_output=True, text=True, timeout=12, check=True)
+            width, height = map(int, result.stdout.strip().splitlines()[0].split("x"))
+        except Exception as exc:
+            QMessageBox.warning(self, "NVIDIA VSR", f"Could not determine source resolution: {exc}")
+            return False
+        return self._enqueue_timeline_vsr({"source": str(source), "scale": scale,
+                                            "width": width, "height": height})
+
     def _enqueue_timeline_vsr(self, spec):
         source = Path(str(spec.get("source") or ""))
         scale = int(spec.get("scale") or 0)
-        if not source.is_file() or scale not in (1, 2, 3): return False
+        if scale not in (1, 2, 3) or (not source.is_file() and not spec.get("vsr_after_job_id")): return False
         if not self._vsr_install_status():
             QMessageBox.information(self, "NVIDIA VSR", "Install NVIDIA VSR from Settings before upscaling clips.")
             return False
@@ -3073,8 +3103,9 @@ class MainWindow(QMainWindow):
                "log_tail": "", "continue_last_result": False, "manual_continue_video": "",
                "vsr_source": str(source), "vsr_scale": scale, "vsr_strength": strength,
                "vsr_unblur": unblur,
-               "timeline_clip_id": spec["timeline_clip_id"],
-               "timeline_project_id": spec["timeline_project_id"]}
+               "vsr_after_job_id": spec.get("vsr_after_job_id"),
+               "timeline_clip_id": spec.get("timeline_clip_id"),
+               "timeline_project_id": spec.get("timeline_project_id")}
         self.queue_jobs.append(job)
         self._save_queue_state()
         self._refresh_queue_views()
@@ -5868,6 +5899,7 @@ class MainWindow(QMainWindow):
 
     def settings_dict(self):
         return {
+            "generation_vsr_enabled": self.gen_vsr_toggle.isChecked(), "generation_vsr_scale": int(self.gen_vsr_scale.currentData() or 2),
             "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "widescreen_quality": self.widescreen_quality.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
             "continue_video": "" if self.continue_last_result.isChecked() else self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 90),
@@ -5905,6 +5937,9 @@ class MainWindow(QMainWindow):
 
     def apply_settings(self, d):
         try:
+            self.gen_vsr_toggle.setChecked(bool(d.get("generation_vsr_enabled", False)))
+            scale_idx = self.gen_vsr_scale.findData(int(d.get("generation_vsr_scale", 2)))
+            self.gen_vsr_scale.setCurrentIndex(max(0, scale_idx))
             self.mode.setCurrentIndex(int(d.get("mode", 0))); self.aspect.setCurrentText(d.get("aspect", "16:9"))
             saved_res = str(d.get("resolution", DEFAULT_RESOLUTION))
             saved_res = {"Low / test": "576 × 320", "480p": "832 × 448", "832 × 480": "832 × 448", "768p": "1344 × 768", "1080p": "1920 × 1088"}.get(saved_res, saved_res)
@@ -6664,6 +6699,11 @@ exit /b %RC%
             model_label=Path(model_path).name if model_path else ("Ref2VA default" if mode==2 else "FL2VA default")
         job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 90) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation),"combine_frames_latent":bool(combine_frames_latent)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
+        if self.gen_vsr_toggle.isChecked():
+            scale = int(self.gen_vsr_scale.currentData() or 2)
+            # The source is not generated yet; the queue waits for this exact job to finish.
+            self._enqueue_timeline_vsr({"source": str(out), "scale": scale, "width": w,
+                                        "height": h, "vsr_after_job_id": job["id"]})
         self._start_next_pending()
 
     def _play_completed_result(self, job):
@@ -6695,7 +6735,7 @@ exit /b %RC%
             elif code in (0,3) and Path(job.get("output","")).is_file():
                 job["state"]="finished"; job["phase"]="Finished"
                 job["clip_duration"] = self._probe_clip_duration(job.get("output"), job.get("frames"))
-                if job.get("job_type") == "nvidia_vsr" and getattr(self, "timeline_widget", None) is not None:
+                if job.get("job_type") == "nvidia_vsr" and job.get("timeline_clip_id") and getattr(self, "timeline_widget", None) is not None:
                     if not self.timeline_widget.vsr_job_completed(job):
                         self.append_log("[NVIDIA VSR] Output ready, but original Timeline project/clip is no longer active. Output preserved in output/nvidia_vsr.\n")
                 if job.get("job_type") == "timeline_assembly":

@@ -1447,6 +1447,9 @@ def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_ref
 
     One sheet is one performer; each detailed reference description appears once.
     Audio transcription event markers are not treated as vocals.
+    Reference roles remain role-aware throughout the prompt: only Character refs
+    become performers, while Location/Prop/Style/Composition refs keep their own
+    scene functions.
     """
     refs = list(selected_refs)[:9]
     lyrics = _clean_whisper_lyric_text(shot.lyrics)
@@ -1465,13 +1468,13 @@ def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_ref
         if kind == "Character":
             base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. This reference sheet contains different views of one individual performer. Show this person as one living character in the scene. Preserve the same face, hair, outfit and body proportions."
         elif kind == "Background / Location":
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. This is the physical location for this clip, with its architecture, floor, walls, furniture and lighting."
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. This is the physical location for this clip, with its architecture, floor, walls, furniture and lighting. It defines the environment and is never a performer."
         elif kind == "Object / Prop":
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Use this referenced item as a physical prop."
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Use this referenced item as a physical prop or set object. It is not a performer."
         elif kind == "Style / Mood":
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Apply its visual styling to the scene."
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Apply its visual styling to the scene as mood/look guidance only. It is not a performer or prop."
         else:
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>."
+            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Preserve its defined reference role; do not treat it as a performer unless it is explicitly a Character reference."
         subject_lines.append(base + (" " + detail + "." if detail else ""))
 
     lines = []
@@ -1484,11 +1487,20 @@ def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_ref
                   "", "SCENE"])
     characters = groups["characters"]
     backgrounds = groups["backgrounds"]
+    objects = groups["objects"]
+    styles = groups["styles"]
+    others = groups["others"]
+    picture_anchors = groups["pictures"]
+
     if backgrounds:
         labels = ", ".join(f"<Subject {n}>" for n, _, _ in backgrounds)
-        lines.append(f"The camera and performers are physically inside {labels}. The selected location supplies the complete visible environment throughout the shot.")
+        lines.append(f"The scene takes place inside {labels}. These referenced backgrounds/locations supply the complete visible environment throughout the shot and are never counted as performers.")
+    else:
+        lines.append("Place the visible action in one coherent physical environment that suits the selected references.")
+
     if characters:
-        lines.append(f"Show exactly {len(characters)} distinct referenced performer{'s' if len(characters)!=1 else ''}, each appearing once as one real person.")
+        labels = ", ".join(f"<Subject {n}>" for n, _, _ in characters)
+        lines.append(f"Show exactly {len(characters)} distinct referenced performer{'s' if len(characters)!=1 else ''}: {labels}. Each performer appears once as one real person.")
         for n, _, ref in characters:
             name = (ref.name or "The performer").strip()
             desc = f"{name} {ref.description}".lower()
@@ -1501,8 +1513,18 @@ def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_ref
             else:
                 action = "performs natural physical actions appropriate to their defined role"
             lines.append(f"<Subject {n}> {action}.")
-    if groups["objects"]:
-        lines.append("Physical props: " + ", ".join(f"<Subject {n}>" for n,_,_ in groups["objects"]) + ".")
+    else:
+        lines.append("If no Character references are present, do not invent extra people. Use the non-character references to define the scene content instead.")
+
+    if objects:
+        lines.append("Use these references as physical props or set objects only: " + ", ".join(f"<Subject {n}>" for n,_,_ in objects) + ". They are not performers and do not sing, speak or play instruments unless a Character reference is explicitly interacting with them.")
+    if styles:
+        lines.append("Apply these references only as visual style or mood guidance: " + ", ".join(f"<Subject {n}>" for n,_,_ in styles) + ". They influence the look of the scene but are not visible cast members unless separately represented by Character references.")
+    if others:
+        lines.append("Keep these references in their defined non-character roles: " + ", ".join(f"<Subject {n}>" for n,_,_ in others) + ". Do not reinterpret them as extra performers.")
+    if picture_anchors:
+        lines.append("Use these picture references only for composition or framing guidance: " + ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors) + ".")
+
     story, _ = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
     if story.strip():
         lines.append(re.sub(r"\s+", " ", story.strip()).rstrip(".") + ".")
@@ -1511,19 +1533,22 @@ def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_ref
     if lyrics:
         singer = next((n for n,_,ref in characters if any(x in (ref.name + ' ' + ref.description).lower() for x in ('lead singer','lead vocal','singer'))), None)
         if singer:
-            lines.append(f"<Subject {singer}> performs the lyric <d>[Original language] {lyrics}</d> in sync with the supplied song.")
+            lines.append(f"Only <Subject {singer}> performs the lyric <d>[Original language] {lyrics}</d> in sync with the supplied song unless another Character reference is explicitly assigned a vocal role.")
+        elif characters:
+            lines.append(f"Perform the original song lyric <d>[Original language] {lyrics}</d> in sync with the supplied audio using the Character references only. Non-character references remain non-performers.")
         else:
-            lines.append(f"Perform the original song lyric <d>[Original language] {lyrics}</d> in sync with the supplied audio.")
+            lines.append(f"Preserve the original song lyric <d>[Original language] {lyrics}</d> in sync with the supplied audio, without inventing extra people.")
     else:
-        lines.append("Instrumental passage: performers play their instruments and move naturally to the beat. The lead singer dances, reacts and engages with the other musicians using relaxed facial expressions and natural breathing.")
+        if characters:
+            lines.append("Instrumental passage: only the Character references perform visible action. They play instruments, move naturally to the beat and react to each other. Non-character references remain environment, prop, style or composition guides and do not behave like performers.")
+        else:
+            lines.append("Instrumental passage: preserve the scene visually using the non-character references without inventing performers.")
     camera, _ = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
-    lines.extend(["", "CAMERA", (camera.strip().rstrip(".") + ".") if camera.strip() else "One coherent cinematic camera move featuring the referenced performers inside the selected location."])
-    lines.extend(["", "ENDING", "End on a clear, natural performance moment inside the established location.",
+    lines.extend(["", "CAMERA", (camera.strip().rstrip(".") + ".") if camera.strip() else "One coherent cinematic camera move featuring the Character references inside the selected location."])
+    lines.extend(["", "ENDING", "End on a clear, natural moment inside the established scene, keeping every reference in its defined role.",
                   "", "overall_soundscape:", "<Audio 1> remains the dominant, continuous, synchronized original music track.",
                   "", "non_diegetic_music:", "Reuse <Audio 1> as the complete music soundtrack."])
     return "\n".join(lines)
-
-
 def build_h3_reference_prompt(
     project: MusicProject,
     shot: MusicShot,
@@ -3019,10 +3044,10 @@ class MiniMaxMusicClipWidget(QWidget):
     def _build_refs_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_refs)
         info = QLabel(
-            "Project references are sent directly to MiniMax Ref2VA. Choose what each image is for: Character, Background / Location, Object / Prop, Style / Mood, or Picture / Composition anchor. "
-            "MiniMax then receives the correct <Subject N> or <Picture N> relationship automatically. For Character refs, add a short identity/appearance description so multi-reference shots can keep the characters distinct. "
+            "Choose what each image is for: Character, Background / Location, Object / Prop, Style / Mood, or Picture / Composition anchor. MiniMax then receives the correct <Subject N> and  <Picture N> relationship automatically.  "
+            "Tip use transparent refs with only 1 full body shot, no reference sheet."
             "With Randomize off, all enabled cast/other refs are included up to 9 total, and multiple background locations rotate between shots. "
-            "With Randomize on, each shot can use a different subset. Up to 9 images can be passed to one Ref2VA job.",
+            "With Randomize on, each shot can use a different subset.",
             body,
         )
         info.setWordWrap(True); lay.addWidget(info)
