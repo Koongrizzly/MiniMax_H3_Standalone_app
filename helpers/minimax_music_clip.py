@@ -1075,15 +1075,23 @@ def _choose_next_instrumental_boundary(
     return min(hard_limit, cursor + min(max_edit, max(min_edit, 6.5)))
 
 def _candidate_lyric_boundaries(lyrics: Sequence[LyricSegment], duration: float) -> List[float]:
-    """Return lyric *line ends* as the primary physical edit anchors.
+    """Cut after a completed lyric clause, not at arbitrary Whisper segment ends.
 
-    Whisper segment starts are useful for prompt context, but a line ending is the
-    natural place to hand the song to the next generated clip.  Using starts and
-    ends equally was one reason the old planner could cut through phrases.
+    Whisper's raw segment timestamps are transcription packaging, not punctuation.
+    A segment ending with a comma, full stop, question mark or exclamation mark
+    is a candidate. With no punctuation, only a clear vocal gap can qualify.
+    The clip-duration safety fallback is handled by _choose_next_lyric_boundary.
     """
     vals = {max(0.0, duration)}
-    for seg in lyrics:
-        if 0.0 < seg.end < duration:
+    clean = [(seg, _clean_whisper_lyric_text(seg.text)) for seg in lyrics]
+    clean = [(seg, txt) for seg, txt in clean if txt]
+    for i, (seg, text) in enumerate(clean):
+        if not 0 < seg.end < duration:
+            continue
+        punctuated = bool(re.search(r"[,;.!?][\"'’)]*$", text.strip()))
+        next_start = clean[i + 1][0].start if i + 1 < len(clean) else duration
+        meaningful_pause = next_start - seg.end >= 0.48
+        if punctuated or meaningful_pause:
             vals.add(round(seg.end, 3))
     return sorted(vals)
 
@@ -1159,14 +1167,13 @@ def _choose_next_lyric_boundary(
             near_grid = 0 if excess <= 0.35 else 1
             # Prefer useful clip lengths over tiny fragments, then smaller trim.
             short_penalty = max(0.0, 4.0 - (value - cursor))
-            scored.append((near_grid, short_penalty, excess, beat_distance(value), -value, value, frames))
+            scored.append((short_penalty, near_grid, excess, beat_distance(value), -value, value, frames))
         if scored:
             return min(scored)[5]
 
     # No usable lyric ending before the current H3 limit. Use meaningful structural
     # boundaries before falling back to pure duration packing.
     structural = [v for v in section_bounds if min_end < v <= hard_limit + 1e-6]
-    structural += [v for v in lyric_starts if min_end < v <= hard_limit + 1e-6]
     if structural:
         candidates = []
         for value in sorted(set(structural)):
@@ -1531,13 +1538,7 @@ def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_ref
     lines.append(f"This is the {shot.section or 'current'} musical section.")
     lines.extend(["", "PERFORMANCE"])
     if lyrics:
-        singer = next((n for n,_,ref in characters if any(x in (ref.name + ' ' + ref.description).lower() for x in ('lead singer','lead vocal','singer'))), None)
-        if singer:
-            lines.append(f"Only <Subject {singer}> performs the lyric <d>[Original language] {lyrics}</d> in sync with the supplied song unless another Character reference is explicitly assigned a vocal role.")
-        elif characters:
-            lines.append(f"Perform the original song lyric <d>[Original language] {lyrics}</d> in sync with the supplied audio using the Character references only. Non-character references remain non-performers.")
-        else:
-            lines.append(f"Preserve the original song lyric <d>[Original language] {lyrics}</d> in sync with the supplied audio, without inventing extra people.")
+        lines.append("<Audio 1> is the sole source of sung words, phrasing, vocal pauses and syllable timing. Visible mouth movements follow the vocals actually heard in this audio segment. Preserve the existing performer roles and appearance; use the recording rather than a written lyric transcription to drive lip movement.")
     else:
         if characters:
             lines.append("Instrumental passage: only the Character references perform visible action. They play instruments, move naturally to the beat and react to each other. Non-character references remain environment, prop, style or composition guides and do not behave like performers.")
@@ -1599,7 +1600,7 @@ def build_h3_reference_prompt(
         )
     else:
         sections.append(
-            "Lyrics and dialogue inside <d>...</d> are audio/performance instructions only. They are heard and lip-synced, never displayed as subtitles, captions, karaoke lyrics, lyric overlays, title cards, lower-thirds or floating text. "
+            "The supplied audio provides the vocal performance. No lyric transcription is included in the visual prompt; keep lyrics out of captions, karaoke overlays, title cards and lower-thirds. "
             "Only text explicitly requested as a physical part of a scene, object, poster, sign, monitor or interface may be visible. Do not turn spoken or sung words into on-screen text."
         )
 
@@ -1724,32 +1725,10 @@ def build_h3_reference_prompt(
         )
 
     if has_lyrics:
-        lyric = lyric_text
-        visible_subtitles = bool(getattr(project, "visible_lyric_subtitles", False))
-        if len(characters) == 1:
-            performer = f"<Subject {characters[0][0]}>"
-            if visible_subtitles:
-                shot1.append(
-                    f"Lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. Visible lyric subtitles are enabled, so the current phrase may also appear as synchronized readable subtitle text."
-                )
-            else:
-                shot1.append(
-                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. These lyric words are heard and lip-synced only; do not display them anywhere in the image."
-                )
-        elif len(characters) > 1:
-            suffix = " Visible lyric subtitles are enabled for this phrase." if visible_subtitles else " The lyric words are audio-only and must not be displayed visually."
-            shot1.append(
-                f"Lyric performance: <d>[Original language] {lyric}</d>. Only the character whose user-defined purpose identifies them as the singer/lead vocalist performs the lyric; keep every other referenced character in their defined role." + suffix
-            )
-        else:
-            if visible_subtitles:
-                shot1.append(
-                    f"Lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. Visible lyric subtitles are enabled and may show the current phrase."
-                )
-            else:
-                shot1.append(
-                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. These words are heard only and must not appear visually."
-                )
+        shot1.append(
+            "<Audio 1> is the sole timing authority for vocal performance. Any visible lip movement follows the actual sung syllables, their timing and pauses in the supplied recording. "
+            "Preserve the referenced performers and their defined roles. Whisper transcription is used only for editing and is not a second script to perform."
+        )
     else:
         shot1.append(
             "Instrumental interval: <Audio 1> contains the complete intended sound for this section. "
@@ -2313,7 +2292,7 @@ def _whisper_phrase_cleanup(raw: Sequence[LyricSegment]) -> List[LyricSegment]:
         tail = last_word(cur_text)
 
         # A noticeable pause or strong sentence punctuation is a trustworthy phrase end.
-        boundary_is_safe = gap >= 0.38 or strong_end(cur_text)
+        boundary_is_safe = gap >= 0.48 or bool(re.search(r"[,;.!?][\"'’)]*$", cur_text.strip()))
 
         # Small's most damaging cuts are contiguous fragments such as "down the" /
         # "page ...".  Always join those.  Also join short contiguous fragments because
@@ -2335,7 +2314,7 @@ def _whisper_phrase_cleanup(raw: Sequence[LyricSegment]) -> List[LyricSegment]:
             and merged_duration <= 8.5
         )
 
-        should_merge = clearly_continues or phrase_needs_more_context
+        should_merge = (clearly_continues or phrase_needs_more_context) and not boundary_is_safe
         if should_merge and merged_duration <= 9.5:
             cur_text = (cur_text + " " + nxt_text).strip()
             cur_end = float(nxt.end)
@@ -3129,7 +3108,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.check_whisper_timing = QCheckBox("Use Whisper lyrics for shot timing", box)
         self.check_whisper_timing.setChecked(True)
         self.check_whisper_timing.setToolTip(
-            "On: Whisper phrase endings are the preferred shot boundaries when they can be covered by a valid MiniMax H3 frame count. "
+            "On: prefer lyric punctuation (comma, period, question mark or exclamation mark) and clear sung pauses as shot boundaries. "
             "Beat/energy analysis becomes supporting information. Off: use the normal beat/energy duration planner. If no lyrics are loaded, normal planning is used automatically."
         )
         form.addRow("Lyric-aware planning:", self.check_whisper_timing)
