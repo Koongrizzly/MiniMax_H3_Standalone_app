@@ -1277,22 +1277,13 @@ def _selected_refs_for_shot(project: MusicProject, shot: MusicShot) -> List[Refe
 
 
 def _h3_picture_definition_line(ref: ReferenceAsset, picture_no: int) -> str:
-    name = (ref.name or f"reference {picture_no}").strip()
-    kind = _normalise_reference_kind(ref.kind)
-    if kind == "Character":
-        return f"<Picture {picture_no}>: Multi-view character reference sheet of {name}."
-    if kind == "Background / Location":
-        return f"<Picture {picture_no}>: Interior/background location reference image of {name}."
-    if kind == "Object / Prop":
-        return f"<Picture {picture_no}>: Object/prop reference image of {name}."
-    if kind == "Style / Mood":
-        return f"<Picture {picture_no}>: Style/mood reference image of {name}."
-    if kind == "Picture / Composition anchor":
-        detail = re.sub(r"\s+", " ", (ref.description or "").strip())
-        if detail:
-            return f"<Picture {picture_no}>: {name}. {detail}."
-        return f"<Picture {picture_no}>: {name}, framing and composition reference."
-    return f"<Picture {picture_no}>: Reference image of {name}."
+    try:
+        filename = Path(str(ref.path or "")).name.strip()
+    except Exception:
+        filename = ""
+    if not filename:
+        filename = (ref.name or f"reference {picture_no}").strip()
+    return f"<Picture {picture_no}>: {filename}"
 
 
 def _h3_ref_subject_definitions(project: MusicProject, refs: Sequence[ReferenceAsset], *, has_lyrics: bool = True) -> List[str]:
@@ -1449,335 +1440,107 @@ def _creative_pool_choice(value: str, shot_index: int, *, allow_commas: bool = F
     return items[idx], len(items)
 
 
-def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_refs: Sequence[ReferenceAsset]) -> str:
-    """Direct, positive Ref2VA staging for a stable cast and one location.
-
-    One sheet is one performer; each detailed reference description appears once.
-    Audio transcription event markers are not treated as vocals.
-    Reference roles remain role-aware throughout the prompt: only Character refs
-    become performers, while Location/Prop/Style/Composition refs keep their own
-    scene functions.
+def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selected_refs: Sequence[ReferenceAsset]) -> str:
+    """Structured MiniMax music prompt using the fixed six-block order only.
+    Creative shot direction lives inside [SCENE DESCRIPTION].
     """
     refs = list(selected_refs)[:9]
-    lyrics = _clean_whisper_lyric_text(shot.lyrics)
     groups = _h3_reference_labels(refs)
-    picture_lines = []
-    subject_lines = []
-    for pic_no, ref in enumerate(refs, 1):
-        kind = _normalise_reference_kind(ref.kind)
-        name = (ref.name or f"Reference {pic_no}").strip()
-        detail = re.sub(r"\s+", " ", (ref.description or "").strip()).rstrip(" .")
-        picture_lines.append(_h3_picture_definition_line(ref, pic_no))
-        # The numbered subject mapping is shared with the existing generator.
-        subject_no = next((num for group in groups.values() for num, picture, item in group if picture == pic_no and item is ref), 0)
-        if kind == "Picture / Composition anchor":
-            continue
-        if kind == "Character":
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. This reference sheet contains different views of one individual performer. Show this person as one living character in the scene. Preserve the same face, hair, outfit and body proportions."
-        elif kind == "Background / Location":
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. This is the physical location for this clip, with its architecture, floor, walls, furniture and lighting. It defines the environment and is never a performer."
-        elif kind == "Object / Prop":
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Use this referenced item as a physical prop or set object. It is not a performer."
-        elif kind == "Style / Mood":
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Apply its visual styling to the scene as mood/look guidance only. It is not a performer or prop."
-        else:
-            base = f"<Subject {subject_no}>: {name} shown in <Picture {pic_no}>. Preserve its defined reference role; do not treat it as a performer unless it is explicitly a Character reference."
-        subject_lines.append(base + (" " + detail + "." if detail else ""))
-
-    lines = []
-    lines.extend(picture_lines)
-    if picture_lines and subject_lines:
-        lines.append("")
-    lines.extend(subject_lines)
-    lines.extend(["", "<Audio 1>: The original supplied song segment. Preserve its timing, instruments and any original recorded voices.",
-                  "", "SELECTED VISUAL STYLE LOCK", "Photorealistic live-action music-video cinema. Natural human motion, realistic instrument playing, coherent room lighting and consistent performer appearances.",
-                  "", "SCENE"])
-    characters = groups["characters"]
-    backgrounds = groups["backgrounds"]
-    objects = groups["objects"]
-    styles = groups["styles"]
-    others = groups["others"]
-    picture_anchors = groups["pictures"]
-
-    if backgrounds:
-        labels = ", ".join(f"<Subject {n}>" for n, _, _ in backgrounds)
-        lines.append(f"The scene takes place inside {labels}. These referenced backgrounds/locations supply the complete visible environment throughout the shot and are never counted as performers.")
-    else:
-        lines.append("Place the visible action in one coherent physical environment that suits the selected references.")
-
-    if characters:
-        labels = ", ".join(f"<Subject {n}>" for n, _, _ in characters)
-        lines.append(f"Show exactly {len(characters)} distinct referenced performer{'s' if len(characters)!=1 else ''}: {labels}. Each performer appears once as one real person.")
-        for n, _, ref in characters:
-            name = (ref.name or "The performer").strip()
-            desc = f"{name} {ref.description}".lower()
-            if any(t in desc for t in ("drum", "percussion")):
-                action = "plays the drum kit in time with the beat, seated behind the kit"
-            elif any(t in desc for t in ("guitar", "bass")):
-                action = "plays their guitar or bass with natural finger and strumming movements"
-            elif any(t in desc for t in ("singer", "vocal", "lead voice")):
-                action = ("performs the original sung words in sync with <Audio 1>" if lyrics else "moves rhythmically and expresses the instrumental energy with natural facial expressions")
+    pictures = [_h3_picture_definition_line(ref, i) for i, ref in enumerate(refs, 1)]
+    subjects = []
+    for group_name, entries in groups.items():
+        for no, picture_no, ref in entries:
+            if no == 0:
+                continue
+            # A supplied description defines the subject's role/identity first.
+            # File names belong only in [REFERENCE IMAGES], not in [SUBJECTS].
+            detail = re.sub(r"\s+", " ", (ref.description or "").strip()).rstrip(" \t.,;:!?")
+            if group_name == "characters":
+                fallback = "The person"
+                retention = "Preserve their exact face, hairstyle, outfit and proportions."
+            elif group_name == "backgrounds":
+                fallback = "The environment"
+                retention = "Preserve its physical layout, lighting, furniture and architecture; it is the scene location."
+            elif group_name == "objects":
+                fallback = "The physical object"
+                retention = "Preserve its recognizable appearance and physical characteristics."
+            elif group_name == "styles":
+                fallback = "The visual style"
+                retention = "Preserve the reference's visual characteristics."
             else:
-                action = "performs natural physical actions appropriate to their defined role"
-            lines.append(f"<Subject {n}> {action}.")
-    else:
-        lines.append("If no Character references are present, do not invent extra people. Use the non-character references to define the scene content instead.")
-
-    if objects:
-        lines.append("Use these references as physical props or set objects only: " + ", ".join(f"<Subject {n}>" for n,_,_ in objects) + ". They are not performers and do not sing, speak or play instruments unless a Character reference is explicitly interacting with them.")
-    if styles:
-        lines.append("Apply these references only as visual style or mood guidance: " + ", ".join(f"<Subject {n}>" for n,_,_ in styles) + ". They influence the look of the scene but are not visible cast members unless separately represented by Character references.")
-    if others:
-        lines.append("Keep these references in their defined non-character roles: " + ", ".join(f"<Subject {n}>" for n,_,_ in others) + ". Do not reinterpret them as extra performers.")
-    if picture_anchors:
-        lines.append("Use these picture references only for composition or framing guidance: " + ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors) + ".")
+                fallback = "The reference"
+                retention = "Preserve its recognizable visual characteristics."
+            if detail:
+                sentence = f"<Subject {no}>: {detail}, shown in <Picture {picture_no}>. {retention}"
+            else:
+                sentence = f"<Subject {no}>: {fallback} shown in <Picture {picture_no}>. {retention}"
+            subjects.append((no, sentence))
+    subjects.sort(key=lambda item: item[0])
 
     story, _ = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
-    if story.strip():
-        lines.append(re.sub(r"\s+", " ", story.strip()).rstrip(".") + ".")
-    lines.append(f"This is the {shot.section or 'current'} musical section.")
-    lines.extend(["", "PERFORMANCE"])
-    if lyrics:
-        lines.append("<Audio 1> is the sole source of sung words, phrasing, vocal pauses and syllable timing. Visible mouth movements follow the vocals actually heard in this audio segment. Preserve the existing performer roles and appearance; use the recording rather than a written lyric transcription to drive lip movement.")
-    else:
-        if characters:
-            lines.append("Instrumental passage: only the Character references perform visible action. They play instruments, move naturally to the beat and react to each other. Non-character references remain environment, prop, style or composition guides and do not behave like performers.")
-        else:
-            lines.append("Instrumental passage: preserve the scene visually using the non-character references without inventing performers.")
+    location, _ = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
     camera, _ = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
-    lines.extend(["", "CAMERA", (camera.strip().rstrip(".") + ".") if camera.strip() else "One coherent cinematic camera move featuring the Character references inside the selected location."])
-    lines.extend(["", "ENDING", "End on a clear, natural moment inside the established scene, keeping every reference in its defined role.",
-                  "", "overall_soundscape:", "<Audio 1> remains the dominant, continuous, synchronized original music track.",
-                  "", "non_diegetic_music:", "Reuse <Audio 1> as the complete music soundtrack."])
-    return "\n".join(lines)
-def build_h3_reference_prompt(
-    project: MusicProject,
-    shot: MusicShot,
-    selected_refs: Sequence[ReferenceAsset],
-) -> str:
-    """Build a MiniMax-H3 full-reference prompt using the official Ref2VA layout.
+    style = re.sub(r"\s+", " ", (project.style_theme or "").strip()).strip(" .")
+    creative = re.sub(r"\s+", " ", (project.characters_subjects or "").strip()).strip(" .")
+    char_nums = [n for n, _, _ in groups["characters"]]
+    room_nums = [n for n, _, _ in groups["backgrounds"]]
+    obj_nums = [n for n, _, _ in groups["objects"]]
+    style_nums = [n for n, _, _ in groups["styles"]]
+    anchors = [pic for _, pic, _ in groups["pictures"]]
+    fmt = lambda ns: ", ".join(f"<Subject {n}>" for n in ns)
 
-    Reference roles stay semantically separate: characters are performers, locations
-    are environments, props are objects, style refs guide appearance, and composition
-    pictures anchor framing. This prevents a background reference from being treated as
-    another visible person/performer.
-    """
-    if bool(getattr(project, "fixed_cast_prompt_mode", False)) and not bool(getattr(project, "randomize_reference_characters", False)):
-        return build_fixed_cast_prompt(project, shot, selected_refs)
-    refs = list(selected_refs)[:9]
-    lyric_text = _clean_whisper_lyric_text(shot.lyrics)
-    has_lyrics = bool(lyric_text)
+    out = [
+        "[REFERENCE IMAGES]", *pictures,
+        "", "[SUBJECTS]", *(line for _, line in subjects),
+        "", "[SELECTED VISUAL STYLE LOCK]",
+        "Photorealistic live-action cinematic music video. Real human skin texture, natural facial motion, physically believable lighting, consistent reference identity and coherent camera perspective."
+    ]
+    if style:
+        out.append(style + ".")
+    if creative:
+        out.append("Creative direction: " + creative + ".")
 
-    # 1) subject_definitions
-    sections: List[str] = ["subject_definitions:"]
-    sections.extend(_h3_ref_subject_definitions(project, refs, has_lyrics=has_lyrics))
-
-    # Keep role groups separate throughout the prompt. A background may legitimately be
-    # a reusable <Subject N> in H3, but it must never be grouped with character performers.
-    groups = _h3_reference_labels(refs)
-    characters = groups["characters"]
-    backgrounds = groups["backgrounds"]
-    objects = groups["objects"]
-    styles = groups["styles"]
-    others = groups["others"]
-    picture_anchors = groups["pictures"]
-
-    def labels(items: Sequence[Tuple[int, int, ReferenceAsset]]) -> str:
-        return ", ".join(f"<Subject {subject_no}>" for subject_no, _picture_no, _ref in items if subject_no)
-
-    # Keep the visual-text rule close to the reference definitions so written lyrics are
-    # not mistaken for a request to create karaoke/subtitle graphics later in the prompt.
-    sections.append("visual_text_policy:")
-    if not has_lyrics:
-        sections.append(
-            "This is an instrumental-only shot. There is no speech, no singing, no narration, no lip-sync, no spoken words, and no visible subtitles or lyric text. "
-            "Only physical scene text explicitly requested by the user may appear. Do not invent dialogue, captions, karaoke text, lyric overlays, title cards, lower-thirds or floating text."
-        )
-    elif bool(getattr(project, "visible_lyric_subtitles", False)):
-        sections.append(
-            "Visible lyric subtitles are enabled. The current lyric phrase from <Audio 1> may appear as synchronized readable subtitle/lyric text. "
-            "Do not invent unrelated captions, title cards, logos, lower-thirds or other text. Text explicitly requested as a physical part of the scene may also remain visible."
-        )
+    out += ["", "[SCENE DESCRIPTION]"]
+    if room_nums:
+        out.append(f"The entire sequence takes place in {fmt(room_nums)}. The referenced location supplies the real walls, floor, depth and environmental lighting in each camera view.")
+    elif location:
+        out.append("Location: " + location.strip().rstrip(".") + ".")
     else:
-        sections.append(
-            "The supplied audio provides the vocal performance. No lyric transcription is included in the visual prompt; keep lyrics out of captions, karaoke overlays, title cards and lower-thirds. "
-            "Only text explicitly requested as a physical part of a scene, object, poster, sign, monitor or interface may be visible. Do not turn spoken or sung words into on-screen text."
-        )
-
-    # 2) summary. Creative-brief lists are option pools, not a checklist for one clip.
-    story_focus, story_pool_count = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
-    story = re.sub(r"\s+", " ", story_focus.strip()) if story_focus.strip() else "the current music-video story"
-    summary_bits = [f"[reference generation + audio reuse] Create a music-video shot for {story}."]
-    if story_pool_count > 1:
-        summary_bits.append("This is one selected story beat from the larger project idea; keep the other listed story beats for other clips instead of combining them here.")
-    if characters:
-        if has_lyrics:
-            summary_bits.append(f"Use {labels(characters)} as the visible character/performer reference{'s' if len(characters) != 1 else ''}.")
-        else:
-            summary_bits.append(f"Use {labels(characters)} as the visible character reference{'s' if len(characters) != 1 else ''}; this interval is instrumental-only, so the character action is visual rather than vocal.")
-    if backgrounds:
-        summary_bits.append(f"Use {labels(backgrounds)} as the authoritative physical location for the entire shot, from the first frame through the final frame. All visible walls, floors, depth, and room lighting belong to this location.")
-        if characters:
-            summary_bits.append("Character reference sheets supply only each performer's identity, hairstyle, clothing and appearance. Compose those performers as people physically present inside the referenced location; the neutral studio/photo-sheet surfaces surrounding them are reference-sheet presentation, not scenery.")
-    if objects:
-        summary_bits.append(f"Use {labels(objects)} only as referenced objects/props when they belong in the scene.")
-    if styles:
-        summary_bits.append(f"Use {labels(styles)} only for visual style/mood guidance.")
-    if others:
-        summary_bits.append(f"Use {labels(others)} according to their explicitly defined purposes.")
-    if picture_anchors:
-        picture_summary = ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors)
-        summary_bits.append(f"Use {picture_summary} as concrete composition/shot-planning anchors rather than as character identities.")
-    if has_lyrics:
-        summary_bits.append("Reuse <Audio 1> as the continuous authoritative song/performance source for this shot.")
+        out.append("A consistent, physically believable setting appropriate to the chosen visual references.")
+    if char_nums:
+        out.append(f"The visible performers are {fmt(char_nums)}, retaining their own referenced appearances and positions.")
+    if obj_nums:
+        out.append(f"Use {fmt(obj_nums)} as referenced physical objects or props in the scene.")
+    if style_nums:
+        out.append(f"Use {fmt(style_nums)} as visual mood references.")
+    if anchors:
+        out.append("Use " + ", ".join(f"<Picture {n}>" for n in anchors) + " as framing/composition guidance.")
+    if location and room_nums:
+        out.append("Scene direction: " + location.strip().rstrip(".") + ".")
+    if story:
+        out.append(story.strip().rstrip(".") + ".")
     else:
-        summary_bits.append("Reuse <Audio 1> as the continuous authoritative instrumental audio source for this shot; the visible character performs silent story action while the music continues unchanged.")
-    sections.append("summary:")
-    sections.append(" ".join(summary_bits))
+        out.append("Create energetic, natural action driven by the music in the referenced environment.")
+    if camera:
+        out.append("Camera choreography: " + camera.strip().rstrip(".") + ".")
+    out.append("The recorded music in <Audio 1> is the sole authority for vocal syllables, pauses and timing. Visible mouth movements, when present, follow the actual audio rather than written lyrics. Keep movement and camera action active through the final frame.")
 
-    # 3) retention_analysis
-    sections.append("retention_analysis:")
-    for group_name in ("characters", "backgrounds", "objects", "styles", "others"):
-        for i, _picture_no, ref in groups[group_name]:
-            name = (ref.name or f"Subject {i}").strip()
-            detail = re.sub(r"\s+", " ", (ref.description or "").strip())
-            kind = _normalise_reference_kind(ref.kind)
-            if kind == "Background / Location":
-                rule = f"<Subject {i}>: fully_preserved - this is the single authoritative scene environment. Preserve {name}'s recognizable room design, spatial depth, walls, floor, lighting, layout and named recurring features in every frame and every camera angle. Place performers directly within this continuous location."
-            elif kind == "Object / Prop":
-                rule = f"<Subject {i}>: fully_preserved - keep {name} strictly as the referenced object/prop with its recognizable appearance and intended purpose; it is not an additional person or performer."
-            elif kind == "Style / Mood":
-                rule = f"<Subject {i}>: weak_reference - use {name} only for the intended visual style/mood without turning it into a physical character or object."
-            elif kind == "Character":
-                rule = f"<Subject {i}>: fully_preserved - keep {name}'s referenced identity, appearance and defined character role consistent."
-            else:
-                rule = f"<Subject {i}>: fully_preserved - keep {name}'s explicitly defined reference role consistent."
-            if detail:
-                rule += f" Preserve these reference details: {detail}."
-            sections.append(rule)
-    for _subject_no, picture_no, ref in picture_anchors:
-        name = (ref.name or f"Picture {picture_no}").strip()
-        detail = re.sub(r"\s+", " ", (ref.description or "").strip())
-        rule = f"<Picture {picture_no}>: partially_preserved - use {name} as the requested framing/composition anchor while allowing scene motion and shot development."
-        if detail:
-            rule += f" Follow these anchor details: {detail}."
-        sections.append(rule)
-    if project.characters_subjects.strip() and refs:
-        sections.append(
-            "Named subject rules: fully_preserved - "
-            + re.sub(r"\s+", " ", project.characters_subjects.strip())
-            + "."
-        )
-    if has_lyrics:
-        sections.append(
-            "<Audio 1>: fully_copy - keep the supplied song segment continuous as the target performance track; preserve its existing vocals, lyrics, instrumental passages, rhythm and timing instead of inventing replacement vocals or music."
-        )
-    else:
-        sections.append(
-            "<Audio 1>: fully_copy - keep the supplied instrumental audio unchanged as the complete sound for this shot. Do not add any extra voice, speech, singing, humming, mumbling, narration or replacement music. Preserve its rhythm, beat, timing, continuity and musical energy."
-        )
+    out += [
+        "", "[overall_soundscape:]",
+        "Only natural incidental sounds appropriate to the physical scene, kept secondary to the music.",
+        "", "[non_diegetic_music:]",
+        "<Audio 1>: the original supplied music segment, preserved continuously at its exact timing."
+    ]
+    return "\n".join(out)
 
-    # 4) detailed_description
-    sections.append("detailed_description:")
-    style = re.sub(r"\s+", " ", project.style_theme.strip()) if project.style_theme.strip() else "cinematic music-video"
-    location, location_pool_count = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
-    location = re.sub(r"\s+", " ", location.strip())
-    if location:
-        # Avoid awkward output such as "set in in the basement" when the user already
-        # typed a leading "in".
-        location_text = re.sub(r"^(?:set\s+in\s+|in\s+)", "", location, flags=re.IGNORECASE).strip()
-        sections.append(f"The target video uses a {style} style and takes place in {location_text}.")
-        if location_pool_count > 1:
-            sections.append("Use only this selected project location as the primary setting for this clip. The other locations listed in the Creative brief are alternatives reserved for other clips; do not visit or combine them in this shot unless the selected location itself explicitly describes a continuous transition.")
-    else:
-        sections.append(f"The target video uses a {style} style.")
 
-    shot1: List[str] = ["[Shot 1]"]
-    if characters:
-        if len(characters) == 1:
-            shot1.append(f"The visible character is {labels(characters)}; preserve this character's identity and role.")
-        else:
-            shot1.append(f"The visible characters are {labels(characters)}; preserve their identities and roles.")
-    if backgrounds:
-        shot1.append(f"The camera is physically inside {labels(backgrounds)} for the complete shot. Show the referenced room's actual walls, floor, lighting and depth behind and around every performer across all camera framings. Integrate the performers into that room with matching perspective, contact shadows, and scene lighting. Character sheet backgrounds are only neutral presentation surfaces for identity reference. Maintain the room continuously during camera movement and close-ups.")
-    if objects:
-        shot1.append(f"Use {labels(objects)} only as props/objects where relevant to the action.")
-    if styles:
-        shot1.append(f"Apply {labels(styles)} only as visual style/mood guidance.")
-    if picture_anchors:
-        first_pictures = ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors)
-        shot1.append(f"Use {first_pictures} for the specified composition/framing purpose.")
-    if story_focus.strip():
-        shot1.append(re.sub(r"\s+", " ", story_focus.strip()) + ".")
-    shot1.append(f"This is the {shot.section or 'current'} section of the music video.")
-    camera_choice, camera_pool_count = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
-    if camera_choice.strip():
-        shot1.append("Primary camera concept: " + re.sub(r"\s+", " ", camera_choice.strip()) + ".")
-        if camera_pool_count > 1:
-            shot1.append("Use this one selected camera concept as the dominant camera language for the clip. Do not stack the other camera moves from the Creative brief into this shot; they are reserved for later clips.")
-    if has_lyrics:
-        shot1.append("<Audio 1> begins immediately and remains continuous and synchronized with the visible vocal performance.")
-    else:
-        shot1.append(
-            "<Audio 1> begins immediately as an instrumental-only passage and remains continuous. "
-            "Every visible character remains completely silent. Use expressive body movement, arm movement, eye movement and silent facial acting to communicate the story and react to the beat. "
-            "Mouth movement stays minimal, natural and non-speaking, with no lip-sync, no sung articulation and no speech-like mouth shapes."
-        )
+def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_refs: Sequence[ReferenceAsset]) -> str:
+    return _build_structured_music_prompt(project, shot, selected_refs)
 
-    if has_lyrics:
-        shot1.append(
-            "<Audio 1> is the sole timing authority for vocal performance. Any visible lip movement follows the actual sung syllables, their timing and pauses in the supplied recording. "
-            "Preserve the referenced performers and their defined roles. Whisper transcription is used only for editing and is not a second script to perform."
-        )
-    else:
-        shot1.append(
-            "Instrumental interval: <Audio 1> contains the complete intended sound for this section. "
-            "Translate every story idea into visible physical action rather than spoken or sung content. Characters may dance, gesture, react, work, move through the environment and interact with props, but they do not talk, sing, narrate, hum, mumble or mouth words. "
-            "Do not interpret phrases such as asks, tells, explains, argues, jokes, calls, sings or says as permission to create audible speech; express the intended meaning silently through action and reaction instead."
-        )
-    sections.append(" ".join(shot1))
-    if backgrounds:
-        sections.append("location_continuity_lock: The selected background/location picture defines the physical set for all frames. Character sheet images define people, not sets. The set remains the same continuous environment through wide shots, close-ups, camera movements and shot transitions.")
 
-    for cut_no, absolute in enumerate(shot.internal_cuts[:4], start=2):
-        rel = max(0.0, absolute - shot.generation_start)
-        mm = int(rel // 60)
-        ss = rel - mm * 60
-        timestamp = f"{mm:02d}:{ss:06.3f}"
-        if has_lyrics:
-            continuity = "<Audio 1> continues seamlessly across the cut with unchanged musical timing and vocal continuity."
-        else:
-            continuity = "<Audio 1> continues seamlessly across the cut as the same instrumental passage; every character remains completely silent with minimal natural non-speaking mouth movement and communicates only through visible action and reaction."
-        sections.append(
-            f"[Shot {cut_no}] At {timestamp}, the camera cuts to a complementary new angle or visual beat within the same established scene. "
-            "Keep the same character identities, performer roles, props and background/location roles. " + continuity
-        )
+def build_h3_reference_prompt(project: MusicProject, shot: MusicShot, selected_refs: Sequence[ReferenceAsset]) -> str:
+    return _build_structured_music_prompt(project, shot, selected_refs)
 
-    if bool(getattr(project, "visible_lyric_subtitles", False)):
-        sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. Do not invent unrelated captions or title cards beyond the explicitly enabled lyric subtitles and explicitly requested physical scene text.")
-    else:
-        if has_lyrics:
-            sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. No visible lyric subtitles, captions, karaoke text, lyric overlays or title cards; only explicitly requested physical scene text may appear.")
-        else:
-            sections.append("Keep all visible character identities and all reference-purpose details stable across shots. Background/location references remain environments, and prop references remain objects. Start useful action immediately. Do not create any extra person, assistant, mascot, floating icon or shoulder creature. No speech, singing, narration, lip-sync, humming, mumbling, visible lyric subtitles, captions, karaoke text, lyric overlays or title cards; only explicitly requested physical scene text may appear.")
-
-    # 5/6) audio sections. The master/reference song is the only music layer we want.
-    sections.append("overall_soundscape:")
-    if has_lyrics:
-        sections.append(
-            "Natural physical ambience and incidental scene sounds may be subtle and secondary. Keep <Audio 1> dominant, continuous and clearly synchronized with the vocal performance."
-        )
-    else:
-        sections.append(
-            "<Audio 1> is the complete instrumental soundtrack for this interval. Natural physical ambience may be subtle and secondary, but must not replace, interrupt or compete with the supplied instrumental audio. Every visible character remains a silent visual participant rather than a speaker or singer."
-        )
-    sections.append("non_diegetic_music:")
-    if has_lyrics:
-        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
-    else:
-        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score, voice, vocalization or replacement music.")
-
-    return "\n".join(x.strip() for x in sections if x and x.strip())
 
 def build_default_prompt(project: MusicProject, shot: MusicShot) -> str:
     return build_h3_reference_prompt(project, shot, _selected_refs_for_shot(project, shot))
@@ -2640,6 +2403,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             "--ref-image-size", str(gen_cfg.get("ref_size", "match") or "match"),
             "--ref-audio", str(audio_chunk),
             "--lock-source-audio-index", "1",
+            "--save-generated-audio-original", str(out_dir / "original" / out_path.name),
             "--output", str(out_path),
         ]
         _append_main_gui_generation_args(cmd, project)
@@ -2767,6 +2531,14 @@ def _assembly_task(progress, project: MusicProject) -> str:
         raise RuntimeError("FFmpeg was not found.")
     if not project.shots:
         raise RuntimeError("No shot plan exists.")
+    # Queue assembly snapshots may be written before queued shot jobs finish.
+    # Resolve the actual completed files when assembly RUNS, not when queued.
+    out_dir = Path(project.output_dir or OUTPUT_ROOT / _safe_stem(project.audio_path)).resolve()
+    raw_dir = out_dir / "raw_clips"
+    for shot in project.shots:
+        completed = _latest_shot_output(raw_dir, shot.index, shot.output_path)
+        if completed is not None:
+            shot.output_path = str(completed)
     missing = [s.index for s in project.shots if not s.output_path or not Path(s.output_path).is_file()]
     if missing:
         raise RuntimeError("Missing generated clips for shots: " + ", ".join(map(str, missing)))
@@ -3023,10 +2795,11 @@ class MiniMaxMusicClipWidget(QWidget):
     def _build_refs_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_refs)
         info = QLabel(
-            "Choose what each image is for: Character, Background / Location, Object / Prop, Style / Mood, or Picture / Composition anchor. MiniMax then receives the correct <Subject N> and  <Picture N> relationship automatically.  "
-            "Tip use transparent refs with only 1 full body shot, no reference sheet."
-            "With Randomize off, all enabled cast/other refs are included up to 9 total, and multiple background locations rotate between shots. "
-            "With Randomize on, each shot can use a different subset.",
+            "Choose what each image is for, MiniMax then receives the correct <Subject N> and  <Picture N> relationship automatically.  "
+            "Tip use transparent refs with only 1 full body shot for the best results, reference sheets don't always get used properly in here.  "
+            "Always add a character/image description to avoid generic results, if you want somebody to play guitar it should be in the description."
+            "With Randomize off, all enabled cast/other refs are included, up to 9 in total, and multiple background locations rotate between shots. "
+            " With Randomize on, each shot can use a different subset. (randomize allows unlimited refs and backgrounds)",
             body,
         )
         info.setWordWrap(True); lay.addWidget(info)
@@ -4354,6 +4127,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "--ref-image-size", str(gen_cfg.get("ref_size", "match") or "match"),
             "--ref-audio", str(audio_chunk),
             "--lock-source-audio-index", "1",
+            "--save-generated-audio-original", str(out_dir / "original" / out_path.name),
             "--output", str(out_path),
         ]
         _append_main_gui_generation_args(args, self.project)
