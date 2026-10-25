@@ -579,6 +579,7 @@ RESOLUTION_PRESETS = {
     "1152 × 640": {"16:9": (1152, 640), "9:16": (640, 1152), "1:1": (640, 640)},
     "1280 × 720": {"16:9": (1280, 704), "9:16": (704, 1280), "1:1": (704, 704)},
     "1344 × 768": {"16:9": (1344, 768), "9:16": (768, 1344), "1:1": (768, 768)},
+    "1600 × 896": {"16:9": (1600, 896), "9:16": (896, 1600), "1:1": (896, 896)},
     "1920 × 1088":{"16:9": (1920, 1088),"9:16": (1088, 1920),"1:1": (1088, 1088)},
 }
 # Exact 21:9 (7:3) presets. All dimensions stay on MiniMax's 32-pixel grid.
@@ -1291,6 +1292,9 @@ class MainWindow(QMainWindow):
         self.gen_vsr_scale.setToolTip("NVIDIA VSR output multiplier. Optional unblur is controlled in Settings.")
         self.gen_vsr_scale.setEnabled(False)
         self.gen_vsr_toggle.toggled.connect(self.gen_vsr_scale.setEnabled)
+        # The preview describes the final saved video, not only the H3 source.
+        self.gen_vsr_toggle.toggled.connect(self._sync_resolution)
+        self.gen_vsr_scale.currentIndexChanged.connect(self._sync_resolution)
         rr.addWidget(self.gen_vsr_toggle); rr.addWidget(self.gen_vsr_scale)
         rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
         form.addRow("Frames", self.frames); form.addRow("", self.experimental_long_duration); form.addRow("Steps", self.steps); form.addRow("Seed", self.seed)
@@ -5322,10 +5326,24 @@ class MainWindow(QMainWindow):
         self.res_class.setVisible(not is_widescreen)
         self.widescreen_quality.setVisible(is_widescreen)
         w, h = self._current_resolution()
-        if not is_widescreen and self.res_class.currentText() == "1280 × 720":
-            self.resolved.setText(f"Generation: {w} × {h} (704p)")
+        is_704p = not is_widescreen and self.res_class.currentText() == "1280 × 720"
+        generation_label = f"Generation: {w} × {h}" + (" (704p)" if is_704p else "")
+        if self.gen_vsr_toggle.isChecked():
+            scale = int(self.gen_vsr_scale.currentData() or 2)
+            final_w, final_h = w * scale, h * scale
+            # Keep both dimensions visible: H3 still generates at the native
+            # resolution; the separately queued VSR pass creates the final file.
+            self.resolved.setText(f"{generation_label}\nFinal (VSR x{scale}): {final_w} × {final_h}")
+            self.resolved.setToolTip(
+                f"MiniMax H3 generates {w} × {h}. NVIDIA VSR x{scale} outputs "
+                f"{final_w} × {final_h} when the upscale job finishes."
+            )
         else:
-            self.resolved.setText(f"{w} × {h}")
+            # Preserve the pre-existing display when VSR is disabled.
+            self.resolved.setText(generation_label if is_704p else f"{w} × {h}")
+            self.resolved.setToolTip(
+                f"Exact generation and final output size: {w} × {h} (NVIDIA VSR disabled)."
+            )
 
     def _sync_mode(self):
         i = self.mode.currentIndex(); self.fl_group.setVisible(i == 1); self.ref_group.setVisible(i == 2)
