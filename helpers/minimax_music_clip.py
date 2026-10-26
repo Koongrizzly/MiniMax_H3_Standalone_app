@@ -1509,7 +1509,7 @@ def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selec
     else:
         out.append("A consistent, physically believable setting appropriate to the chosen visual references.")
     if char_nums:
-        out.append(f"The visible performers are {fmt(char_nums)}, retaining their own referenced appearances and positions.")
+        out.append(f"The referenced characters are {fmt(char_nums)}, retaining their own referenced appearances and positions.")
     if obj_nums:
         out.append(f"Use {fmt(obj_nums)} as referenced physical objects or props in the scene.")
     if style_nums:
