@@ -2707,7 +2707,13 @@ class MainWindow(QMainWindow):
         # "Continue last result" should ignore cancelled tests.  Everything else
         # still counts as the latest prior queue job, including failed jobs, so
         # a failure in the chain stops continuation instead of silently skipping it.
-        candidates=[j for j in self.queue_jobs if j.get("state") != "cancelled"]
+        # Only native H3 generation outputs can be used as H3 latent/frame
+        # continuation predecessors. A queued VSR upscale, timeline assembly, or
+        # other helper task is not the last H3 result, even if queued later.
+        candidates=[j for j in self.queue_jobs
+                    if j.get("state") != "cancelled"
+                    and not j.get("job_type")
+                    and j.get("mode") in (0, 1, 2)]
         if not candidates:
             return None
         return max(candidates, key=lambda j: float(j.get("created_at") or 0))
@@ -2793,7 +2799,10 @@ class MainWindow(QMainWindow):
                     f"source={continue_source} | start={float(trim_start or 0.0):.3f}s, natural end"
                 )
                 self.append_log("\n")
-            if job.get("continue_last_result") and job.get("continue_audio_memory"):
+            # Audio memory depends on a usable video predecessor, not on whether
+            # the predecessor is queued or an already-finished Timeline MP4.
+            # The normal GUI supports both source types; Timeline must too.
+            if job.get("continue_audio_memory"):
                 run_args += ["--continue-audio-memory"]
             if job.get("latent_continuation"):
                 run_args += ["--latent-continuation"]
@@ -3131,6 +3140,10 @@ class MainWindow(QMainWindow):
 
         original = copy.deepcopy(self.settings_dict())
         created = []
+        queued_timeline_jobs = {}
+        # A selected subset can originate from arbitrary selection order. Always
+        # enqueue in Timeline order so a continuation finds its own predecessor.
+        specs = sorted(specs, key=lambda item: int(item.get("timeline_index", 0) or 0))
         try:
             for pos, spec in enumerate(specs):
                 clip_id = str(spec.get("id") or "")
@@ -3176,6 +3189,13 @@ class MainWindow(QMainWindow):
                     hq_wide = str(hq_override.get("widescreen_quality") or "").strip()
                     if hq_wide in WIDESCREEN_21_9_PRESETS:
                         settings["widescreen_quality"] = hq_wide
+
+                # Generation-tab automatic NVIDIA VSR is a separate queue task,
+                # not part of an H3 clip. Inheriting this checkbox made generate()
+                # queue H3 + VSR, while Timeline wrongly captured queue_jobs[-1]
+                # (the VSR job) as the H3 result, corrupting chain dependencies.
+                # The dedicated Timeline upscaler remains available separately.
+                settings["generation_vsr_enabled"] = False
 
                 # Timeline jobs rebuild/clear their Ref2VA audio inputs per clip.
                 # Never inherit the Generation-tab "Use Audio 1 as exact source / output"
@@ -3324,10 +3344,10 @@ class MainWindow(QMainWindow):
                         }
                         predecessor_is_in_this_batch = previous_timeline_index in batch_timeline_indices
 
-                        if predecessor_is_in_this_batch and pos > 0:
-                            # The predecessor was queued immediately/earlier in this
-                            # same Timeline request, so the normal queue dependency
-                            # chain is the strongest continuation source.
+                        if predecessor_is_in_this_batch and previous_timeline_index in queued_timeline_jobs:
+                            # Pin to this Timeline's *actual* H3 predecessor, not the
+                            # most recently queued global job (which can be VSR,
+                            # another project, or a utility task).
                             settings["continue_last_result"] = True
                             settings["continue_video"] = ""
                         elif prev_exists:
@@ -3347,6 +3367,11 @@ class MainWindow(QMainWindow):
                             settings["latent_continuation"] = False
                     settings["last"] = ""
                 else:
+                    # A standalone Timeline block is T2VA unless the explicit
+                    # next-first-frame bridge below selects FL2VA. Per-clip older
+                    # settings may carry mode=1 from a previous Continue run.
+                    if not use_timeline_refs:
+                        settings["mode"] = 0
                     # Start a fresh dependency chain. A captured manual source
                     # remains valid, but it must never silently target the last
                     # queue result from an earlier timeline chain.
@@ -3410,17 +3435,50 @@ class MainWindow(QMainWindow):
                     else:
                         settings["output_folder"] = project_folder
 
+                # Expose meaningful differences from the successful main GUI
+                # chain. Timeline intentionally keeps per-clip snapshots unless
+                # the user presses "Use current Generation settings".
+                parity_keys = (
+                    "fl2va_model", "use_hybrid_model", "hybrid_model", "video_vae_model",
+                    "loras", "cfg", "shift", "audio_shift", "sampler", "scheduler",
+                    "steps", "resolution", "aspect", "continue_context_frames",
+                    "continue_audio_memory", "latent_continuation", "combine_frames_latent",
+                )
+                snapshot_differences = [k for k in parity_keys
+                                        if k in settings and k in original and settings[k] != original[k]]
+                if snapshot_differences:
+                    self.append_log(
+                        f"[TIMELINE H3 PARITY] {clip_name}: saved clip settings differ from "
+                        f"current Generation tab: {', '.join(snapshot_differences)}. "
+                        "Use current Generation settings to synchronize, if desired.\n"
+                    )
                 self._timeline_ref_audio_subjects = [int(x) for x in (settings.get("ref_audio_subjects") or [])]
                 self.apply_settings(settings)
                 before = len(self.queue_jobs)
-                self.generate()
-                self._timeline_ref_audio_subjects = []
+                # generate() normally resolves Continue last result from the global
+                # queue. For Timeline, its predecessor is explicitly identified.
+                self._timeline_forced_continue_from_job_id = (
+                    queued_timeline_jobs.get(int(spec.get("timeline_index", pos) or 0) - 1)
+                    if settings.get("continue_last_result") else None
+                )
+                try:
+                    self.generate()
+                finally:
+                    self._timeline_forced_continue_from_job_id = None
+                    self._timeline_ref_audio_subjects = []
                 if len(self.queue_jobs) <= before:
                     # generate() already showed the specific validation dialog.
                     # Stop here so a later Continue clip can never attach to the
                     # wrong queue job after an earlier clip failed to enqueue.
                     return False
-                job = self.queue_jobs[-1]
+                # Identify the H3 job, not an incidental postprocessing task.
+                new_h3_jobs = [j for j in self.queue_jobs[before:]
+                               if not j.get("job_type") and j.get("mode") in (0, 1, 2)]
+                if len(new_h3_jobs) != 1:
+                    self.append_log(f"[TIMELINE ERROR] Expected one H3 job for {clip_name}, got {len(new_h3_jobs)}.\n")
+                    return False
+                job = new_h3_jobs[0]
+                queued_timeline_jobs[int(spec.get("timeline_index", pos) or 0)] = job["id"]
                 job["timeline_project_id"] = str(getattr(self.timeline_widget, "project", {}).get("project_id", ""))
                 job["timeline_clip_id"] = clip_id
                 job["timeline_clip_index"] = pos
@@ -3438,6 +3496,18 @@ class MainWindow(QMainWindow):
                     for path, subject in zip(timeline_voice_refs, timeline_voice_subjects)
                 ] if use_timeline_refs else []
                 job["timeline_settings_snapshot"] = copy.deepcopy(settings)
+                self.append_log(
+                    f"[TIMELINE H3 PARITY] {clip_name} | mode={job.get('mode_name')} | "
+                    f"predecessor_job={job.get('continue_from_job_number') or '-'} | "
+                    f"manual_source={Path(str(job.get('manual_continue_video'))).name if job.get('manual_continue_video') else '-'} | "
+                    f"audio_memory={bool(job.get('continue_audio_memory'))} | "
+                    f"latent={bool(job.get('latent_continuation'))} | "
+                    f"context={job.get('continue_context_frames') or '-'} | "
+                    f"model={job.get('model_label')} | "
+                    f"sampler={settings.get('sampler')} | scheduler={settings.get('scheduler')} | "
+                    f"steps={settings.get('steps')} | shift={settings.get('shift')} | "
+                    f"audio_shift={settings.get('audio_shift')} | cfg={settings.get('cfg')}\n"
+                )
                 if bool(spec.get("timeline_alternate_candidate", False)):
                     job["timeline_alternate_candidate"] = True
                     job["timeline_alternate_candidate_id"] = str(spec.get("timeline_alternate_candidate_id") or "")
@@ -6636,10 +6706,12 @@ exit /b %RC%
         if mode==1:
             continue_last=self.continue_last_result.isChecked()
             glue_results=self.glue_results.isChecked()
-            continue_audio_memory=bool(continue_last and self.continue_audio_memory.isChecked())
             latent_continuation=bool(self.latent_continuation.isChecked())
             combine_frames_latent=bool(latent_continuation and self.combine_frames_latent.isChecked())
             manual_continue_video="" if continue_last else self.continue_video.path()
+            # The visible UI allows audio memory for manual Continuation Video too.
+            # Previously this silently became False unless Continue last was ON.
+            continue_audio_memory=bool((continue_last or manual_continue_video) and self.continue_audio_memory.isChecked())
             if (manual_continue_video or continue_last) and self.first.path():
                 QMessageBox.warning(self,"Conflicting FL2VA inputs","Continue Video already supplies the first-frame boundary. Clear the separate First frame."); return
             if self.first.path(): args += ["--first-frame",self.first.path()]
@@ -6647,7 +6719,8 @@ exit /b %RC%
             if manual_continue_video and not Path(manual_continue_video).is_file():
                 QMessageBox.warning(self,"Video missing","The selected Continue video file does not exist."); return
             if continue_last:
-                previous=self._latest_non_cancelled_queue_job()
+                forced_id=getattr(self, "_timeline_forced_continue_from_job_id", None)
+                previous=(self._job_by_id(forced_id) if forced_id else self._latest_non_cancelled_queue_job())
                 if previous is None:
                     QMessageBox.warning(self,"No previous queue job","Continue last result needs an earlier non-cancelled queue job to continue from. Add or finish a source job first."); return
                 if previous.get("state")=="failed":

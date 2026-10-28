@@ -359,9 +359,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="h3_isolated_", dir=str(ROOT / "output")) as td:
         td = Path(td); lat = td / "latents.pt"; frames_dir = td / "frames"; wav = td / "audio.wav"
         if ns.continue_video and (ns.continue_trim_in > 0.001 or ns.continue_trim_out is not None):
-            # Create an accurate *temporary* visible segment, leaving the source
-            # MP4 untouched. This covers frame history, final-frame anchor and
-            # (when enabled) sound memory with the same exact cut boundaries.
+            # The standalone sampler currently accepts a continuation media path,
+            # not an arbitrary [start, end] interval. Prepare a frame-accurate
+            # LOSSLESS temporary segment from the original source; never feed a
+            # second lossy H.264/AAC encode to the VAE or audio memory. The original
+            # file is unchanged. A future runtime API can eliminate this proxy.
             start = max(0.0, float(ns.continue_trim_in))
             end = ns.continue_trim_out
             source = Path(ns.continue_video)
@@ -383,14 +385,14 @@ def main():
                 ok, msg = ensure_ffmpeg_tools(lambda line: print(line, flush=True))
                 if not ok:
                     raise RuntimeError(f"FFmpeg unavailable for timeline continuation trim: {msg}")
-                proxy = td / "timeline_visible_predecessor.mp4"
+                proxy = td / "timeline_visible_predecessor_lossless.mkv"
                 command = [str(tool_path("ffmpeg.exe")), "-y", "-nostdin", "-hide_banner",
                            "-loglevel", "error", "-ss", f"{start:.6f}", "-i", str(source),
                            "-t", f"{end-start:.6f}", "-map", "0:v:0", "-map", "0:a?",
-                           "-vf", "fps=24", "-c:v", "libx264", "-preset", "fast", "-crf", "16",
-                           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                           "-avoid_negative_ts", "make_zero", str(proxy)]
-                print(f"[TIMELINE TRIM] Continuation source: {source}", flush=True)
+                           "-map_metadata", "0", "-vf", "fps=24",
+                           "-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p",
+                           "-c:a", "pcm_s16le", "-avoid_negative_ts", "make_zero", str(proxy)]
+                print(f"[TIMELINE TRIM] Lossless FFV1/PCM continuation (no CRF/AAC re-encoding): {source}", flush=True)
                 print(f"[TIMELINE TRIM] Visible range: {start:.3f}s to {end:.3f}s (source {duration:.3f}s)", flush=True)
                 subprocess.check_call(command, cwd=ROOT)
                 if not proxy.is_file() or proxy.stat().st_size == 0:
