@@ -5480,7 +5480,7 @@ class MainWindow(QMainWindow):
         folder = self.current_output_dir(); folder.mkdir(parents=True, exist_ok=True)
         name = self.output_name.text().strip()
         if not name:
-            prefix = "minimax_h3_ref2va_int4" if mode == 2 else "minimax_h3_int4"
+            prefix = "minimax_h3_ref2va" if mode == 2 else "minimax_h3"
             name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         if not name.lower().endswith(".mp4"): name += ".mp4"
         return folder / Path(name).name

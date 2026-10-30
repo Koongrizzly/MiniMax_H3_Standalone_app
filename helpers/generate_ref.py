@@ -207,7 +207,7 @@ def main():
         return 2
     if ns.seed < 0: ns.seed = int.from_bytes(os.urandom(4), "little") % 99_000_000
     else: ns.seed = int(ns.seed) % 99_000_000
-    out = Path(ns.output) if ns.output else ROOT / "output" / f"minimax_h3_ref2va_int4_{time.strftime('%Y%m%d_%H%M%S')}.mp4"; out.parent.mkdir(parents=True, exist_ok=True)
+    out = Path(ns.output) if ns.output else ROOT / "output" / f"minimax_h3_ref2va_{time.strftime('%Y%m%d_%H%M%S')}.mp4"; out.parent.mkdir(parents=True, exist_ok=True)
     print(f"MiniMax-H3 Ref2VA W4A8 | {ns.width}x{ns.height} | requested frames={ns.frames} | steps={ns.steps} | CFG={ns.cfg:g} | shift={ns.shift:g} | audio shift={ns.audio_shift:g} | seed={ns.seed}", flush=True)
     print(f"Using checkpoint: {Path(ref).name}", flush=True)
     print(f"Using text encoder: {Path(te).name}", flush=True)

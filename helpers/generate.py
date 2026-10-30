@@ -227,7 +227,7 @@ def main():
         managed_sample_stages = [x for x in ("reference", "text", "diffusion") if stage_plan["stages"][x]["use_manager"]]
         use_vram_manager = bool(managed_sample_stages)
 
-    out = Path(ns.output) if ns.output else ROOT / "output" / f"minimax_h3_int4_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    out = Path(ns.output) if ns.output else ROOT / "output" / f"minimax_h3_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def _ffprobe_has_audio(ffprobe, path):

@@ -759,6 +759,7 @@ class MusicProject:
     turbo_lora_strength: float = 1.0
     randomize_reference_characters: bool = False
     fixed_cast_prompt_mode: bool = False
+    help_avoid_duplicates: bool = False
     unlimited_random_references: bool = False
     single_character_reference_per_clip: bool = False
     reference_random_seed: int = -1
@@ -1501,22 +1502,23 @@ def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selec
     if creative:
         out.append("Creative direction: " + creative + ".")
 
+    avoid_duplicates = bool(getattr(project, "help_avoid_duplicates", False))
     out += ["", "[SCENE DESCRIPTION]"]
-    if room_nums:
+    if room_nums and not avoid_duplicates:
         out.append(f"The entire sequence takes place in {fmt(room_nums)}. The referenced location supplies the real walls, floor, depth and environmental lighting in each camera view.")
     elif location:
         out.append("Location: " + location.strip().rstrip(".") + ".")
     else:
         out.append("A consistent, physically believable setting appropriate to the chosen visual references.")
-    if char_nums:
+    if char_nums and not avoid_duplicates:
         out.append(f"The referenced characters are {fmt(char_nums)}, retaining their own referenced appearances and positions.")
-    if obj_nums:
+    if obj_nums and not avoid_duplicates:
         out.append(f"Use {fmt(obj_nums)} as referenced physical objects or props in the scene.")
-    if style_nums:
+    if style_nums and not avoid_duplicates:
         out.append(f"Use {fmt(style_nums)} as visual mood references.")
-    if anchors:
+    if anchors and not avoid_duplicates:
         out.append("Use " + ", ".join(f"<Picture {n}>" for n in anchors) + " as framing/composition guidance.")
-    if location and room_nums:
+    if location and room_nums and not avoid_duplicates:
         out.append("Scene direction: " + location.strip().rstrip(".") + ".")
     if story:
         out.append(story.strip().rstrip(".") + ".")
@@ -1584,6 +1586,32 @@ def _migrate_saved_creative_pool_prompt(project: MusicProject, shot: MusicShot, 
     return prompt
 
 
+def _apply_duplicate_avoidance(project: MusicProject, prompt: str) -> str:
+    """Keep references/subject definitions; omit subject callouts in scene/shots.
+
+    Applies to saved Director prompts as well as newly built prompts. Preserve
+    manually edited lines that do not contain reference subject markers.
+    """
+    if not bool(getattr(project, "help_avoid_duplicates", False)):
+        return prompt
+    lines = prompt.split("\n")
+    in_scene = False
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[SCENE DESCRIPTION]":
+            in_scene = True
+        elif stripped.startswith("[") and stripped.endswith("]") and stripped != "[SCENE DESCRIPTION]":
+            # Shot directions may use [shot ...] inside the scene block.
+            if not re.match(r"\[shot\s+\d+", stripped, re.IGNORECASE):
+                in_scene = False
+        if in_scene and (re.search(r"<Subject\s+\d+>", line, re.IGNORECASE) or
+                         re.search(r"^Use\s+<Picture\s+\d+>.*as framing/composition guidance\.", stripped, re.IGNORECASE)):
+            continue
+        result.append(line)
+    return "\n".join(result)
+
+
 def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_refs: List[ReferenceAsset]) -> str:
     """Return the exact Director prompt for generation when one exists.
 
@@ -1594,13 +1622,13 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
     """
     saved_prompt = (shot.prompt or "").strip()
     if saved_prompt:
-        migrated_prompt = _migrate_saved_creative_pool_prompt(project, shot, saved_prompt)
+        migrated_prompt = _apply_duplicate_avoidance(project, _migrate_saved_creative_pool_prompt(project, shot, saved_prompt))
         if migrated_prompt != saved_prompt:
             # Persist the repaired prompt so the Director view, retries, queue sidecar
             # and subsequent saves all agree on the exact prompt used for generation.
             shot.prompt = migrated_prompt
         return migrated_prompt
-    prompt = build_h3_reference_prompt(project, shot, selected_refs)
+    prompt = _apply_duplicate_avoidance(project, build_h3_reference_prompt(project, shot, selected_refs))
     shot.prompt = prompt
     return prompt
 
@@ -2808,6 +2836,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.check_fixed_cast_prompt = QCheckBox("Fixed cast", body)
         self.check_fixed_cast_prompt.setToolTip("Keep selected characters and their roles consistent across clips, using clear scene and camera instructions. Randomized reference mode uses its own behavior.")
         lay.addWidget(self.check_fixed_cast_prompt)
+        self.check_help_avoid_duplicates = QCheckBox("Help avoid duplicates", body)
+        self.check_help_avoid_duplicates.setToolTip("if you get duplicated characters, try enabling this")
+        lay.addWidget(self.check_help_avoid_duplicates)
         self.check_randomize_ref_characters = QCheckBox("Randomize references per clip", body)
         self.check_randomize_ref_characters.setToolTip(
             "Randomize reference selection per shot. Character references keep the existing one-or-two random behavior. "
@@ -3156,6 +3187,7 @@ class MiniMaxMusicClipWidget(QWidget):
         # snapshotted only when a generation job is actually prepared. This keeps
         # an old project's historical generation snapshot intact while merely reviewing it.
         self.project.fixed_cast_prompt_mode = bool(self.check_fixed_cast_prompt.isChecked())
+        self.project.help_avoid_duplicates = bool(self.check_help_avoid_duplicates.isChecked())
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.unlimited_random_references = bool(self.project.randomize_reference_characters and self.check_unlimited_random_refs.isChecked())
         self.project.single_character_reference_per_clip = bool(self.check_single_character_ref.isChecked())
@@ -3174,6 +3206,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.slider_frames.setValue(nearest_idx)
         self.spin_head.setValue(p.head_padding); self.spin_tail.setValue(p.tail_padding); self.spin_snap.setValue(p.phrase_snap_tolerance)
         self.check_fixed_cast_prompt.setChecked(bool(getattr(p, "fixed_cast_prompt_mode", False)))
+        self.check_help_avoid_duplicates.setChecked(bool(getattr(p, "help_avoid_duplicates", False)))
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self.check_unlimited_random_refs.setChecked(bool(getattr(p, "unlimited_random_references", False)))
         self.check_single_character_ref.setChecked(bool(getattr(p, "single_character_reference_per_clip", False)))
@@ -3330,7 +3363,7 @@ class MiniMaxMusicClipWidget(QWidget):
         for name in (
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
             "phrase_snap_tolerance", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
-            "randomize_reference_characters", "fixed_cast_prompt_mode", "unlimited_random_references", "single_character_reference_per_clip",
+            "randomize_reference_characters", "fixed_cast_prompt_mode", "help_avoid_duplicates", "unlimited_random_references", "single_character_reference_per_clip",
         ):
             setattr(self.project, name, getattr(old, name))
         self._refresh_generation_settings_snapshot()
@@ -4383,6 +4416,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.tail_padding = float(data.get("tail_padding", self.project.tail_padding))
                 self.project.phrase_snap_tolerance = float(data.get("phrase_snap_tolerance", self.project.phrase_snap_tolerance))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
+                self.project.help_avoid_duplicates = bool(data.get("help_avoid_duplicates", self.project.help_avoid_duplicates))
                 self.project.unlimited_random_references = bool(data.get("unlimited_random_references", self.project.unlimited_random_references))
                 self.project.single_character_reference_per_clip = bool(data.get("single_character_reference_per_clip", self.project.single_character_reference_per_clip))
         except Exception:
@@ -4401,6 +4435,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "tail_padding": self.project.tail_padding,
                 "phrase_snap_tolerance": self.project.phrase_snap_tolerance,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
+                "help_avoid_duplicates": self.project.help_avoid_duplicates,
                 "unlimited_random_references": self.project.unlimited_random_references,
                 "single_character_reference_per_clip": self.project.single_character_reference_per_clip,
             }
