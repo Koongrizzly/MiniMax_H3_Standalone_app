@@ -1442,6 +1442,36 @@ def _creative_pool_choice(value: str, shot_index: int, *, allow_commas: bool = F
     return items[idx], len(items)
 
 
+def _shot_needs_dance_action(project: MusicProject, shot: MusicShot) -> bool:
+    """An empty Whisper clip, or explicit instrumental mode, gets dance direction."""
+    return not project.lyrics or not _clean_whisper_lyric_text(shot.lyrics or "").strip()
+
+
+def _apply_instrumental_dance_action(project: MusicProject, shot: MusicShot, prompt: str) -> str:
+    """Adjust the scene only; leave references, subject definitions and manual edits intact."""
+    if not _shot_needs_dance_action(project, shot):
+        return prompt
+    lines = prompt.split("\n")
+    in_scene = False
+    scene_header = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[SCENE DESCRIPTION]":
+            in_scene = True
+            scene_header = i
+            continue
+        if in_scene and stripped.startswith("[") and stripped.endswith("]") and not re.match(r"\[shot\s+\d+", stripped, re.IGNORECASE):
+            break
+        if in_scene and re.search(r"\bdance action\b", line, re.IGNORECASE):
+            return prompt
+        if in_scene and re.search(r"\bnatural action\b", line, re.IGNORECASE):
+            lines[i] = re.sub(r"\bnatural action\b", "natural dance action", line, count=1, flags=re.IGNORECASE)
+            return "\n".join(lines)
+    if scene_header >= 0:
+        lines.insert(scene_header + 1, "Create energetic, natural dance action driven by the music in the referenced environment.")
+    return "\n".join(lines)
+
+
 def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selected_refs: Sequence[ReferenceAsset]) -> str:
     """Structured MiniMax music prompt using the fixed six-block order only.
     Creative shot direction lives inside [SCENE DESCRIPTION].
@@ -1534,7 +1564,7 @@ def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selec
         "", "[non_diegetic_music:]",
         "<Audio 1>: the original supplied music segment, preserved continuously at its exact timing."
     ]
-    return "\n".join(out)
+    return _apply_instrumental_dance_action(project, shot, "\n".join(out))
 
 
 def build_fixed_cast_prompt(project: MusicProject, shot: MusicShot, selected_refs: Sequence[ReferenceAsset]) -> str:
@@ -1622,13 +1652,13 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
     """
     saved_prompt = (shot.prompt or "").strip()
     if saved_prompt:
-        migrated_prompt = _apply_duplicate_avoidance(project, _migrate_saved_creative_pool_prompt(project, shot, saved_prompt))
+        migrated_prompt = _apply_instrumental_dance_action(project, shot, _apply_duplicate_avoidance(project, _migrate_saved_creative_pool_prompt(project, shot, saved_prompt)))
         if migrated_prompt != saved_prompt:
             # Persist the repaired prompt so the Director view, retries, queue sidecar
             # and subsequent saves all agree on the exact prompt used for generation.
             shot.prompt = migrated_prompt
         return migrated_prompt
-    prompt = _apply_duplicate_avoidance(project, build_h3_reference_prompt(project, shot, selected_refs))
+    prompt = _apply_instrumental_dance_action(project, shot, _apply_duplicate_avoidance(project, build_h3_reference_prompt(project, shot, selected_refs)))
     shot.prompt = prompt
     return prompt
 
