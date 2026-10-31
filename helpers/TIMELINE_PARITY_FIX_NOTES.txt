@@ -1,0 +1,29 @@
+GRIZZLYMAX / MINIMAX H3 — TIMELINE CONTINUATION PARITY FIX
+Source: newest helpers(5).zip (identical helpers in MiniMax_H3_Standalone_app(5).zip)
+Date: 2026-10-28
+
+CHANGES (helpers/minimax_h3_gui.py only)
+1. Native H3 continue-last queue lookup now ignores NVIDIA VSR and other utility jobs.
+2. Timeline no longer inherits automatic Generation-tab NVIDIA VSR. Use Timeline's explicit upscaler action separately.
+3. Timeline clips are enqueued in timeline order, and each queued Continue clip is pinned to its ACTUAL Timeline H3 predecessor rather than the last global queue job.
+4. Timeline result metadata is attached to the H3 job, never an unrelated postprocessing job.
+5. Audio memory now works with BOTH Continue last result and a manually selected Continue Video (including a previously rendered Timeline predecessor). The GUI had silently discarded it for manual paths.
+6. Fresh non-reference Timeline clips explicitly select T2VA (unless using the deliberate next-frame bridge, which selects FL2VA).
+7. Timeline queue logs now show chain settings and alert if the per-clip sampling settings differ from the current Generation tab.
+
+UNMODIFIED
+- runtime/headless_h3.py, runtime/sample_worker.py, runtime/sample_worker_ref.py
+- runtime/vram_manager.py and all VRAM settings
+- generate.py and generate_ref.py (inspected; no changes needed for these fixes)
+- Latent-guide and VAE implementations; no new experimental memory algorithm
+- Timeline trim handling, including its temporary FFmpeg proxy and latent fallback
+- Native audio/video model sampling behavior
+
+KNOWN LIMITATIONS
+No CUDA generation was possible in this environment. CPU regression checks verified the queue job selection, ordering, explicit H3 predecessor links, sound-memory settings and disabling inherited VSR. This patch fixes real queue/setting bugs; it does not guarantee zero color drift in every H3 continuation. In particular, trimmed Timeline clips still use a re-encoded predecessor proxy and native latent continuation is not made seamless by this patch.
+
+INSTALL
+Extract the FULL HELPERS ZIP into <your MiniMax H3 app>\helpers\, overwriting the eight .py files; or extract FULL APP ZIP into the MiniMax H3 app root. Use only ONE ZIP. Keep your models/environments/settings/output as they are. Restart the app after updating.
+
+TEST
+In Timeline Director, run three consecutive UNTRIMMED 124-frame clips at the same sampler/checkpoint as the working H3 GUI chain. Carry audio memory ON, native latent OFF initially; do not use any clip upscale in the test. Review the [TIMELINE H3 PARITY] lines in the Logs tab. Check raw individual clip outputs BEFORE assembly. Compare the same chain in Generation tab.

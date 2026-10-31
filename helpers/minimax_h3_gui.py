@@ -1163,7 +1163,7 @@ class MainWindow(QMainWindow):
         # splitter update.  Re-assert the Prompt Builder exception after each
         # queued layout refresh so it cannot regress a moment later.
         if hasattr(self, "tabs") and hasattr(self, "global_preview_host"):
-            self._enforce_prompt_builder_full_width()
+            self._enforce_full_width_workspace()
 
     def _build(self):
         root = QWidget(); outer = QVBoxLayout(root); outer.setContentsMargins(10, 10, 10, 10); outer.setSpacing(8)
@@ -1237,6 +1237,7 @@ class MainWindow(QMainWindow):
         self._build_queue_tab()
         self._build_music_clip_tab()
         self._build_timeline_tab()
+        self._build_beatsync_tab()
         self._build_settings_tab()
         if getattr(self, "timeline_widget", None) is not None:
             self.timeline_widget.initialize_from_current_settings()
@@ -2084,6 +2085,8 @@ class MainWindow(QMainWindow):
     def _short_model(self, job):
         if job.get("job_type") == "timeline_assembly":
             return "Timeline assembly"
+        if job.get("job_type") == "beatsyncfx":
+            return "BeatSyncFX render"
         return job.get("model_label") or ("Ref2VA INT4" if job.get("mode")==2 else "FL2VA INT4")
 
     def _probe_clip_duration(self, output_path, frames=None):
@@ -2897,6 +2900,108 @@ class MainWindow(QMainWindow):
             lay.addStretch(1)
             self.music_clip_tab_index = self.tabs.addTab(page, "Music Clip Creator")
             self.tabs.tabBar().setTabData(self.music_clip_tab_index, "music_clip_creator")
+
+    def _build_beatsync_tab(self):
+        """Mount the real BeatSyncFX editor, without launching its standalone window."""
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 4, 4, 4)
+        self.beatsync_widget = None
+        try:
+            from BeatSyncFX.helpers.gui import MainWindow as BeatSyncWindow
+            editor = BeatSyncWindow()
+            self.beatsync_widget = editor
+            # Reparent the editor's content; never embed a second QMainWindow.
+            content = editor.takeCentralWidget()
+            content.setParent(page)
+            layout.addWidget(content, 1)
+            editor._embedded_content = content
+            # Rendering belongs exclusively to the host queue in embedded mode.
+            editor.export = self._queue_beatsync_render
+            # The host footer is the single render entry point in embedded mode.
+            editor.export_button.hide()
+            # Export/help contains a separate render action; replace its connection too.
+            for child in content.findChildren(QPushButton):
+                if child.text() == "Render MP4...":
+                    child.hide()
+            editor.cancel_button.hide()
+            editor.progress.hide()
+            # GrizzlyMax owns the FFmpeg binaries; do not require another installation.
+            editor.ffmpeg = str(ffmpeg_tool_path("ffmpeg.exe"))
+            editor.ffprobe = str(ffmpeg_tool_path("ffprobe.exe"))
+            # Keep the complete native BeatSyncFX preview, timeline controls,
+            # and interactive drawing canvas visible in the embedded editor.
+            # GrizzlyMax's global preview is hidden while this tab is active.
+            self.beatsync_page = page
+            self.beatsync_tab_index = self.tabs.addTab(page, "BeatSyncFX")
+            self.tabs.tabBar().setTabData(self.beatsync_tab_index, "beatsyncfx")
+        except Exception as exc:
+            warning = QLabel("BeatSyncFX could not be initialized:\n" + str(exc))
+            warning.setWordWrap(True)
+            layout.addWidget(warning)
+            self.beatsync_page = page
+            self.beatsync_tab_index = self.tabs.addTab(page, "BeatSyncFX")
+            self.tabs.tabBar().setTabData(self.beatsync_tab_index, "beatsyncfx")
+            self.append_log("BeatSyncFX initialization failed: " + repr(exc) + "\n")
+
+    def _queue_beatsync_render(self):
+        editor = getattr(self, "beatsync_widget", None)
+        if editor is None:
+            QMessageBox.warning(self, "BeatSyncFX", "The editor has not loaded.")
+            return
+        source = str(editor.project.get("video") or "")
+        if not Path(source).is_file():
+            QMessageBox.warning(self, "BeatSyncFX", "Open a source video in BeatSyncFX first.")
+            return
+        ffmpeg = ffmpeg_tool_path("ffmpeg.exe")
+        if not ffmpeg.is_file():
+            self._ensure_ffmpeg_async()
+            QMessageBox.warning(self, "BeatSyncFX", "GrizzlyMax FFmpeg is not ready yet.")
+            return
+        default = str(ROOT / "output" / (Path(source).stem + "_beatsync.mp4"))
+        output, _ = QFileDialog.getSaveFileName(self, "Queue BeatSyncFX render", default, "MP4 video (*.mp4)")
+        if not output:
+            return
+        if not output.lower().endswith(".mp4"):
+            output += ".mp4"
+        if Path(output).resolve() == Path(source).resolve():
+            QMessageBox.warning(self, "BeatSyncFX", "Source and output cannot be the same file.")
+            return
+        if any(j.get("state") in ("pending", "running") and
+               Path(str(j.get("output") or "")).resolve() == Path(output).resolve()
+               for j in self.queue_jobs):
+            QMessageBox.warning(self, "BeatSyncFX", "Another queued job already uses this output filename.")
+            return
+        # Snapshot avoids changing an already queued job when the project is edited.
+        import copy as _copy
+        snapshot = _copy.deepcopy(editor.project)
+        job_id = uuid.uuid4().hex
+        snapshot_path = ROOT / "jobs" / "beatsyncfx" / (job_id + ".json")
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        python_exe = str(PYTHON)
+        if not Path(python_exe).is_file():
+            QMessageBox.warning(self, "BeatSyncFX", "GrizzlyMax Python environment has not been installed.")
+            snapshot_path.unlink(missing_ok=True)
+            return
+        job = {
+            "id": job_id, "job_number": self._take_next_job_number(),
+            "job_type": "beatsyncfx", "state": "pending", "created_at": time.time(),
+            "started_at": None, "finished_at": None, "elapsed": 0,
+            "mode": -1, "mode_name": "BeatSyncFX render", "model_label": "BeatSyncFX render",
+            "output": output, "seed": "—", "resolution": f"{snapshot.get('width')} × {snapshot.get('height')}",
+            "frames": None, "steps": None, "prompt": "Effects: " + Path(source).name,
+            "args": ["-m", "BeatSyncFX.helpers.queue_render", str(snapshot_path), str(ffmpeg), output],
+            "queue_program": python_exe, "progress": None, "phase": "Waiting to render",
+            "error": "", "settings": {}, "log_tail": "", "beatsync_snapshot": str(snapshot_path),
+            "continue_last_result": False, "manual_continue_video": "", "glue_results": False,
+        }
+        self.queue_jobs.append(job)
+        self._save_queue_state()
+        self._refresh_queue_views()
+        self.status.setText("BeatSyncFX render added to queue")
+        self.append_log("BeatSyncFX queued: " + output + "\n")
+        self._start_next_pending()
 
     def _build_timeline_tab(self):
         # The timeline owns its project/chunk/CUT model in minimax_timeline.py.
@@ -4697,9 +4802,13 @@ class MainWindow(QMainWindow):
             and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
         )
         is_timeline = getattr(self, "timeline_tab_index", -1) == self.tabs.currentIndex()
+        is_beatsync = self._beatsync_is_active()
         if hasattr(self, "gen"):
             self.gen.setEnabled(True)
-            if is_music:
+            if is_beatsync:
+                self.gen.setText("Render video")
+                self.gen.setToolTip("Add a snapshot of the BeatSyncFX effects project to the GrizzlyMax render queue.")
+            elif is_music:
                 self.gen.setText("Create video clip")
                 self.gen.setToolTip(
                     "Analyze the selected song, use Whisper lyric timing when enabled, build the H3 shot list, queue every missing clip, then queue final trim/assembly."
@@ -4712,6 +4821,9 @@ class MainWindow(QMainWindow):
                 self.gen.setToolTip("Add the current MiniMax generation job to the queue.")
 
     def _main_generate_action(self):
+        if self._beatsync_is_active():
+            self._queue_beatsync_render()
+            return
         if getattr(self, "timeline_tab_index", -1) == self.tabs.currentIndex():
             timeline = getattr(self, "timeline_widget", None)
             if timeline is not None:
@@ -5151,6 +5263,25 @@ class MainWindow(QMainWindow):
         except (RuntimeError, AttributeError, TypeError, ValueError):
             return False
 
+    def _beatsync_is_active(self):
+        """Identify the BeatSyncFX page by widget, even after tab reordering."""
+        try:
+            page = getattr(self, "beatsync_page", None)
+            return page is not None and self.tabs.currentWidget() is page
+        except (RuntimeError, AttributeError):
+            return False
+
+    def _enforce_full_width_workspace(self, *_args):
+        """Both Prompt Builder and BeatSyncFX use the complete tab workspace."""
+        if self._prompt_builder_is_active() or self._beatsync_is_active():
+            try:
+                self.global_preview_host.hide()
+                total = max(1000, self.global_preview_splitter.width())
+                self.global_preview_splitter.setSizes([0, total])
+                self.global_preview_splitter.updateGeometry()
+            except (RuntimeError, AttributeError, TypeError, ValueError):
+                pass
+
     def _enforce_prompt_builder_full_width(self, *_args):
         """Keep Prompt Builder full width through delayed WebEngine reloads."""
         if not self._prompt_builder_is_active():
@@ -5178,8 +5309,8 @@ class MainWindow(QMainWindow):
 
             # Use the selected page itself rather than relying on a cached tab
             # index. This remains correct through delayed builder startup/reload.
-            if self._prompt_builder_is_active():
-                self._enforce_prompt_builder_full_width()
+            if self._prompt_builder_is_active() or self._beatsync_is_active():
+                self._enforce_full_width_workspace()
                 self._schedule_layout_refresh()
                 return
 
@@ -5323,7 +5454,7 @@ class MainWindow(QMainWindow):
         self.builder_start_btn.setToolTip("Start or restart the local Hailuo H3 Prompt Builder server bundled with this standalone app.")
         self.builder_browser_btn.setToolTip("Open the same local Prompt Builder in your default web browser.")
         self.builder_transfer_btn.setToolTip("Copy the finished H3 prompt into the Generation tab. Supported aspect ratio and nearest approved frame preset are transferred too.")
-        self.gen.setToolTip("Add the current generation settings as a queue job. If nothing is running it starts immediately; otherwise it waits in Pending. This button remains available on every tab.")
+        self.gen.setToolTip("Add the current generation settings as a queue job. If nothing is running it starts immediately; otherwise it waits in Pending.")
         self.cancel.setToolTip("Cancel the currently running queue job completely. Use the Queue tab context menu to cancel and move it back to Pending instead.")
         self.info_btn.setToolTip("Open the GrizzlyMax feature list in your default web browser.")
         self.openout.setToolTip("Open the configured output folder in Windows Explorer.")
@@ -5596,6 +5727,13 @@ class MainWindow(QMainWindow):
             for raw in text.replace("\r", "\n").splitlines():
                 line = raw.strip()
                 if not line: continue
+                if job.get("job_type") == "beatsyncfx" and line.startswith("BEATSYNC_PROGRESS "):
+                    try:
+                        job["progress"] = max(0, min(100, int(line.split()[1])))
+                        job["phase"] = "Rendering effects"
+                    except (ValueError, IndexError):
+                        pass
+                    continue
                 m = re.search(r"(?:^|\s)(\d{1,3})%\|", line)
                 if m:
                     job["progress"] = max(0,min(100,int(m.group(1)))); job["phase"] = "Sampling"
