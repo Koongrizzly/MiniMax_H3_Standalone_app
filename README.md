@@ -1,4 +1,4 @@
-![MiniMax H3 INT4 Standalone](/presets/setsave/2026_09_19_10_57_07.jpg)
+![MiniMax H3 INT4 Standalone](/presets/setsave/2026-11-01%2010_14_23-.jpg)
 
 # MiniMax H3 Standalone
 ---
@@ -53,7 +53,7 @@ Main Features :
 
 - 10/31/2026 :
   BeatSyncFX (Slopcore creator)
-
+![MiniMax H3 INT4 Standalone](/presets/setsave/2026-11-01%2010_16_09-.jpg)
   - Full blown text and effects overlay creation in the new BeatSyncFX tab.
   - create stunning beat synced slopcore effects or overlays, add lyrics or subtitles, track objects or faces with brackets etc yourself or give it to your favorite agent.
   - save templates for later use
