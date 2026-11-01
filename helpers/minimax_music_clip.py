@@ -161,7 +161,8 @@ PROJECT_MARKER_NAME = ".minimax_music_project.json"
 PROJECT_ASSETS_DIRNAME = "project_assets"
 _PROJECT_MANIFEST_LOCK = threading.Lock()
 WHISPER_DIR = ROOT / "presets" / "bin" / "whisper"
-WHISPER_MODEL = WHISPER_DIR / "ggml-small.bin"
+_SHARED_WHISPER_MEDIUM = ROOT / 'models' / 'whisper' / 'ggml-medium.bin'
+WHISPER_MODEL = _SHARED_WHISPER_MEDIUM if _SHARED_WHISPER_MEDIUM.is_file() else WHISPER_DIR / "ggml-small.bin"
 WHISPER_RUNTIME_ZIP = WHISPER_DIR / "_whisper_runtime.zip"
 WHISPER_RUNTIME_URL = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-bin-x64.zip"
 WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin?download=true"

@@ -1097,7 +1097,7 @@ class MainWindow(QMainWindow):
         self._init_telegram_remote()
         self._sync_resolution()
         self._sync_mode()
-        QTimer.singleShot(300, self.validate_install)
+        QTimer.singleShot(300, lambda: self.validate_install(interactive=False))
         QTimer.singleShot(700, self._recover_interrupted_job)
         QTimer.singleShot(1000, self._ensure_ffmpeg_async)
         QTimer.singleShot(10000, self._startup_update_check)
@@ -1249,7 +1249,7 @@ class MainWindow(QMainWindow):
         self.gen = QPushButton("Generate"); self.gen.setObjectName("primary"); self.gen.clicked.connect(self._main_generate_action)
         self.cancel = QPushButton("Cancel"); self.cancel.clicked.connect(self.cancel_job); self.cancel.setEnabled(False)
         self.info_btn = QPushButton("Info"); self.info_btn.clicked.connect(self.open_feature_list)
-        val = QPushButton("Validate install"); val.clicked.connect(self.validate_install)
+        val = QPushButton("Validate install"); val.clicked.connect(lambda: self.validate_install(interactive=True))
         self.openout = QPushButton("Open output folder"); self.openout.clicked.connect(self.open_output_folder)
         controls.addWidget(self.gen); controls.addWidget(self.cancel); controls.addStretch(); controls.addWidget(self.info_btn); controls.addWidget(val); controls.addWidget(self.openout)
         outer.addWidget(bar, 0)
@@ -6760,7 +6760,19 @@ exit /b %RC%
             except Exception as exc:
                 QMessageBox.warning(self, "Restart", f"The update is installed, but the app could not restart automatically.\n\n{exc}\n\nPlease restart it manually.")
 
-    def validate_install(self):
+    def validate_install(self, interactive=True):
+        # The startup model-only validation stays silent. The footer button opens
+        # an actionable preflight for all portable subcomponents.
+        if interactive:
+            try:
+                from helpers.install_preflight import PreflightDialog
+                dialog = PreflightDialog(self)
+                dialog.exec()
+            except Exception as exc:
+                QMessageBox.warning(self, 'Installation preflight', f'Unable to scan optional components: {exc}')
+        self._validate_minimax_models()
+
+    def _validate_minimax_models(self):
         if not PYTHON.is_file(): self.status.setText("Environment missing"); return
         mode = self.mode.currentIndex()
         if self.use_hybrid_model.isChecked():
