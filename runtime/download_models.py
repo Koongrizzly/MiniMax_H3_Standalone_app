@@ -482,13 +482,13 @@ def choose_loras() -> list[dict]:
 
 def main() -> int:
     print("=" * 68)
-    print("MiniMax-H3 INT4 W4A8 ConvRot model downloader v3.2")
+    print("MiniMax-H3 required components and LoRA setup")
     print(f"Source: {HF}/{REPO}")
     print("=" * 68)
-    print("Downloads selected files only - never a full repository snapshot.\n")
+    print("Verifying required text encoder and VAEs; optional LoRAs are discovered live.\n")
 
     files = repo_files()
-    selected_diffusion = choose_diffusion_models(files)
+    selected_diffusion = []  # Diffusion checkpoints are selected in the GUI Settings tab.
 
     required_common = [REMOTE_TE, REMOTE_VVAE, REMOTE_AVAE]
     missing = [p for p in required_common if p not in files]
@@ -508,7 +508,7 @@ def main() -> int:
             else:
                 print(f"  - Hybrid W4A8 diffusion model: {name}")
     else:
-        print("  - Diffusion models: skipped by user")
+        print("  - Diffusion checkpoint selection: managed in GUI Settings")
     print("  - W4A8 ConvRot text encoder")
     print("  - Mixed FP16/FP32 video VAE")
     print("  - FP32 audio VAE")
@@ -535,7 +535,8 @@ def main() -> int:
         download(item["path"], LORAS, Path(item["path"]).name)
 
     print("\nSelected MiniMax-H3 components are present.")
-    print("The downloader can be run again later to add the other model or newly published LoRAs.")
+    print("To find the latest INT4 / INT8 diffusion checkpoints, open GrizzlyMax Settings.")
+    print("You can rerun this helper to verify common components or add newly published LoRAs.")
     return 0
 
 
