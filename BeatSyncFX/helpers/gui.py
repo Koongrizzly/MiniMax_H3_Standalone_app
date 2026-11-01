@@ -668,6 +668,10 @@ class MainWindow(QMainWindow):
         mainbar.addWidget(button('Save project + template', self.save_project_dialog))
         mainbar.addWidget(button('Load template', self.load_template_dialog))
         mainbar.addWidget(button('Locate FFmpeg', self.choose_ffmpeg))
+        self.beatsync_setup_button = button('Setup BeatSyncFX', self.setup_beatsync_environment,
+                                           'Install or repair BeatSyncFX dependencies in its own portable environment')
+        mainbar.addWidget(self.beatsync_setup_button)
+        self._update_beatsync_setup_label()
         mainbar.addStretch()
         self.path_label = QLabel('No video selected')
         self.path_label.setMinimumWidth(180)
@@ -1330,6 +1334,55 @@ class MainWindow(QMainWindow):
                 self.music_player.setSource(QUrl.fromLocalFile(path))
                 self.audio_output.setMuted(True)
             self.status.setText(f'Replacement audio: {Path(path).name} (used for analysis and export)')
+
+    def _update_beatsync_setup_label(self):
+        """Only inspect our own environment; never use the GrizzlyMax Python installation."""
+        python_exe = ROOT / 'environments' / 'beatsyncfx' / 'Scripts' / 'python.exe'
+        ready = python_exe.is_file()
+        self.beatsync_setup_button.setText('Repair BeatSyncFX' if ready else 'Setup BeatSyncFX')
+        self.beatsync_setup_button.setToolTip(
+            'Run the portable BeatSyncFX dependency installer (also available standalone). '
+            + ('Environment found; click to check or repair.' if ready else 'Environment not installed yet.')
+        )
+
+    def setup_beatsync_environment(self, checked=False):
+        """Run the existing standalone installer in a separate console, without altering GrizzlyMax."""
+        import subprocess
+        installer = ROOT / 'setup_windows.bat'
+        python_exe = ROOT / 'environments' / 'beatsyncfx' / 'Scripts' / 'python.exe'
+        if not installer.is_file():
+            self.message(f'BeatSyncFX installer was not found:\n{installer}')
+            return
+        if os.name != 'nt':
+            self.message('The portable BeatSyncFX installer is for Windows only.')
+            return
+        status = 'installed' if python_exe.is_file() else 'not installed'
+        answer = QMessageBox.question(
+            self, 'Setup BeatSyncFX',
+            'BeatSyncFX keeps its Python packages in its own folder:\n'
+            f'{ROOT / "environments" / "beatsyncfx"}\n\n'
+            f'Current environment: {status}.\n\n'
+            'Run setup_windows.bat in a separate command window?\n'
+            'It will install or repair PySide6, NumPy and Pillow. '
+            'An internet connection is required for missing packages.\n\n'
+            'The GrizzlyMax environment will not be modified.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            # Run through cmd so native BAT commands work, keeping install output visible.
+            subprocess.Popen(['cmd.exe', '/c', str(installer)],
+                             cwd=str(ROOT),
+                             creationflags=subprocess.CREATE_NEW_CONSOLE)
+        except Exception as exc:
+            self.message(f'Unable to launch BeatSyncFX setup:\n{exc}')
+            return
+        self.status.setText('BeatSyncFX setup launched in a command window. Follow its instructions.')
+        QMessageBox.information(self, 'BeatSyncFX setup',
+                                'The installer is running in a separate command window.\n'
+                                'Complete the installer there. Restart BeatSyncFX if it was not installed before.')
+        self._update_beatsync_setup_label()
 
     def choose_ffmpeg(self):
         path,_=QFileDialog.getOpenFileName(self,'Choose ffmpeg executable',str(ROOT/'presets'/'bin'),
