@@ -97,12 +97,11 @@ def _cmd_for(key):
         py = ROOT/'environments/.minimax_h3_int4/python.exe'
         if not py.is_file(): py = ROOT/'environments/.minimax_h3_int4/Scripts/python.exe'
         if not py.is_file(): return None, None
-        return [str(py),'-c','from runtime.ffmpeg_tools import ensure_ffmpeg_tools; ok,msg=ensure_ffmpeg_tools(); print(msg); raise SystemExit(0 if ok else 1)'], ROOT
+        return [str(py), str(ROOT/'presets/extra_env/install_ffmpeg_bundle.py')], ROOT
     if key == 'shared_cpp_whisper':
-        py = ROOT/'environments/.minimax_h3_int4/python.exe'
-        if not py.is_file(): py = ROOT/'environments/.minimax_h3_int4/Scripts/python.exe'
-        if not py.is_file(): return None, None
-        return [str(py),'-c','from helpers.minimax_music_clip import _download_whisper_cpp_task; print(_download_whisper_cpp_task(print))'],ROOT
+        script = ROOT/'presets/extra_env/install_shared_whisper_cpp.bat'
+        if script.is_file(): return ['cmd.exe', '/c', str(script)], ROOT
+        return None, None
     if key == 'prompt_llama':
         py = ROOT/'environments/.minimax_h3_int4/python.exe'
         if not py.is_file(): py = ROOT/'environments/.minimax_h3_int4/Scripts/python.exe'
@@ -121,7 +120,7 @@ class PreflightDialog(QDialog):
         self.resize(780, 600)
         self.setMinimumWidth(600)
         outer = QVBoxLayout(self)
-        intro=QLabel('Detected components are listed below. Choose Install, Locate or Skip for missing items. Existing installations are not overwritten.\nFor current MiniMax H3 INT4 and INT8 diffusion checkpoints, open the Settings tab and use its checkpoint selector/download feature.\nWhisper.cpp is shared by Prompt Builder and Music Clip Creator; Faster-Whisper uses a different format and BeatSyncFX retains its own environment.\nPrompt Builder llama.cpp is optional; you can use the built-in or Ollama backend instead.')
+        intro=QLabel('Detected components are listed below. Choose Install, Locate or Skip for missing items. Existing installations are not overwritten.\nFor current MiniMax H3 INT4 and INT8 diffusion checkpoints, open the Settings tab and use its checkpoint selector/download feature.\nPrompt Builder llama.cpp is optional; you can use the built-in or Ollama backend instead.')
         intro.setWordWrap(True);outer.addWidget(intro)
         scroll=QScrollArea();scroll.setWidgetResizable(True);outer.addWidget(scroll,1)
         content=QWidget();self.rows=QVBoxLayout(content);scroll.setWidget(content)
@@ -202,9 +201,9 @@ class PreflightDialog(QDialog):
                 QMessageBox.warning(self,'Installer unavailable',f'Installer for {record["title"]} cannot run yet. Install GrizzlyMax/BeatSyncFX core environment first, then validate again.')
                 continue
             try:
-                subprocess.Popen(['cmd.exe','/k',subprocess.list2cmdline(command)],cwd=str(cwd),creationflags=getattr(subprocess,'CREATE_NEW_CONSOLE',0))
+                subprocess.Popen(command, cwd=str(cwd), creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0))
                 launched.append(record['title'])
             except OSError as exc: QMessageBox.warning(self,'Installer error',f'{record["title"]}: {exc}')
         self.refresh()
         if launched:
-            QMessageBox.information(self,'Installers launched','Installation windows opened for:\n'+ '\n'.join(launched)+'\n\nComplete those installations, then click Recheck. An opened installer does not mean installation succeeded.')
+            QMessageBox.information(self,'Installers launched','Installation windows opened for:\n'+ '\n'.join(launched)+'\n\nCheck each installer window for success or errors, then click Recheck.\nWhisper.cpp diagnostics: logs/install_shared_whisper_cpp.log')

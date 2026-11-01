@@ -6791,7 +6791,25 @@ exit /b %RC%
             if self.extended_logging.isChecked(): self.append_log(text + "\n")
             elif code != 0: self.append_log(text + "\n")
             else: self.append_log("Validation OK\n")
-            self.status.setText("Install OK" if code == 0 else "Validation failed")
+            # This is a MiniMax model/checkpoint check, not the installation
+            # preflight. Fresh installs intentionally have no diffusion model:
+            # those are selected/downloaded later in Settings.
+            if code == 0:
+                self.status.setText("MiniMax models ready")
+                self.status.setToolTip("Selected MiniMax checkpoint, text encoder and VAEs validated.")
+            else:
+                lower = text.lower()
+                missing_diffusion = any(token in lower for token in (
+                    "no fl2va model checkpoint found", "no ref2va model checkpoint found",
+                    "no compatible fl2va model", "no compatible ref2va model",
+                    "fl2va model: path does not exist", "ref2va model: path does not exist",
+                ))
+                if missing_diffusion:
+                    self.status.setText("Select checkpoint in Settings")
+                    self.status.setToolTip("Installation components are separate from model validation. Choose/download the current INT4 or INT8 checkpoint in Settings; see the log for any additional model errors.")
+                else:
+                    self.status.setText("MiniMax model check failed")
+                    self.status.setToolTip("Model validation failed. See the application log for missing/incompatible model files.")
         p.finished.connect(done); p.start(); self._validator = p
 
     def _unload_prompt_builder_llm_for_generation(self):
