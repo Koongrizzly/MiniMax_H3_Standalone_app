@@ -144,19 +144,40 @@ def load_project(path: str) -> dict:
     return project
 
 
+def ffmpeg_default_directory() -> Path:
+    """Prefer the host GrizzlyMax bundle when BeatSyncFX is embedded.
+
+    Standalone installs continue to use BeatSyncFX/presets/bin.
+    """
+    host_bundle = ROOT.parent / 'presets' / 'bin'
+    if (host_bundle / 'ffmpeg.exe').is_file() and (host_bundle / 'ffprobe.exe').is_file():
+        return host_bundle
+    return ROOT / 'presets' / 'bin'
+
+
 def locate_ffmpeg(saved: str = '') -> tuple[str, str]:
-    candidates = [saved, ROOT / 'presets/bin/ffmpeg.exe', ROOT / 'presets/bin/ffmpeg',
+    """Find a matched FFmpeg/FFprobe bundle, preferring the host by default.
+
+    An explicitly chosen saved path remains usable if it is a complete bundle.
+    A saved missing or incomplete bundle cannot hide a valid GrizzlyMax install.
+    """
+    host_bundle = ROOT.parent / 'presets' / 'bin'
+    own_bundle = ROOT / 'presets' / 'bin'
+    candidates = [saved,
+                  host_bundle / 'ffmpeg.exe', host_bundle / 'ffmpeg',
+                  own_bundle / 'ffmpeg.exe', own_bundle / 'ffmpeg',
                   shutil.which('ffmpeg')]
     for candidate in candidates:
         if not candidate:
             continue
         f = Path(candidate)
-        if f.is_file():
-            probe = f.with_name('ffprobe.exe' if f.suffix.lower() == '.exe' else 'ffprobe')
-            if not probe.is_file():
-                other = shutil.which('ffprobe')
-                probe = Path(other) if other else probe
-            return str(f), str(probe) if probe.is_file() else ''
+        if f.is_dir():
+            f = f / ('ffmpeg.exe' if (f / 'ffmpeg.exe').is_file() else 'ffmpeg')
+        if not f.is_file():
+            continue
+        probe = f.with_name('ffprobe.exe' if f.suffix.lower() == '.exe' else 'ffprobe')
+        if probe.is_file():
+            return str(f), str(probe)
     return '', ''
 
 

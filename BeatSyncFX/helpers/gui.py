@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from .core import (ROOT, new_project, load_project, save_project, load_settings,
-                  save_settings, save_effects_template, load_effects_template, locate_ffmpeg, probe_video, snap_beat, split_lyrics,
+                  save_settings, save_effects_template, load_effects_template, locate_ffmpeg, ffmpeg_default_directory, probe_video, snap_beat, split_lyrics,
                   import_slopcore_words, import_whisper_json, import_subtitles, import_beatmap)
 from .paint import paint_effects, MOTION_STUDIO_STYLES, BEAT_EFFECTS
 from .motion_math import ENTRIES, EXITS
@@ -667,7 +667,8 @@ class MainWindow(QMainWindow):
         mainbar.addWidget(button('Load project', self.load_project_dialog))
         mainbar.addWidget(button('Save project + template', self.save_project_dialog))
         mainbar.addWidget(button('Load template', self.load_template_dialog))
-        mainbar.addWidget(button('Locate FFmpeg', self.choose_ffmpeg))
+        self.ffmpeg_button = button('Re-locate FFmpeg' if self.ffmpeg and self.ffprobe else 'Locate FFmpeg', self.choose_ffmpeg)
+        mainbar.addWidget(self.ffmpeg_button)
         self.beatsync_setup_button = button('Setup BeatSyncFX', self.setup_beatsync_environment,
                                            'Install or repair BeatSyncFX dependencies in its own portable environment')
         mainbar.addWidget(self.beatsync_setup_button)
@@ -1385,7 +1386,7 @@ class MainWindow(QMainWindow):
         self._update_beatsync_setup_label()
 
     def choose_ffmpeg(self):
-        path,_=QFileDialog.getOpenFileName(self,'Choose ffmpeg executable',str(ROOT/'presets'/'bin'),
+        path,_=QFileDialog.getOpenFileName(self,'Choose ffmpeg executable',str(ffmpeg_default_directory()),
                                            'FFmpeg (ffmpeg.exe ffmpeg);;All files (*)')
         if path:
             newexe,newprobe=locate_ffmpeg(path)
@@ -1394,6 +1395,7 @@ class MainWindow(QMainWindow):
                 return
             self.ffmpeg,self.ffprobe=newexe,newprobe
             self.settings['ffmpeg']=newexe; save_settings(self.settings)
+            self.ffmpeg_button.setText('Re-locate FFmpeg')
             self.status.setText('FFmpeg configured: '+newexe)
 
     def load_project_dialog(self):
