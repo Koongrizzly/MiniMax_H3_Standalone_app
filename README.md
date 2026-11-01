@@ -57,10 +57,11 @@ Main Features :
   - Full blown text and effects overlay creation in the new BeatSyncFX tab.
   - create stunning beat synced slopcore effects or overlays, add lyrics or subtitles, track objects or faces with brackets (do this yourself or give it to your favorite agent)
   - save templates for later use
-  - allows loading png and gif files
+  - allows loading png and gif files on top of video footage.
   - built in 30+ effects + 10 global sound effects & 10 default subtitle effects
   - draw boxes, brackets.. around something and let them follow the subject as it moves
   - color picker, bpm analyzer, effects timeline with drag and rezize
+  - integrated with the GrizzlyMax queue and timeline director.
   - easy to use with agents such as codex, tell it where to find the video that needs effects, give it a  sample video of what you want and tell it to create the templates for the full video
   The next video clip was created from scratch with the Grizzlymax music clip creator and this new tool with the help of Codex to add all the text and effects (original footage 1600x896, upscaled wuth VSR x2)
 ---
@@ -96,7 +97,7 @@ Main Features :
   
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026-09-25%2023_13_56-.jpg)
 
-Watch a 6 minute shortfilm made from scratch with the timeline director on youtube (click the image below)
+Watch a 6 minute shortfilm made from scratch with the timeline director.
 
 
   <p align="center">
@@ -111,7 +112,7 @@ Watch a 6 minute shortfilm made from scratch with the timeline director on youtu
 
 <p align="center">
   <a href="https://youtu.be/uye8BzmC_jE">
-    ▶ Watch the full video on YouTube
+    ▶ Watch the example on YouTube
   </a>
 </p>
 
