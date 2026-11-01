@@ -9,12 +9,11 @@ if exist "%CD%\helpers\generate_ref.py" if exist "%CD%\generate_ref.py" del /q "
 title MiniMax-H3 INT4 ConvRot Standalone Installer
 
 echo ============================================================
-echo MiniMax-H3 INT4 W4A8 ConvRot Standalone - CLEAN INSTALL
+echo MiniMax-H3 INT4/INT8 W4A8 ConvRot Standalone - CLEAN INSTALL
 echo ============================================================
 echo.
 echo This creates an isolated Python environment and runtime.
-echo After the runtime install finishes, the model downloader starts
-echo automatically and lets you choose FL2VA, Ref2VA, both, and LoRAs.
+echo.Make sure (at least) Miniconda is installed on your system.
 echo.
 
 REM ------------------------------------------------------------
