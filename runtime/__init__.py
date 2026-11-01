@@ -1,1 +1,1 @@
-"""MiniMax-H3 standalone runtime."""
+"""GrizzlyMax runtime utilities."""
