@@ -55,7 +55,7 @@ Main Features :
   BeatSyncFX (Slopcore creator)
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026-11-01%2010_16_09-.jpg)
   - Full blown text and effects overlay creation in the new BeatSyncFX tab.
-  - create stunning beat synced slopcore effects or overlays, add lyrics or subtitles, track objects or faces with brackets etc yourself or give it to your favorite agent.
+  - create stunning beat synced slopcore effects or overlays, add lyrics or subtitles, track objects or faces with brackets (do this yourself or give it to your favorite agent)
   - save templates for later use
   - allows loading png and gif files
   - built in 30+ effects + 10 global sound effects & 10 default subtitle effects
