@@ -1,1 +1,0 @@
-"""BeatSync FX application modules."""
