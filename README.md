@@ -29,6 +29,8 @@ Main Features :
 
 - Music video clip creator
 
+- Text and effects overlay creation (beatsyncFX)
+
 - Preview pane with repeat, fullscreen, slider, zoom & panning. 
 
 - Integrated H3 Prompt Builder with presets
@@ -59,7 +61,13 @@ Main Features :
   - built in 30+ effects + 10 global sound effects & 10 default subtitle effects
   - draw boxes, brackets.. around something and let them follow the subject as it moves
   - color picker, bpm analyzer, effects timeline with drag and rezize
-  - much more 
+  - easy to use with agents such as codex, tell it where to find the video that needs effects, give it a  sample video of what you want and tell it to create the templates for the full video
+  The next video clip was created from scratch with Grizzlymax and this new tool with the help of Codex to add all the text and effects
+---
+
+[![Watch Example on YouTube](https://img.youtube.com/vi/7y6fabhdXiI/maxresdefault.jpg)](https://youtu.be/7y6fabhdXiI)
+
+---
 
 
 - 10/10/26 :
