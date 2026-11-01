@@ -15,7 +15,7 @@ except Exception:
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
-    QPlainTextEdit, QLineEdit, QFileDialog, QMessageBox, QTabWidget, QScrollArea,
+    QPlainTextEdit, QLineEdit, QFileDialog, QMessageBox, QTabWidget, QTabBar, QScrollArea,
     QCheckBox, QListWidget, QListWidgetItem, QFrame, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QMenu, QSplitter, QSlider, QProgressBar, QGraphicsView, QGraphicsScene,
     QDialog, QDialogButtonBox, QAbstractItemView, QLayout, QSizePolicy
@@ -1217,6 +1217,18 @@ class MainWindow(QMainWindow):
         # navigation buttons only while there is an overflow.
         self.tabs.setUsesScrollButtons(True)
         self.tabs.setDocumentMode(True)
+        # The navigation bar lives ABOVE the preview/content splitter.  Keeping
+        # it outside the splitter prevents tab movement/overflow when the shared
+        # preview is hidden by Prompt Builder or BeatSyncFX.
+        self.workspace_tab_bar = QTabBar(root)
+        self.workspace_tab_bar.setMovable(True)
+        self.workspace_tab_bar.setUsesScrollButtons(True)
+        self.workspace_tab_bar.setExpanding(True)
+        self.workspace_tab_bar.setDocumentMode(True)
+        outer.addWidget(self.workspace_tab_bar, 0)
+        # QTabWidget still owns page stacking and saved tab order. Its internal
+        # bar stays present for Qt bookkeeping but occupies no visible space.
+        self.tabs.tabBar().setFixedHeight(0)
         # Do not let the largest tab's sizeHint impose an artificial minimum on
         # the right side of the global splitter.  Several tabs contain wide
         # controls, but they are already scrollable; the preview must still be
@@ -1242,6 +1254,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "timeline_widget", None) is not None:
             self.timeline_widget.initialize_from_current_settings()
         self._adopt_global_preview_pane()
+        self._initialize_workspace_tab_bar()
 
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.
         bar = QWidget(); bar.setObjectName("bottomBar")
@@ -1258,6 +1271,7 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._sync_main_generate_button)
         self.tabs.currentChanged.connect(self._sync_global_preview_for_tab)
         self.tabs.tabBar().tabMoved.connect(self._sync_cached_tab_indexes)
+        self.tabs.currentChanged.connect(self._sync_workspace_tab_selection)
         self._sync_main_generate_button(self.tabs.currentIndex())
         self._sync_global_preview_for_tab(self.tabs.currentIndex())
 
@@ -4731,6 +4745,48 @@ class MainWindow(QMainWindow):
         self._start_next_pending()
         return True
 
+    def _initialize_workspace_tab_bar(self):
+        """Fixed full-width navigation, independent of the shared video preview."""
+        nav = self.workspace_tab_bar
+        bar = self.tabs.tabBar()
+        for index in range(self.tabs.count()):
+            nav.addTab(bar.tabText(index))
+            nav.setTabData(index, bar.tabData(index))
+        nav.setCurrentIndex(self.tabs.currentIndex())
+        nav.currentChanged.connect(self.tabs.setCurrentIndex)
+        nav.tabMoved.connect(self._on_workspace_tab_moved)
+
+    def _sync_workspace_tab_selection(self, index):
+        nav = getattr(self, "workspace_tab_bar", None)
+        if nav is not None and nav.currentIndex() != index:
+            nav.blockSignals(True)
+            try:
+                nav.setCurrentIndex(index)
+            finally:
+                nav.blockSignals(False)
+
+    def _sync_workspace_tab_order(self):
+        """Follow internal tab moves, including settings restoration."""
+        nav = getattr(self, "workspace_tab_bar", None)
+        if nav is None:
+            return
+        bar = self.tabs.tabBar()
+        nav.blockSignals(True)
+        try:
+            for target in range(min(nav.count(), self.tabs.count())):
+                key = bar.tabData(target)
+                source = next((i for i in range(nav.count()) if nav.tabData(i) == key), -1)
+                if source >= 0 and source != target:
+                    nav.moveTab(source, target)
+            nav.setCurrentIndex(self.tabs.currentIndex())
+        finally:
+            nav.blockSignals(False)
+
+    def _on_workspace_tab_moved(self, source, destination):
+        """Move the real page as well when the user drags a visible tab."""
+        self.tabs.tabBar().moveTab(source, destination)
+        self._sync_workspace_tab_selection(self.tabs.currentIndex())
+
     def _current_tab_order(self):
         bar = self.tabs.tabBar()
         order = []
@@ -4770,6 +4826,8 @@ class MainWindow(QMainWindow):
                     self.tabs.setCurrentIndex(index)
                     break
 
+        self._sync_workspace_tab_order()
+
         # Numeric tab indexes are not stable once users reorder the bar; refresh
         # the two legacy cached indexes still used by the main GUI.
         for index in range(self.tabs.count()):
@@ -4782,6 +4840,7 @@ class MainWindow(QMainWindow):
                 self.timeline_tab_index = index
 
     def _sync_cached_tab_indexes(self, *args):
+        self._sync_workspace_tab_order()
         bar = self.tabs.tabBar()
         for index in range(self.tabs.count()):
             key = str(bar.tabData(index) or "")
