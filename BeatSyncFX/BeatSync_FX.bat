@@ -2,9 +2,11 @@
 setlocal
 cd /d "%~dp0"
 if not exist "environments\beatsyncfx\Scripts\python.exe" (
- echo First run setup_windows.bat to create the environment.
- pause
- exit /b 1
+ echo BeatSync FX has not been installed yet.
+ choice /C YN /M "Run setup now"
+ if errorlevel 2 exit /b 1
+ call "%~dp0setup_windows.bat"
+ if not exist "environments\beatsyncfx\Scripts\python.exe" exit /b 1
 )
 "environments\beatsyncfx\Scripts\python.exe" -c "from PIL import Image" >nul 2>&1
 if errorlevel 1 (
