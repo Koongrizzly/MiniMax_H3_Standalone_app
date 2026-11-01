@@ -313,7 +313,7 @@ echo ============================================================
 echo RUNTIME INSTALL COMPLETE
 echo ============================================================
 echo.
-echo Starting model downloader...
+echo Verifying required components and checking optional LoRAs...
 echo.
 call "%CD%\presets\download_models.bat"
 set "DLERR=%ERRORLEVEL%"
@@ -327,9 +327,10 @@ if not "%DLERR%"=="0" (
 
 echo.
 echo ============================================================
-echo INSTALL AND MODEL DOWNLOAD COMPLETE
+echo INSTALL AND REQUIRED COMPONENT SETUP COMPLETE
 echo ============================================================
 echo Run start.bat to open MiniMax-H3.
+echo Latest INT4 / INT8 diffusion checkpoints are available from the Settings tab.
 pause
 exit /b 0
 
