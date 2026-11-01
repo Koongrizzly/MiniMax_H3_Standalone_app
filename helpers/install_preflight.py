@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from .shared_whisper import shared_python, ct2_medium, cpp_exe, cpp_medium
+from .shared_whisper import shared_python, ct2_medium, cpp_medium
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QScrollArea, QWidget)
 
@@ -80,11 +80,11 @@ def media_state():
     beat_medium = bool(medium)
     beat_env = beat_python()
     llama = prompt_llama_runner()
+    whisper_shared_ok = cpp_ok or music_ok
     return [
         dict(key='grizzly', title='GrizzlyMax environment', ok=(ROOT/'environments/.minimax_h3_int4/python.exe').is_file() or (ROOT/'environments/.minimax_h3_int4/Scripts/python.exe').is_file(), action='Install', note='GrizzlyMax root install.bat; existing models are preserved'),
         dict(key='ffmpeg', title='FFmpeg bundle', ok=ff_ok, action='Download', note='Needs ffmpeg.exe, ffprobe.exe and ffplay.exe in presets/bin'),
-        dict(key='prompt_whisper', title='Whisper.cpp — Prompt Builder', ok=cpp_ok, action='Install', note='whisper-cli.exe with GGML/GGUF-compatible model; shared with Music Clip Creator where supported'),
-        dict(key='music_whisper', title='Whisper.cpp — Music Clip Creator', ok=music_ok, action='Install', note='Checks the existing Music Clip Creator whisper.cpp runtime and ggml-small model'),
+        dict(key='shared_cpp_whisper', title='Shared Whisper.cpp — Prompt Builder + Music Clip Creator', ok=whisper_shared_ok, action='Install', note='One shared whisper-cli.exe install for both tools; supports GGML/GGUF-compatible models and uses the existing Music Clip Creator whisper.cpp runtime when available'),
         dict(key='prompt_llama', title='Prompt Builder — llama.cpp GGUF backend', ok=bool(llama), action='Install', note='Optional local GGUF backend. Uses Prompt Builder CUDA llama.cpp bundle under presets/bin/llama or your selected llama-server.exe; GGUF model is chosen in Prompt Builder'),
         dict(key='beat', title='BeatSyncFX environment', ok=bool(beat_env and (BEAT/'helpers/gui.py').is_file()), action='Install', note='Separate portable BeatSyncFX environment; does not modify GrizzlyMax Python'),
         dict(key='beat_whisper', title='Shared Faster-Whisper Medium', ok=beat_medium and bool(shared_python()), action='Install Medium', note='Shared GrizzlyMax environments/.whisper and models/whisper; BeatSyncFX uses this when embedded'),
@@ -98,7 +98,7 @@ def _cmd_for(key):
         if not py.is_file(): py = ROOT/'environments/.minimax_h3_int4/Scripts/python.exe'
         if not py.is_file(): return None, None
         return [str(py),'-c','from runtime.ffmpeg_tools import ensure_ffmpeg_tools; ok,msg=ensure_ffmpeg_tools(); print(msg); raise SystemExit(0 if ok else 1)'], ROOT
-    if key in ('prompt_whisper','music_whisper'):
+    if key == 'shared_cpp_whisper':
         py = ROOT/'environments/.minimax_h3_int4/python.exe'
         if not py.is_file(): py = ROOT/'environments/.minimax_h3_int4/Scripts/python.exe'
         if not py.is_file(): return None, None
@@ -121,7 +121,7 @@ class PreflightDialog(QDialog):
         self.resize(780, 600)
         self.setMinimumWidth(600)
         outer = QVBoxLayout(self)
-        intro=QLabel('Detected components are listed below. Choose Install, Locate or Skip for missing items. Existing installations are not overwritten.\nFor current MiniMax H3 INT4 and INT8 diffusion checkpoints, open the Settings tab and use its checkpoint selector/download feature.\nWhisper.cpp and Faster-Whisper use different formats; BeatSyncFX retains its own environment.\nPrompt Builder llama.cpp is optional; you can use the built-in or Ollama backend instead.')
+        intro=QLabel('Detected components are listed below. Choose Install, Locate or Skip for missing items. Existing installations are not overwritten.\nFor current MiniMax H3 INT4 and INT8 diffusion checkpoints, open the Settings tab and use its checkpoint selector/download feature.\nWhisper.cpp is shared by Prompt Builder and Music Clip Creator; Faster-Whisper uses a different format and BeatSyncFX retains its own environment.\nPrompt Builder llama.cpp is optional; you can use the built-in or Ollama backend instead.')
         intro.setWordWrap(True);outer.addWidget(intro)
         scroll=QScrollArea();scroll.setWidgetResizable(True);outer.addWidget(scroll,1)
         content=QWidget();self.rows=QVBoxLayout(content);scroll.setWidget(content)
@@ -156,7 +156,7 @@ class PreflightDialog(QDialog):
                 save_path('ffmpeg',path);return True
             if path: QMessageBox.warning(self,'Invalid FFmpeg folder','All three FFmpeg executables must be present.')
             return False
-        if key in ('prompt_whisper','music_whisper'):
+        if key == 'shared_cpp_whisper':
             exe,_=QFileDialog.getOpenFileName(self,'Locate whisper-cli.exe',str(ROOT/'presets/bin/whisper'),'Executables (*.exe)')
             if not exe:return False
             model,_=QFileDialog.getOpenFileName(self,'Locate GGML/GGUF Whisper model',str(Path(exe).parent),'Whisper models (*.bin *.gguf)')
