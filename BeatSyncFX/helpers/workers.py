@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import sys
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -39,6 +41,21 @@ class WhisperWorker(QThread):
 
     def run(self):
         try:
+            # Prefer the shared GrizzlyMax Whisper environment when embedded.
+            grizzly_root = Path(__file__).resolve().parents[2]
+            shared = grizzly_root / 'environments/.whisper/Scripts/python.exe'
+            runner = grizzly_root / 'presets/extra_env/shared_whisper_transcribe.py'
+            if shared.is_file() and runner.is_file():
+                with tempfile.TemporaryDirectory(prefix='beatsync_whisper_') as temp:
+                    out = Path(temp) / 'words.json'
+                    proc = subprocess.run([str(shared), str(runner), '--audio', self.input_audio,
+                        '--model', self.model_dir, '--output', str(out), '--device', self.device,
+                        '--compute-type', self.compute_type], capture_output=True, text=True,
+                        timeout=1800, **_windows_no_console())
+                    if proc.returncode:
+                        raise RuntimeError('Shared Whisper failed: ' + (proc.stderr or proc.stdout)[-1500:])
+                    self.ready.emit(json.loads(out.read_text(encoding='utf-8')))
+                    return
             from faster_whisper import WhisperModel
             model = Path(self.model_dir)
             if not (model / 'model.bin').is_file() or not (model / 'config.json').is_file():

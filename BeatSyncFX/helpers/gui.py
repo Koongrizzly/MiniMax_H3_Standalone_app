@@ -1652,7 +1652,8 @@ class MainWindow(QMainWindow):
     def select_installed_whisper(self):
         from .model_finder import find_ct2_models
         base = ROOT / 'models'
-        options = [str(p) for p in find_ct2_models(base)]
+        shared = ROOT.parent / 'models' / 'whisper'
+        options = [str(p) for p in find_ct2_models(shared)] + [str(p) for p in find_ct2_models(base)]
         if not options:
             self.message('No locally installed Faster-Whisper models found in models/.\nUse Setup Whisper first, or Browse / scan for a model elsewhere.')
             return
@@ -1699,11 +1700,34 @@ class MainWindow(QMainWindow):
             if not chosen: return
             model = chosen.property('whisper_model')
             target = ROOT / 'models' / ('whisper-' + model)
+            shared_install = ROOT.parent / 'presets/extra_env/setup_shared_whisper_medium.bat'
+            if model == 'medium' and shared_install.is_file():
+                target = ROOT.parent / 'models/whisper/faster-whisper-medium'
             if (target / 'model.bin').is_file() and (target / 'config.json').is_file():
                 self.whisper_backend.setCurrentText('Faster-Whisper (CTranslate2)')
                 self.whisper_model_folder.setText(str(target))
                 self.save_whisper_folder()
                 status.setText('Model is installed and selected: ' + str(target))
+                return
+            if model == 'medium' and shared_install.is_file():
+                install.setEnabled(False)
+                status.setText('Installing shared GrizzlyMax Whisper Medium…')
+                proc.setProgram('cmd.exe')
+                proc.setArguments(['/c', str(shared_install)])
+                proc.setWorkingDirectory(str(ROOT.parent))
+                def shared_done(exitcode, _exitstatus):
+                    try: proc.finished.disconnect(shared_done)
+                    except (RuntimeError, TypeError): pass
+                    install.setEnabled(True)
+                    if exitcode == 0 and (target / 'model.bin').is_file():
+                        self.whisper_backend.setCurrentText('Faster-Whisper (CTranslate2)')
+                        self.whisper_model_folder.setText(str(target))
+                        self.save_whisper_folder()
+                        status.setText('Shared Whisper Medium installed and selected.')
+                    else:
+                        status.setText('Shared Whisper setup failed; run the shared installer from GrizzlyMax Validate Install.')
+                proc.finished.connect(shared_done)
+                proc.start()
                 return
             python = ROOT / 'environments' / 'beatsyncfx' / 'Scripts' / 'python.exe'
             if not python.is_file():
@@ -1753,6 +1777,11 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes: return
         self.save_whisper_folder()
         folder = self.settings.get('whisper_model_folder', '').strip()
+        shared = ROOT.parent / 'models/whisper/faster-whisper-medium'
+        if self.whisper_backend.currentText().startswith('Faster-Whisper') and (shared/'model.bin').is_file() and not folder:
+            folder = str(shared)
+            self.whisper_model_folder.setText(folder)
+            self.save_whisper_folder()
         if not folder:
             self.message('No Whisper model selected. Use Setup Whisper in the source tools section, or browse for an existing model.')
             return

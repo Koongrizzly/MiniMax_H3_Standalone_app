@@ -12,7 +12,8 @@ def main():
     if model not in MODELS:
         raise SystemExit('Model must be small, medium, or large-v3')
     root = Path(__file__).resolve().parent.parent
-    folder = root / 'models' / ('whisper-' + model)
+    shared = root.parent / 'models' / 'whisper'
+    folder = (shared / ('faster-whisper-' + model)) if (root.parent / 'helpers/shared_whisper.py').is_file() else (root / 'models' / ('whisper-' + model))
     folder.mkdir(parents=True, exist_ok=True)
     print('Downloading', MODELS[model], 'to', folder, flush=True)
     snapshot_download(repo_id=MODELS[model], local_dir=str(folder))
