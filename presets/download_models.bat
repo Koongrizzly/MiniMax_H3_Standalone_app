@@ -13,6 +13,6 @@ if not exist "%PY%" (
 set "ERR=%ERRORLEVEL%"
 echo.
 if not "%ERR%"=="0" echo MODEL DOWNLOAD FAILED. Error code: %ERR%
-if "%ERR%"=="0" echo MODEL DOWNLOAD COMPLETE. You can run presets\download_models.bat again later to add models or new LoRAs.
+if "%ERR%"=="0" echo REQUIRED COMPONENTS COMPLETE. Use GrizzlyMax Settings for current INT4 / INT8 checkpoints; rerun this helper for new LoRAs.
 pause
 exit /b %ERR%
