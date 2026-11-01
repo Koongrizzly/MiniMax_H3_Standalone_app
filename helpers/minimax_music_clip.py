@@ -2789,10 +2789,8 @@ class MiniMaxMusicClipWidget(QWidget):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background:#11151b; border:none; } QScrollArea > QWidget > QWidget { background:#11151b; }")
-        scroll.viewport().setStyleSheet("background:#11151b;")
+        scroll.setStyleSheet("QScrollArea { border:none; }")
         body = QWidget(scroll)
-        body.setStyleSheet("background:#11151b;")
         body.setMinimumWidth(0)
         body.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         body_layout = QVBoxLayout(body)
@@ -3061,7 +3059,7 @@ class MiniMaxMusicClipWidget(QWidget):
         # Do not use palette(base) here: when embedded, Qt's native palette may still
         # be light even though the standalone GUI uses a dark stylesheet.
         self.review_preview.setStyleSheet(
-            "QLabel { border:1px solid #334556; background:#0b0f14; color:#9ab8d8; border-radius:5px; }"
+            "QLabel { border:1px solid palette(mid); background:palette(base); color:palette(text); border-radius:5px; }"
         )
         preview_lay.addWidget(self.review_preview, 1)
         preview_actions = QHBoxLayout()

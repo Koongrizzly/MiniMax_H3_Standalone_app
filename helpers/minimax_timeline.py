@@ -1682,7 +1682,7 @@ class TimelineCanvas(QWidget):
         self._rects = []
         cursor = x0
         cut_palette = [
-            QColor("#375a7f"), QColor("#5b4b8a"), QColor("#476c5e"),
+            QColor(accent).darker(170), QColor(accent), QColor("#476c5e"),
             QColor("#72553d"), QColor("#6a4f67"), QColor("#465c78"),
         ]
         state_colors = {
@@ -1765,7 +1765,7 @@ class TimelineCanvas(QWidget):
                 prompt_h = 42
                 box_left = int(left + 5)
                 box_w = max(1, int(width - 14))
-                painter.setBrush(QBrush(QColor("#375a7f")))
+                painter.setBrush(QBrush(QColor(accent).darker(170)))
                 painter.setPen(QPen(bg, 1))
                 painter.drawRect(box_left, prompt_y, box_w, prompt_h)
                 if clip.get("generation_mode") in {"source", "loaded"}:
@@ -1779,9 +1779,9 @@ class TimelineCanvas(QWidget):
                 image = self._clip_thumbnail(clip) if show_thumb else None
                 if image is not None and box_w >= 70:
                     thumb_rect = QRect(box_left + 4, prompt_y + 3, self.THUMB_W, self.THUMB_H)
-                    painter.fillRect(thumb_rect, QColor("#223548"))
+                    painter.fillRect(thumb_rect, QColor(bg))
                     painter.drawImage(thumb_rect.x(), thumb_rect.y(), image)
-                    painter.setPen(QPen(QColor("#8ea7bf"), 1))
+                    painter.setPen(QPen(QColor(muted), 1))
                     painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawRect(thumb_rect)
                     text_left = thumb_rect.right() + 8
@@ -1794,7 +1794,7 @@ class TimelineCanvas(QWidget):
                     painter.setFont(badge_font)
                     badge_y = prompt_y + prompt_h + 13
                     left_badges, right_badges = self._status_badges(idx, clip)
-                    painter.setPen(QColor("#f4f6f8"))
+                    painter.setPen(QColor(text))
                     if left_badges:
                         painter.drawText(thumb_rect.left(), badge_y, " ".join(left_badges))
                     if right_badges:
@@ -1804,7 +1804,7 @@ class TimelineCanvas(QWidget):
                         painter.drawText(max(int(left + 8), badge_right - right_w), badge_y, right_text)
                     painter.setFont(font)
 
-                painter.setPen(QColor("#f4f6f8"))
+                painter.setPen(QColor(text))
                 text_rect = QRect(text_left, prompt_y + 2, text_w, prompt_h - 4)
                 painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine), fm.elidedText(prompt, Qt.TextElideMode.ElideRight, text_w))
 
@@ -1841,16 +1841,16 @@ class TimelineCanvas(QWidget):
             top = sound_top + row * (self.SOUND_ROW_H + self.SOUND_ROW_GAP)
             rect = QRect(int(left), int(top), int(width), self.SOUND_ROW_H)
             self._audio_rects.append((str(item.get("id") or ""), rect))
-            painter.setBrush(QBrush(QColor("#5b4b8a")))
+            painter.setBrush(QBrush(QColor(accent)))
             painter.setPen(QPen(border, 1))
             painter.drawRoundedRect(rect, 5, 5)
-            painter.setPen(QColor("#f4f6f8"))
+            painter.setPen(QColor(text))
             name = str(item.get("name") or Path(str(item.get("path") or "Audio")).stem or "Audio")
             volume = int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))
             end_sec = start_sec + duration
             line1 = fm.elidedText(name, Qt.TextElideMode.ElideRight, max(20, rect.width() - 12))
             painter.drawText(rect.x() + 6, rect.y() + 17, line1)
-            painter.setPen(QColor("#c9c5df"))
+            painter.setPen(QColor(muted))
             try:
                 fade_in = max(0.0, float(item.get("fade_in_seconds") or 0.0))
             except Exception:
@@ -1991,6 +1991,7 @@ class TimelineTab(QWidget):
         self.settings_provider = settings_provider
         self.queue_timeline_callback = queue_timeline_callback
         self.queue_vsr_callback = queue_vsr_callback
+        self.load_beatsync_callback = None
         self.assemble_timeline_callback = assemble_timeline_callback
         self.preview_result_callback = preview_result_callback
         self.open_output_callback = open_output_callback
@@ -2473,7 +2474,7 @@ class TimelineTab(QWidget):
             "Press 'Use current Generation settings' to refresh it from the Generation tab."
         )
         self.generation_resolution_label.setStyleSheet(
-            "QLabel { color: #82e7ff; font-weight: 600; padding: 0 8px; }"
+            "QLabel { color: palette(highlight); font-weight: 600; padding: 0 8px; }"
         )
         viewbar.addWidget(self.generation_resolution_label)
         root.addLayout(viewbar)
@@ -5235,6 +5236,7 @@ class TimelineTab(QWidget):
         self._populate_candidate_menu(candidates_menu, clip_id, clip)
 
         load_clip_action = menu.addAction("Load clip…")
+        beatsync_action = menu.addAction("Load in BeatSyncFX")
         preview = menu.addAction("Preview clip")
         open_folder = menu.addAction("Open clip folder")
         trim = menu.addAction("Trim clip…")
@@ -5286,6 +5288,7 @@ class TimelineTab(QWidget):
         ))
         # Stale is metadata only: preserved media remains previewable/openable.
         preview.setEnabled(output_exists)
+        beatsync_action.setEnabled(output_exists and callable(self.load_beatsync_callback))
         open_folder.setEnabled(output_exists)
         trim.setEnabled(output_exists and not locked)
         transition_action.setEnabled(not locked and idx + 1 < len(self._clips()))
@@ -5308,6 +5311,8 @@ class TimelineTab(QWidget):
             self._open_ref_presets()
         elif chosen is load_clip_action:
             self._load_external_clip_after(clip_id)
+        elif chosen is beatsync_action:
+            self.load_beatsync_callback(clip_id, str(preview_path))
         elif chosen is preview:
             self._preview_clip_by_id(clip_id)
         elif chosen is open_folder:
@@ -5479,6 +5484,46 @@ class TimelineTab(QWidget):
         }
         # Do not change trim_in/out, volume, audio/video fades, speed or transitions.
         self._invalidate_assembly("Clip upscaled — assemble again.")
+        self._refresh_all()
+        return True
+
+    def beatsync_job_completed(self, job):
+        """Promote an effects render only if its source is still the active candidate."""
+        _, clip = self._clip_by_id(str(job.get("timeline_clip_id") or ""))
+        if clip is None or str(self.project.get("project_id") or "") != str(job.get("timeline_project_id") or ""):
+            return False
+        output = Path(str(job.get("output") or ""))
+        if not output.is_file() or output.stat().st_size < 1024:
+            return False
+        source = str(job.get("beatsync_source") or "")
+        active = self._clip_preview_path(clip)
+        self._record_undo_state("BeatSyncFX alternate finished")
+        candidates = clip.setdefault("alternate_candidates", [])
+        info = {"output": str(output), "resolution": str(job.get("resolution") or ""),
+                "effect_engine": "beatsyncfx", "source": source}
+        snapshot = {"candidate_id": uuid.uuid4().hex, "output": str(output),
+                    "status": "finished", "queue_job_id": str(job.get("id") or ""),
+                    "last_generation_info": info}
+        if not active or Path(active).resolve() != Path(source).resolve():
+            candidates.append(snapshot)
+            self._refresh_all()
+            return True
+        if str(clip.get("generation_mode") or "") in {"source", "loaded"}:
+            key = str(Path(active).resolve()).lower()
+            if not any(str(Path(str(c.get("output") or "")).resolve()).lower() == key
+                       for c in candidates if isinstance(c, dict) and c.get("output")):
+                original = self._candidate_snapshot_from_active(clip)
+                original["output"] = str(Path(active).resolve())
+                original["status"] = "finished"
+                candidates.append(original)
+        else:
+            self._archive_active_candidate_before_replacement(clip, str(output))
+        clip["output"] = str(output)
+        clip["queue_job_id"] = str(job.get("id") or "")
+        clip["status"] = "finished"
+        clip["stale"] = False
+        clip["last_generation_info"] = info
+        self._invalidate_assembly("BeatSyncFX effects rendered — assemble again.")
         self._refresh_all()
         return True
 
