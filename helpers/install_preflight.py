@@ -142,9 +142,13 @@ class PreflightDialog(QDialog):
             label=QLabel(('[OK] ' if record['ok'] else '[MISSING] ')+record['title']+'\n'+record['note'])
             label.setWordWrap(True);h.addWidget(label,1)
             select=QComboBox()
-            if record['ok']: choices=['Installed — no action','Locate / change path','Repair / reinstall']
-            else: choices=[record['action'],'Locate existing','Skip']
-            select.addItems(choices);select.setMinimumWidth(175)
+            if record['ok']:
+                choices=[('Installed — no action', 'none'), ('Locate / change path', 'locate'), ('Repair / reinstall', 'repair')]
+            else:
+                choices=[(record['action'], 'install'), ('Locate existing', 'locate'), ('Skip', 'none')]
+            for label_text, action_id in choices:
+                select.addItem(label_text, userData=action_id)
+            select.setMinimumWidth(175)
             self.controls[record['key']]=(record,select)
             h.addWidget(select);self.rows.addWidget(line)
         self.rows.addStretch(1)
@@ -180,14 +184,19 @@ class PreflightDialog(QDialog):
         return False
 
     def install_selected(self):
-        chosen=[(r,s.currentText()) for r,s in self.controls.values()]
+        chosen=[(r,s.currentData()) for r,s in self.controls.values()]
+        requested=[r['title'] for r, action in chosen if action in ('install', 'repair')]
+        if requested:
+            prompt='Start the following selected installation actions?\n\n' + '\n'.join('• '+x for x in requested)
+            if QMessageBox.question(self, 'Confirm installation actions', prompt, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
         launched=[]
         for record,choice in chosen:
             key=record['key']
-            if choice.startswith('Locate'):
+            if choice == 'locate':
                 self.locate(key)
                 continue
-            if not choice.startswith(('Install','Download','Repair')): continue
+            if choice not in ('install', 'repair'): continue
             command,cwd=_cmd_for(key)
             if not command:
                 QMessageBox.warning(self,'Installer unavailable',f'Installer for {record["title"]} cannot run yet. Install GrizzlyMax/BeatSyncFX core environment first, then validate again.')
