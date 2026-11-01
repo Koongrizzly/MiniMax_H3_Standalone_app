@@ -6765,7 +6765,7 @@ exit /b %RC%
         # an actionable preflight for all portable subcomponents.
         if interactive:
             try:
-                from helpers.install_preflight import PreflightDialog
+                from runtime.install_preflight import PreflightDialog
                 dialog = PreflightDialog(self)
                 dialog.exec()
             except Exception as exc:
