@@ -62,7 +62,7 @@ Main Features :
   - draw boxes, brackets.. around something and let them follow the subject as it moves
   - color picker, bpm analyzer, effects timeline with drag and rezize
   - easy to use with agents such as codex, tell it where to find the video that needs effects, give it a  sample video of what you want and tell it to create the templates for the full video
-  The next video clip was created from scratch with Grizzlymax and this new tool with the help of Codex to add all the text and effects
+  The next video clip was created from scratch with the Grizzlymax music clip creator and this new tool with the help of Codex to add all the text and effects (original footage 1600x896, upscaled wuth VSR x2)
 ---
 
 [![Watch Example on YouTube](https://img.youtube.com/vi/7y6fabhdXiI/maxresdefault.jpg)](https://youtu.be/7y6fabhdXiI)
