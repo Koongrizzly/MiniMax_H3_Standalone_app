@@ -19,7 +19,7 @@ Main Features :
 
 - Reference image/video/audio → video + audio (Ref2VA)
 
-- Up to 30 seconds at 24 FPS by default + experimental : up to 100 seconds ! (tested working on RTX 3090 with low 320p resolution)
+- Up to 30 seconds at 24 FPS by default + experimental : up to 100 seconds ! (tested working on RTX 3090 with low 320p resolution, don't expect it to follow prompts properly, mostly for testing/fun projects)
 
 - MiniMax H3 4 step LoRA included in the installer (Use 'Beta' instead of 'simple' scheduler when using the EMA speedup lora)
 
