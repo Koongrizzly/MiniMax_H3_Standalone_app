@@ -1700,10 +1700,10 @@ class MainWindow(QMainWindow):
             if not chosen: return
             model = chosen.property('whisper_model')
             target = ROOT / 'models' / ('whisper-' + model)
-            shared_install = ROOT.parent / 'presets/extra_env/setup_shared_whisper_medium.bat'
+            shared_install = ROOT.parent / 'presets/extra_env/setup_shared_whisper_medium_compatible.bat'
             if model == 'medium' and shared_install.is_file():
                 target = ROOT.parent / 'models/whisper/faster-whisper-medium'
-            if (target / 'model.bin').is_file() and (target / 'config.json').is_file():
+            if (target / 'model.bin').is_file() and (target / 'config.json').is_file() and not (model == 'medium' and shared_install.is_file()):
                 self.whisper_backend.setCurrentText('Faster-Whisper (CTranslate2)')
                 self.whisper_model_folder.setText(str(target))
                 self.save_whisper_folder()
@@ -1711,9 +1711,9 @@ class MainWindow(QMainWindow):
                 return
             if model == 'medium' and shared_install.is_file():
                 install.setEnabled(False)
-                status.setText('Installing shared GrizzlyMax Whisper Medium…')
+                status.setText('Installing or repairing shared GrizzlyMax Whisper Medium (PyAV compatibility)…')
                 proc.setProgram('cmd.exe')
-                proc.setArguments(['/c', str(shared_install)])
+                proc.setArguments(['/c', 'set WHISPER_NO_PAUSE=1 && call  + str(shared_install) + '])
                 proc.setWorkingDirectory(str(ROOT.parent))
                 def shared_done(exitcode, _exitstatus):
                     try: proc.finished.disconnect(shared_done)
@@ -1725,7 +1725,7 @@ class MainWindow(QMainWindow):
                         self.save_whisper_folder()
                         status.setText('Shared Whisper Medium installed and selected.')
                     else:
-                        status.setText('Shared Whisper setup failed; run the shared installer from GrizzlyMax Validate Install.')
+                        status.setText('Shared Whisper repair failed: ' + (bytes(proc.readAllStandardError()).decode(errors='replace') + bytes(proc.readAllStandardOutput()).decode(errors='replace'))[-450:])
                 proc.finished.connect(shared_done)
                 proc.start()
                 return
