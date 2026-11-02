@@ -1,0 +1,16 @@
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+MODELS = ROOT / "models" / "minimax_h3"
+DIFFUSION_DIR = MODELS / "diffusion_models"
+TEXT_ENCODER_DIR = MODELS / "text_encoders"
+VIDEO_VAE_DIR = MODELS / "video_vae"
+AUDIO_VAE_DIR = MODELS / "audio_vae"
+LORA_DIR = MODELS / "loras"
+OUTPUT_DIR = ROOT / "output"
+LOG_DIR = ROOT / "logs"
+VENDOR_DIR = ROOT / "vendor"
+EXPECTED_FL2VA = "minimax_h3_fl2va_pruned-w4a8_convrot_pruned.safetensors"
+EXPECTED_REF2VA = "minimax_h3_ref2va_pruned-w4a8_convrot_pruned.safetensors"
+EXPECTED_TE = "qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors"
+EXPECTED_VIDEO_VAE = "MiniMax-H3-video_vae_fp16.safetensors"
+EXPECTED_AUDIO_VAE = "MiniMax-H3-audio_vae_fp32.safetensors"

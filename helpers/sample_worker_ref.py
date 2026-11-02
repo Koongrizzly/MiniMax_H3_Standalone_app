@@ -1,0 +1,429 @@
+from __future__ import annotations
+import argparse, gc, math, subprocess, tempfile
+from pathlib import Path
+import numpy as np
+import torch
+from runtime.memory_diag import log_mem, log_mem_throttled, install_sampling_block_trace, install_comfy_load_trace
+from runtime import vram_manager as _vram_manager_module
+from runtime.vram_manager import VRAMManager, VRAMManagerConfig
+import torchaudio
+from PIL import Image
+import av
+from runtime.ffmpeg_tools import ensure_ffmpeg_tools, tool_path
+# Import the shared embedded-Comfy bootstrap first. It adds vendor/ to sys.path,
+# enables H3_COMFY_ARGS parsing, and only then imports comfy/node_helpers.
+# Ref2VA previously imported comfy directly before this bootstrap, causing
+# `ModuleNotFoundError: No module named 'comfy'` in the isolated worker.
+from runtime.headless_h3 import comfy, nodes, patch_sigma, apply_loras, split_av_latents, _flush_models, load_vae, zero_conditioning
+import node_helpers
+from comfy_extras.nodes_minimax_h3 import _empty_av_latent, adapt_canvas, CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, FPS
+
+def load_image(path):
+    im=Image.open(path).convert('RGB'); return torch.from_numpy(np.asarray(im).astype(np.float32)/255.0)[None,...]
+def resize(image,w,h,crop='disabled'):
+    s=image[...,:3].movedim(-1,1); s=comfy.utils.common_upscale(s,w,h,'lanczos',crop); return s.movedim(1,-1)
+def load_video_24(path, max_frames):
+    frames=[]
+    with av.open(str(path)) as c:
+        st=c.streams.video[0]
+        for f in c.decode(st):
+            img=f.to_image().convert('RGB'); frames.append(torch.from_numpy(np.asarray(img).astype(np.float32)/255.0))
+            if len(frames)>=max_frames: break
+    if not frames: raise ValueError(f'No decodable video frames: {path}')
+    return torch.stack(frames)
+def _load_pcm16_wav(path):
+    """Load a normalized PCM16 WAV without torchaudio's TorchCodec backend.
+
+    Newer torchaudio builds route ``torchaudio.load`` through TorchCodec.  That
+    makes Ref2VA input decoding depend on matching libtorchcodec/FFmpeg DLLs even
+    though MiniMax only needs ordinary PCM samples here.  The app already owns a
+    verified FFmpeg toolchain, so normalize with FFmpeg and read the resulting
+    PCM16 WAV directly with Python's stdlib instead.
+    """
+    import wave
+    with wave.open(str(path), 'rb') as wf:
+        channels = int(wf.getnchannels())
+        sample_width = int(wf.getsampwidth())
+        sample_rate = int(wf.getframerate())
+        frames = int(wf.getnframes())
+        if sample_width != 2:
+            raise RuntimeError(f'Expected PCM16 WAV, got sample width {sample_width} bytes: {path}')
+        raw = wf.readframes(frames)
+    pcm = np.frombuffer(raw, dtype='<i2')
+    if channels > 1:
+        pcm = pcm.reshape(-1, channels).T
+    else:
+        pcm = pcm.reshape(1, -1)
+    waveform = torch.from_numpy(pcm.astype(np.float32, copy=True) / 32768.0)
+    return waveform, sample_rate
+
+
+def _normalize_audio_to_pcm16(path, wav):
+    ok, msg = ensure_ffmpeg_tools(lambda x: print(x, flush=True))
+    if not ok:
+        raise RuntimeError('FFmpeg tools unavailable: ' + msg)
+    ff = str(tool_path('ffmpeg.exe'))
+    r = subprocess.run(
+        [ff, '-y', '-i', str(path), '-vn', '-ac', '2', '-ar', '32000', '-c:a', 'pcm_s16le', str(wav)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if r.returncode or not Path(wav).is_file():
+        raise RuntimeError(f'FFmpeg could not decode reference audio: {path}')
+
+
+def extract_audio(path,tmpdir):
+    wav=Path(tmpdir)/('ref_'+Path(path).stem+'.wav')
+    _normalize_audio_to_pcm16(path, wav)
+    waveform,sr=_load_pcm16_wav(wav)
+    return {'waveform':waveform.unsqueeze(0),'sample_rate':sr}
+
+
+def load_audio(path):
+    # Always normalize through the app-local FFmpeg first.  Besides accepting the
+    # same formats everywhere, this avoids torchaudio.load -> TorchCodec and its
+    # external libtorchcodec DLL dependency in the standalone environment.
+    with tempfile.TemporaryDirectory(prefix='minimax_ref_audio_') as td:
+        wav=Path(td)/'reference.wav'
+        _normalize_audio_to_pcm16(path, wav)
+        waveform,sr=_load_pcm16_wav(wav)
+    return {'waveform':waveform.unsqueeze(0),'sample_rate':sr}
+def encode_audio(vae,audio):
+    w=audio['waveform']; sr=audio['sample_rate']; vsr=getattr(vae,'audio_sample_rate',32000)
+    if sr!=vsr: w=torchaudio.functional.resample(w,sr,vsr)
+    # Ref2VA audio encoding is inference-only. Running the MiniMax audio VAE with
+    # autograd enabled can retain a very large encoder/attention graph for long
+    # reference clips. On a 24 GB Windows GPU that graph can consume the whole
+    # card and spill into shared GPU memory before Qwen even starts.
+    # Keep no graph at all and move the tiny 40 Hz reference latent to CPU
+    # immediately, before leaving this helper.
+    with torch.inference_mode():
+        z=vae.encode(w[:1].movedim(1,-1))
+        z=z.detach().cpu()
+    return z,z.shape[-1]
+
+
+
+def _fmt_bytes(n):
+    return f"{int(n)/(1024**3):.2f} GiB"
+
+def _log_checkpoint(label, path):
+    try:
+        p=Path(path)
+        print(f"[MODEL] {label}: {p.name} | size={_fmt_bytes(p.stat().st_size)} | path={p}", flush=True)
+    except Exception as e:
+        print(f"[MODEL] {label}: {path} | size=unknown ({e})", flush=True)
+
+def _cpu_latent(x):
+    if x is None:
+        return None
+    try:
+        return x.detach().cpu()
+    except Exception:
+        return x.cpu() if hasattr(x, "cpu") else x
+
+
+def _encode_visual_reference(vae, pixels, manager=None, *, label="reference image"):
+    """Encode visual Ref2VA input without the old full-encode spill first.
+
+    Managed reference stages go directly to MiniMax/Comfy's tiled VAE path under
+    inference_mode. This avoids constructing an autograd graph and avoids the old
+    pattern of trying a huge regular encode, spilling/OOMing, and only then retrying
+    tiled while the failed allocation is still being unwound.
+    """
+    managed = bool(manager is not None and manager.is_stage_managed('reference'))
+    if managed:
+        free_before, total = manager._cuda_free()
+        print(
+            f"[VRAM-MGR] V11.6 reference admission | {label} | "
+            f"CUDA free={manager._gb(free_before) if free_before is not None else 'n/a'} | "
+            f"card={manager._gb(total) if total is not None else 'n/a'} | proactive tiled inference encode",
+            flush=True,
+        )
+        manager.trim_cuda_cache(reason=f'pre-{label}', force=True)
+    with torch.inference_mode():
+        if managed:
+            z = vae.encode_tiled(pixels, tile_x=256, tile_y=256, overlap=64)
+        else:
+            z = vae.encode(pixels)
+        z = _cpu_latent(z)
+    if managed:
+        # Drop only unused allocator cache between independent references. Keep the
+        # 4.85 GiB VAE residency itself intact so the next image does not reload it.
+        try:
+            comfy.model_management.soft_empty_cache()
+        except Exception:
+            pass
+        free_after, _ = manager._cuda_free()
+        print(
+            f"[VRAM-MGR] V11.6 reference encode complete | {label} | "
+            f"CUDA free={manager._gb(free_after) if free_after is not None else 'n/a'}",
+            flush=True,
+        )
+    return z
+
+def _install_qwen_layer_trace(manager=None):
+    import comfy.text_encoders.llama as h3_llama
+    original=h3_llama.TransformerBlock.forward
+    counter={'n':0}
+    def traced(self, x, *args, **kwargs):
+        n=counter['n']; counter['n'] += 1
+        if manager is not None:
+            manager.maybe_check_blocks(reason=f'Qwen boundary {n:03d}')
+        log_mem_throttled('qwen_layers', f'Qwen transformer layer ACTIVE | call={n:03d}', x, interval=1.0)
+        out=original(self, x, *args, **kwargs)
+        return out
+    h3_llama.TransformerBlock.forward=traced
+    return h3_llama, original
+
+def main():
+    ap=argparse.ArgumentParser();
+    for n in ('diffusion','text-encoder','video-vae','audio-vae','prompt','out'): ap.add_argument('--'+n,required=True)
+    for n in ('width','height','frames','steps','seed'): ap.add_argument('--'+n,type=int,required=True)
+    for n in ('cfg','shift','audio-shift'): ap.add_argument('--'+n,type=float,required=True)
+    ap.add_argument('--sampler',default='euler'); ap.add_argument('--scheduler',default='simple'); ap.add_argument('--ref-image-size',choices=['match','max'],default='match')
+    ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
+    ap.add_argument('--lock-source-audio-index', type=int, default=0, help='1-based standalone --ref-audio slot to use as the target H3 audio latent with denoise mask 0. 0 keeps normal Ref2VA audio generation.')
+    ap.add_argument('--ref-audio-subject', action='append', type=int, default=[], help='Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic.')
+    ap.add_argument('--lora',action='append',default=[]); ap.add_argument('--lora-strength',action='append',type=float,default=[])
+    ap.add_argument('--extended-logging', action='store_true')
+    ap.add_argument('--spectrum', action='store_true', help='Enable experimental MiniMax H3 Spectrum feature forecasting')
+    ap.add_argument('--sla-attention', action='store_true', help='Enable MiniMax H3 SLA block-sparse attention')
+    ap.add_argument('--experimental-long-duration', action='store_true', help='Allow native-grid research durations up to 2385 frames')
+    ap.add_argument('--vram-manager', action='store_true')
+    ap.add_argument('--vram-managed-stage', action='append', choices=['reference','text','diffusion'], default=[], help='Limit VRAM Manager to selected worker stage(s); omitted means all stages')
+    ap.add_argument('--vram-runtime-free-gb', type=float, default=0.5)
+    ap.add_argument('--vram-text-headroom-gb', type=float, default=2.0)
+    ap.add_argument('--vram-diffusion-headroom-gb', type=float, default=4.0)
+    ap.add_argument('--vram-offload-chunk-mb', type=int, default=512)
+    ap.add_argument('--vram-max-resident-weights-gb', type=float, default=0.0)
+    ap.add_argument('--vram-block-check-interval', type=int, default=1)
+    ap.add_argument('--vram-residency-fill', action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument('--vram-residency-target-free-gb', type=float, default=0.5)
+    ap.add_argument('--vram-residency-warmup-blocks', type=int, default=2)
+    ap.add_argument('--vram-residency-refill-interval', type=int, default=1)
+    ap.add_argument('--vram-allocator-fraction', type=float, default=0.94)
+    ap.add_argument('--vram-cache-trim-slack-gb', type=float, default=2.0)
+    ap.add_argument('--vram-keep-text-encoder', action='store_true')
+    ns=ap.parse_args()
+    if ns.vram_manager:
+        expected = "V11_6_ULTRA_CLIP_PRESSURE_20261003A"
+        actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
+        if actual != expected:
+            raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
+        print(f"[VRAM-MGR] V11.6 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+    if len(ns.lora)!=len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
+    if len(ns.lora)>3: raise ValueError('Maximum 3 LoRAs are supported')
+    manager=None
+    if ns.vram_manager:
+        manager=VRAMManager(comfy, VRAMManagerConfig(
+            runtime_free_gb=max(0.1, ns.vram_runtime_free_gb),
+            text_load_headroom_gb=max(ns.vram_runtime_free_gb, ns.vram_text_headroom_gb),
+            diffusion_load_headroom_gb=max(ns.vram_runtime_free_gb, ns.vram_diffusion_headroom_gb),
+            offload_chunk_mb=max(64, ns.vram_offload_chunk_mb),
+            max_resident_weights_gb=max(0.0, ns.vram_max_resident_weights_gb),
+            block_check_interval=max(1, ns.vram_block_check_interval),
+            residency_fill_enabled=bool(ns.vram_residency_fill),
+            residency_target_free_gb=max(ns.vram_runtime_free_gb, ns.vram_residency_target_free_gb),
+            residency_warmup_blocks=max(0, ns.vram_residency_warmup_blocks),
+            residency_refill_interval=max(1, ns.vram_residency_refill_interval),
+            allocator_memory_fraction=min(0.99, max(0.50, ns.vram_allocator_fraction)),
+            cache_trim_slack_gb=max(0.25, ns.vram_cache_trim_slack_gb),
+            managed_stages=tuple(ns.vram_managed_stage) or None,
+            diffusion_model_path=str(ns.diffusion),
+        ), verbose=ns.extended_logging)
+        manager.install(); manager.set_stage('text')
+    max_frames = 2385 if ns.experimental_long_duration else 719
+    if ns.frames > max_frames: raise ValueError(f'Maximum allowed requested frame count is {max_frames} ({max_frames / 24.0:.3f} seconds at 24 FPS)')
+    load_trace_cleanup=(install_comfy_load_trace(comfy) if ns.extended_logging else (lambda: None))
+    if ns.extended_logging: log_mem('V8 worker baseline before Ref2VA stages', sync=True)
+    print(f'Generation settings: {ns.width}x{ns.height} | requested frames={ns.frames} | steps={ns.steps} | CFG={ns.cfg:g} | shift={ns.shift:g} | audio shift={ns.audio_shift:g} | sampler={ns.sampler} | scheduler={ns.scheduler} | seed={ns.seed}', flush=True)
+    latent,frame_count=_empty_av_latent(ns.width,ns.height,ns.frames)
+    ref_items=[]; ref_blocks=[]
+    if manager is not None: manager.set_stage('reference')
+    print('Loading video VAE and encoding Ref2VA visual references...',flush=True); vv=load_vae(Path(ns.video_vae))
+    for path in ns.ref_image[:9]:
+        img=load_image(path); h,w=img.shape[1],img.shape[2]
+        scale=min(1.0, math.sqrt((ns.width*ns.height)/(w*h))) if ns.ref_image_size=='match' else min(1.0,REF_IMAGE_SHORT_EDGE/min(w,h))
+        tw=max(CANVAS_MULTIPLE,round(w*scale/CANVAS_MULTIPLE)*CANVAS_MULTIPLE); th=max(CANVAS_MULTIPLE,round(h*scale/CANVAS_MULTIPLE)*CANVAS_MULTIPLE)
+        r=resize(img,tw,th); z=_encode_visual_reference(vv, r, manager, label=f'reference image {len(ref_blocks)+1} ({tw}x{th})'); ref_items.append({'type':'image','data':r.cpu()}); ref_blocks.append({'kind':'image','latent_h':th//16,'latent_w':tw//16,'latent':z})
+    video_data=[]
+    for path in ns.ref_video[:3]:
+        vf=load_video_24(path,frame_count); vh,vw=vf.shape[1],vf.shape[2]; cw,ch=adapt_canvas(vw,vh)
+        if vw*vh<cw*ch: cw=max(CANVAS_MULTIPLE,round(vw/CANVAS_MULTIPLE)*CANVAS_MULTIPLE); ch=max(CANVAS_MULTIPLE,round(vh/CANVAS_MULTIPLE)*CANVAS_MULTIPLE)
+        frames=resize(vf,cw,ch)
+        n=min(frames.shape[0],frame_count)
+        if n<5: raise ValueError('MiniMax H3 reference videos need at least 5 frames')
+        while n%17!=5 and n>5:n-=1
+        frames=frames[:n]; z=_encode_visual_reference(vv, frames, manager, label=f'reference video {len(video_data)+1} ({cw}x{ch}, {n}f)')
+        sample_idx=list(range(0,frames.shape[0],FPS//2)); qwen=frames[sample_idx].cpu()
+        video_data.append((path,z,ch,cw,qwen,[i/2.0 for i in range(len(sample_idx))]))
+    del vv; _flush_models()
+    if ns.extended_logging: log_mem('after Ref2VA visual reference encode / VAE flush', sync=True)
+    if manager is not None: manager.set_stage('reference')
+    print('Loading audio VAE and encoding Ref2VA audio references...',flush=True); avae=load_vae(Path(ns.audio_vae))
+    with tempfile.TemporaryDirectory(prefix='h3_ref_audio_') as td:
+        for path,z,ch,cw,qwen,timestamps in video_data:
+            soundtrack=extract_audio(path,td); az,at=(None,0)
+            if soundtrack is not None: az,at=encode_audio(avae,soundtrack); az=_cpu_latent(az); ref_items.append({'type':'audio'})
+            ref_items.append({'type':'video','data':qwen,'timestamps':timestamps})
+            ref_blocks.append({'kind':'video_audio' if at else 'video','latent_t':z.shape[2],'latent_h':ch//16,'latent_w':cw//16,'ref_audio_t':at,'latent':z,'audio_latent':az})
+        voice_prompt_lines = []
+        locked_source_audio = None
+        for standalone_i, path in enumerate(ns.ref_audio[:3]):
+            az,at=encode_audio(avae,load_audio(path)); az=_cpu_latent(az); ref_items.append({'type':'audio'}); ref_blocks.append({'kind':'audio','ref_audio_t':at,'audio_latent':az})
+            if ns.lock_source_audio_index == standalone_i + 1:
+                locked_source_audio = az.clone()
+                print(f"Locked source audio selected: standalone slot {standalone_i + 1} | {Path(path).name} | encoded latent steps={at}", flush=True)
+            # Audio tags are assigned in native ref_items order. Reference-video
+            # soundtracks may already have consumed <Audio n> slots, so resolve
+            # the index only after this standalone item is appended.
+            audio_index = sum(1 for item in ref_items if item.get('type') == 'audio')
+            subject_n = ns.ref_audio_subject[standalone_i] if standalone_i < len(ns.ref_audio_subject) else 0
+            if 1 <= int(subject_n) <= 9:
+                voice_prompt_lines.append(f"<Audio {audio_index}> is the voice timbre reference for <Subject {int(subject_n)}>." )
+                print(f"Voice reference mapping: {Path(path).name} -> <Audio {audio_index}> -> <Subject {int(subject_n)}>", flush=True)
+    if ns.lock_source_audio_index:
+        if not (1 <= ns.lock_source_audio_index <= min(3, len(ns.ref_audio))):
+            raise ValueError(f'--lock-source-audio-index {ns.lock_source_audio_index} does not refer to a supplied standalone --ref-audio slot')
+        if locked_source_audio is None:
+            raise RuntimeError('Locked source audio was requested but no encoded source latent was produced')
+        video_target, audio_template = latent['samples'].unbind()
+        target_t = int(audio_template.shape[-1])
+        source_t = int(locked_source_audio.shape[-1])
+        if source_t > target_t:
+            locked_source_audio = locked_source_audio[..., :target_t]
+            print(f'Locked source audio fit: cropped latent timeline {source_t} -> {target_t} steps.', flush=True)
+        elif source_t < target_t:
+            pad_shape = list(locked_source_audio.shape)
+            pad_shape[-1] = target_t - source_t
+            locked_source_audio = torch.cat((locked_source_audio, torch.zeros(pad_shape, dtype=locked_source_audio.dtype)), dim=-1)
+            print(f'Locked source audio fit: zero-padded latent timeline {source_t} -> {target_t} steps.', flush=True)
+        target_device = audio_template.device
+        locked_source_audio = locked_source_audio.to(device=target_device, dtype=audio_template.dtype)
+        latent['samples'] = comfy.nested_tensor.NestedTensor((video_target, locked_source_audio))
+        # Nested denoise mask: video=1 means generate normally; audio=0 means keep
+        # the encoded source audio latent fixed while H3 jointly attends to it.
+        latent['noise_mask'] = comfy.nested_tensor.NestedTensor((
+            torch.ones_like(video_target),
+            torch.zeros_like(locked_source_audio),
+        ))
+        print(f'Locked source audio ACTIVE | target audio latent={tuple(locked_source_audio.shape)} | denoise mask=0 | video denoise mask=1', flush=True)
+    del avae,video_data; _flush_models()
+    if ns.extended_logging: log_mem('after Ref2VA audio reference encode / VAE flush', sync=True)
+    if manager is not None: manager.set_stage('text')
+    qwen_patch=None
+    if ns.extended_logging:
+        _log_checkpoint('text encoder checkpoint', ns.text_encoder); log_mem('before text encoder load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
+    if ns.extended_logging or (manager is not None and manager.is_stage_managed('text')):
+        qwen_patch=_install_qwen_layer_trace(manager)
+    print('Loading MiniMax H3 text encoder for Ref2VA...',flush=True); clip=comfy.sd.load_clip([ns.text_encoder],clip_type=comfy.sd.CLIPType.MINIMAX)
+    if ns.extended_logging: log_mem('after text encoder object load')
+    effective_prompt = ns.prompt
+    if voice_prompt_lines:
+        # Replace any manually-entered voice-binding lines with the runtime-
+        # resolved bindings. Reference-video soundtracks can consume <Audio n>
+        # slots before standalone voice samples, so only the worker can know
+        # the final indices reliably.
+        import re as _re
+        effective_prompt = _re.sub(
+            r'(?im)^\s*<Audio\s+\d+>\s+is\s+the\s+voice\s+timbre\s+reference\s+for\s+<Subject\s+\d+>\s*\.?\s*$',
+            '',
+            effective_prompt,
+        ).lstrip()
+        # Put the bindings before the user's shot directions. This leaves the
+        # visible prompt effectively unchanged while making the association
+        # explicit to H3 on every generation that uses these voice slots.
+        effective_prompt = "\n".join(voice_prompt_lines) + "\n" + effective_prompt
+        print('Applied standalone voice-timbre reference declarations.', flush=True)
+    tokens=clip.tokenize(effective_prompt,minimax_ref_items=ref_items)
+    if manager is not None and manager.is_stage_managed('text'):
+        manager.begin_text_conditioning_admission()
+        # comfy.sd.load_clip() is lazy: this is the first real Qwen CUDA residency
+        # load.  Do it under the V11.6 activation reserve, then verify actual free
+        # VRAM before the first transformer forward.
+        clip.load_model(tokens)
+        manager.prepare_text_conditioning(reason='Ref2VA pre-Qwen conditioning')
+    print('Encoding prompt and Ref2VA conditioning...', flush=True)
+    if ns.extended_logging: log_mem('before text encoder conditioning')
+    positive=clip.encode_from_tokens_scheduled(tokens)
+    if manager is not None and manager.is_stage_managed('text'):
+        manager.end_text_conditioning_admission()
+    if ns.extended_logging:
+        log_mem('after text encoder conditioning')
+        if torch.cuda.is_available(): print(f'[PEAK] text encoder CUDA peak allocated={_fmt_bytes(torch.cuda.max_memory_allocated())} reserved={_fmt_bytes(torch.cuda.max_memory_reserved())}', flush=True)
+    if qwen_patch is not None: qwen_patch[0].TransformerBlock.forward=qwen_patch[1]
+    positive=node_helpers.conditioning_set_values(positive,{'minimax_refs':ref_blocks}); negative=zero_conditioning(positive)
+    del ref_items,ref_blocks
+    if ns.vram_keep_text_encoder:
+        gc.collect(); print('[VRAM-MGR] text encoder kept resident/managed after conditioning.', flush=True)
+    else:
+        _flush_models()
+    if ns.extended_logging: log_mem('after text encoder flush', sync=True)
+    if manager is not None: manager.set_stage('diffusion')
+    if ns.extended_logging: _log_checkpoint('Ref2VA diffusion checkpoint', ns.diffusion); log_mem('before diffusion model load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
+    print('Loading W4A8 Ref2VA diffusion model...',flush=True)
+    model=comfy.sd.load_diffusion_model(ns.diffusion)
+    if ns.extended_logging: log_mem('after diffusion checkpoint object load / before LoRA', sync=True)
+    model=apply_loras(model,zip(ns.lora,ns.lora_strength))
+    if ns.extended_logging: log_mem('after LoRA patching', sync=True)
+    model=patch_sigma(model,ns.shift,ns.audio_shift)
+    if ns.sla_attention:
+        from runtime.sla_backend import ensure_comfy_kitchen_sla_backend
+        if not ensure_comfy_kitchen_sla_backend(auto_upgrade=False):
+            raise RuntimeError('SLA requested but comfy_kitchen.sol_attn is unavailable; refusing dense fallback')
+        import comfy_kitchen as _sla_ck
+        print(f"[SLA] sparse kernel backend READY | comfy_kitchen.sol_attn={getattr(_sla_ck, 'sol_attn', None)!r}", flush=True)
+        from h3_sla.patch import patch_h3_sla
+        model = patch_h3_sla(
+            model,
+            sparsity_ratio=0.85,
+            block_size=32,
+            min_seq_len=12288,
+            dense_last_steps=1,
+            protect_audio=True,
+            dense_backend='comfy_kitchen',
+            dense_steps='1',
+            disable_fp16_accum=True,
+            stabilize_motion=False,
+            reference_protection='Off',
+            tail_correction=False,
+            use_int8_qk=False,
+            use_int8_pv=False,
+            engine='comfy_kitchen',
+        )
+        print('[SLA] enabled | screenshot preset | sparsity=0.85 | block=32 | min_seq_len=12288 | dense_last_steps=1 | dense_steps=1 | protect_audio=ON | ref_protection=Off | dense_backend=comfy_kitchen | engine=comfy_kitchen', flush=True)
+    spectrum = None
+    if ns.spectrum:
+        from runtime.h3_spectrum import MiniMaxH3Spectrum, MIN_FIT_POINTS
+        if int(ns.steps) < MIN_FIT_POINTS + 2:
+            print(f'[SPECTRUM] requested but inactive: {ns.steps} steps is too short; at least {MIN_FIT_POINTS + 2} steps are required for two anchors, a forecast, and a native tail refresh.', flush=True)
+        else:
+            spectrum = MiniMaxH3Spectrum(total_steps=ns.steps, start_step=0, verbose=ns.extended_logging)
+            opts = model.model_options.setdefault('transformer_options', {})
+            opts['minimax_h3_spectrum'] = spectrum
+            print(f'[SPECTRUM] enabled | standalone H3 target-row feature forecasting | steps={ns.steps} | warm-up actual passes={MIN_FIT_POINTS}', flush=True)
+    if ns.extended_logging: log_mem('after sigma patch / before sampler setup', sync=True)
+    if ns.extended_logging: log_mem('after diffusion model load')
+    diag_cleanup=(install_sampling_block_trace(model, ns.steps) if ns.extended_logging else (lambda: None))
+    mgr_cleanup=(manager.install_sampling_hooks(model) if manager is not None else (lambda: None))
+    print(f'Sampling {frame_count} frames with {ns.steps} steps...',flush=True)
+    if ns.extended_logging: log_mem('immediately before common_ksampler', sync=True)
+    try:
+        with torch.no_grad(): sampled=nodes.common_ksampler(model,ns.seed,ns.steps,ns.cfg,ns.sampler,ns.scheduler,positive,negative,latent,denoise=1.0)[0]
+    finally:
+        try: diag_cleanup()
+        except Exception: pass
+        try: mgr_cleanup()
+        except Exception: pass
+    if spectrum is not None:
+        print(f'[SPECTRUM] sampling complete | {spectrum.summary()}', flush=True)
+        spectrum.reset()
+    video_latent,audio_latent=split_av_latents(sampled); payload={'video':video_latent.detach().cpu(),'audio':audio_latent.detach().cpu(),'frames':int(frame_count),'seed':int(ns.seed)}
+    del sampled,video_latent,audio_latent,model,clip,positive,negative,latent; _flush_models(); gc.collect(); torch.save(payload,ns.out)
+    if ns.extended_logging: log_mem('after sampling model flush / latents on CPU', sync=True)
+    if manager is not None: manager.restore()
+    try: load_trace_cleanup()
+    except Exception: pass
+    print('Ref2VA sampling stage complete.',flush=True); return 0
+if __name__=='__main__': raise SystemExit(main())
