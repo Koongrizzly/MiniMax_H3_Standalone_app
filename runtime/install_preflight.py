@@ -64,6 +64,22 @@ def save_prompt_llama_runner(runner):
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
 
+def shared_whisper_dependencies_ok():
+    """Fast, non-importing check of the shared Whisper PyAV dependency."""
+    py = shared_python()
+    if not py:
+        return False
+    root = py.parent.parent if py.parent.name.lower() == 'scripts' else py.parent
+    site = root / 'Lib' / 'site-packages'
+    installed = list(site.glob('av-*.dist-info'))
+    if not installed:
+        return False
+    try:
+        versions = [tuple(int(part) for part in info.name[3:].split('.dist-info')[0].split('.')[:2]) for info in installed]
+        return len(versions) == 1 and (18, 1) == versions[0]
+    except (ValueError, IndexError):
+        return False
+
 def media_state():
     overrides = paths()
     binroot = ROOT/'presets/bin'
@@ -87,7 +103,7 @@ def media_state():
         dict(key='shared_cpp_whisper', title='Shared Whisper.cpp — Prompt Builder + Music Clip Creator', ok=whisper_shared_ok, action='Install', note='One shared whisper-cli.exe install for both tools; supports GGML/GGUF-compatible models and uses the existing Music Clip Creator whisper.cpp runtime when available'),
         dict(key='prompt_llama', title='Prompt Builder — llama.cpp GGUF backend', ok=bool(llama), action='Install', note='Optional local GGUF backend. Uses Prompt Builder CUDA llama.cpp bundle under presets/bin/llama or your selected llama-server.exe; GGUF model is chosen in Prompt Builder'),
         dict(key='beat', title='BeatSyncFX environment', ok=bool(beat_env and (BEAT/'helpers/gui.py').is_file()), action='Install', note='Separate portable BeatSyncFX environment; does not modify GrizzlyMax Python'),
-        dict(key='beat_whisper', title='Shared Faster-Whisper Medium', ok=beat_medium and bool(shared_python()), action='Install Medium', note='Shared GrizzlyMax environments/.whisper and models/whisper; BeatSyncFX uses this when embedded'),
+        dict(key='beat_whisper', title='Shared Faster-Whisper Medium', ok=beat_medium and shared_whisper_dependencies_ok(), action='Install Medium', note='Shared GrizzlyMax environments/.whisper and models/whisper. Requires compatible PyAV 18.1.0; Install/Repair fixes dependencies without deleting the Medium model'),
     ]
 
 def _cmd_for(key):
@@ -108,7 +124,7 @@ def _cmd_for(key):
         if not py.is_file(): return None, None
         return [str(py), str(ROOT/'presets/extra_env/install_prompt_llama.py')], ROOT
     if key == 'beat_whisper':
-        script = ROOT/'presets/extra_env/setup_shared_whisper_medium.bat'
+        script = ROOT/'presets/extra_env/setup_shared_whisper_medium_compatible.bat'
         if script.is_file(): return ['cmd.exe','/c',str(script)], ROOT
         return None, None
     return None, None

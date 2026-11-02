@@ -203,7 +203,7 @@ def _is_hybrid_checkpoint(path) -> bool:
         return False
     try:
         name = Path(path).name.lower()
-        return any(token in name for token in ("hybrid", "sparseref", "fused"))
+        return any(token in name for token in ("hybrid", "sparseref", "fused", "singularity"))
     except Exception:
         return False
 
