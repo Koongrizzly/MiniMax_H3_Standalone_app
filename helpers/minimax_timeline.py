@@ -1682,7 +1682,7 @@ class TimelineCanvas(QWidget):
         self._rects = []
         cursor = x0
         cut_palette = [
-            QColor(accent).darker(170), QColor(accent), QColor("#476c5e"),
+            QColor("#375a7f"), QColor("#5b4b8a"), QColor("#476c5e"),
             QColor("#72553d"), QColor("#6a4f67"), QColor("#465c78"),
         ]
         state_colors = {
@@ -1765,7 +1765,7 @@ class TimelineCanvas(QWidget):
                 prompt_h = 42
                 box_left = int(left + 5)
                 box_w = max(1, int(width - 14))
-                painter.setBrush(QBrush(QColor(accent).darker(170)))
+                painter.setBrush(QBrush(QColor("#375a7f")))
                 painter.setPen(QPen(bg, 1))
                 painter.drawRect(box_left, prompt_y, box_w, prompt_h)
                 if clip.get("generation_mode") in {"source", "loaded"}:
@@ -1779,9 +1779,9 @@ class TimelineCanvas(QWidget):
                 image = self._clip_thumbnail(clip) if show_thumb else None
                 if image is not None and box_w >= 70:
                     thumb_rect = QRect(box_left + 4, prompt_y + 3, self.THUMB_W, self.THUMB_H)
-                    painter.fillRect(thumb_rect, QColor(bg))
+                    painter.fillRect(thumb_rect, QColor("#223548"))
                     painter.drawImage(thumb_rect.x(), thumb_rect.y(), image)
-                    painter.setPen(QPen(QColor(muted), 1))
+                    painter.setPen(QPen(QColor("#8ea7bf"), 1))
                     painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawRect(thumb_rect)
                     text_left = thumb_rect.right() + 8
@@ -1794,7 +1794,7 @@ class TimelineCanvas(QWidget):
                     painter.setFont(badge_font)
                     badge_y = prompt_y + prompt_h + 13
                     left_badges, right_badges = self._status_badges(idx, clip)
-                    painter.setPen(QColor(text))
+                    painter.setPen(QColor("#f4f6f8"))
                     if left_badges:
                         painter.drawText(thumb_rect.left(), badge_y, " ".join(left_badges))
                     if right_badges:
@@ -1804,7 +1804,7 @@ class TimelineCanvas(QWidget):
                         painter.drawText(max(int(left + 8), badge_right - right_w), badge_y, right_text)
                     painter.setFont(font)
 
-                painter.setPen(QColor(text))
+                painter.setPen(QColor("#f4f6f8"))
                 text_rect = QRect(text_left, prompt_y + 2, text_w, prompt_h - 4)
                 painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine), fm.elidedText(prompt, Qt.TextElideMode.ElideRight, text_w))
 
@@ -1841,16 +1841,16 @@ class TimelineCanvas(QWidget):
             top = sound_top + row * (self.SOUND_ROW_H + self.SOUND_ROW_GAP)
             rect = QRect(int(left), int(top), int(width), self.SOUND_ROW_H)
             self._audio_rects.append((str(item.get("id") or ""), rect))
-            painter.setBrush(QBrush(QColor(accent)))
+            painter.setBrush(QBrush(QColor("#5b4b8a")))
             painter.setPen(QPen(border, 1))
             painter.drawRoundedRect(rect, 5, 5)
-            painter.setPen(QColor(text))
+            painter.setPen(QColor("#f4f6f8"))
             name = str(item.get("name") or Path(str(item.get("path") or "Audio")).stem or "Audio")
             volume = int(round(float(100 if item.get("volume_percent") is None else item.get("volume_percent"))))
             end_sec = start_sec + duration
             line1 = fm.elidedText(name, Qt.TextElideMode.ElideRight, max(20, rect.width() - 12))
             painter.drawText(rect.x() + 6, rect.y() + 17, line1)
-            painter.setPen(QColor(muted))
+            painter.setPen(QColor("#c9c5df"))
             try:
                 fade_in = max(0.0, float(item.get("fade_in_seconds") or 0.0))
             except Exception:
@@ -2474,7 +2474,7 @@ class TimelineTab(QWidget):
             "Press 'Use current Generation settings' to refresh it from the Generation tab."
         )
         self.generation_resolution_label.setStyleSheet(
-            "QLabel { color: palette(highlight); font-weight: 600; padding: 0 8px; }"
+            "QLabel { color: #82e7ff; font-weight: 600; padding: 0 8px; }"
         )
         viewbar.addWidget(self.generation_resolution_label)
         root.addLayout(viewbar)

@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QProcess, QTimer, QEvent, QUrl, QSizeF, Signal
-from PySide6.QtGui import QDesktopServices, QTextCursor, QPainter, QColor, QBrush, QPixmap, QIcon, QPalette
+from PySide6.QtGui import QDesktopServices, QTextCursor, QPainter, QColor, QBrush, QPixmap, QIcon
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -1038,7 +1038,6 @@ class MainWindow(QMainWindow):
         self._layout_refresh_pending = False
         self._main_scroll_pages = []
         self._font_size_pt = 10
-        self._theme_name = "default"
         self._font_apply_timer = QTimer(self)
         self._font_apply_timer.setSingleShot(True)
         self._font_apply_timer.setInterval(1800)
@@ -1979,15 +1978,13 @@ class MainWindow(QMainWindow):
         t.setAlternatingRowColors(True); t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         t.setMinimumHeight(92)
         t.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents); t.header().setStretchLastSection(True)
-        # Palette roles update automatically when the user switches themes.
-        # Never cache a fixed dark background on individual queue columns.
+        # Do not rely on the native Windows palette here.  Some dark-theme combinations
+        # produced a white viewport/header with near-white text, making real queue rows look empty.
         t.setStyleSheet("""
-            QTreeWidget { background:palette(base); alternate-background-color:palette(alternate-base);
-                          color:palette(text); border:1px solid palette(mid); }
-            QTreeWidget::item { min-height:24px; padding:2px; }
-            QTreeWidget::item:selected { background:palette(highlight); color:palette(highlighted-text); }
-            QHeaderView::section { background:palette(button); color:palette(button-text);
-                border:0; border-right:1px solid palette(mid); border-bottom:1px solid palette(mid); padding:5px; }
+            QTreeWidget { background-color:#0b0f14; alternate-background-color:#101821; color:#e8eef6; border:1px solid #334556; }
+            QTreeWidget::item { color:#e8eef6; min-height:24px; padding:2px; }
+            QTreeWidget::item:selected { background:#176c89; color:#ffffff; }
+            QHeaderView::section { background:#18232e; color:#dce8f3; border:0; border-right:1px solid #334556; border-bottom:1px solid #334556; padding:5px; }
         """)
         return t
 
@@ -2165,7 +2162,7 @@ class MainWindow(QMainWindow):
             self.running_tree.clear(); self.pending_tree.clear(); self.finished_tree.clear()
             now=time.time(); spin=("◐","◓","◑","◒")[self._spinner_index%4]
             counts={"running":0,"pending":0,"finished":0}
-            normal_brush=QBrush(self.palette().color(QPalette.ColorRole.Text)); failed_brush=QBrush(QColor("#ff8f8f")); done_brush=QBrush(QColor("#9be7b0"))
+            normal_brush=QBrush(QColor("#e8eef6")); failed_brush=QBrush(QColor("#ff8f8f")); done_brush=QBrush(QColor("#9be7b0"))
             # Render terminal jobs newest-first while preserving the existing
             # order semantics of Running/Pending jobs.  queue_jobs itself is not
             # reordered because dependency and pending scheduling logic use it.
@@ -2190,7 +2187,7 @@ class MainWindow(QMainWindow):
                         pb.setRange(0,0); pb.setFormat(f"{spin} {j.get('phase','Working…')}")
                     else:
                         pb.setRange(0,100); pb.setValue(int(p)); pb.setFormat(f"Sampling %p%")
-                    # Use the inherited, live theme for queued progress indicators.
+                    pb.setStyleSheet("QProgressBar{background:#111820;color:#e8eef6;border:1px solid #334556;text-align:center;} QProgressBar::chunk{background:#126680;}")
                     self.running_tree.setItemWidget(item,3,pb)
                     self._apply_queue_dependency_tooltips(item,j,7,8)
                 elif state=="pending":
@@ -5208,19 +5205,8 @@ class MainWindow(QMainWindow):
         fontrow.addWidget(self.font_size_slider, 1)
         fontrow.addWidget(self.font_size_label)
         fontv.addLayout(fontrow)
-        theme_row = QHBoxLayout()
-        theme_row.addWidget(QLabel("Theme:", fontg))
-        self.theme_combo = QComboBox(fontg)
-        for name, key in (("Default", "default"), ("Matrix", "matrix"),
-                          ("Day (Windows light)", "day"), ("Dark grey with blue", "blue"),
-                          ("Dark grey with violet", "violet")):
-            self.theme_combo.addItem(name, key)
-        self.theme_combo.setToolTip("Apply a theme to GrizzlyMax, embedded helpers, queue and timeline. Saved with your GUI settings.")
-        theme_row.addWidget(self.theme_combo, 1)
-        fontv.addLayout(theme_row)
         v.addWidget(fontg)
         self.font_size_slider.valueChanged.connect(self._font_size_slider_changed)
-        self.theme_combo.currentIndexChanged.connect(self._theme_changed)
 
         outg = QGroupBox("Output"); of = QFormLayout(outg)
         self.output_folder = FolderRow(f"Blank = default: {DEFAULT_OUTPUT_DIR}")
@@ -5648,14 +5634,6 @@ class MainWindow(QMainWindow):
             pass
         self.status.setText(f"Font size applied globally: {self._font_size_pt} pt")
 
-    def _theme_changed(self, _index):
-        self._theme_name = str(self.theme_combo.currentData() or "default")
-        self._apply_style()
-        try:
-            self.save_last()
-        except Exception:
-            pass
-
     def _apply_style(self):
         base = max(5, min(15, int(getattr(self, "_font_size_pt", 10))))
         title = base + 7
@@ -5686,23 +5664,7 @@ class MainWindow(QMainWindow):
         QScrollBar:vertical { background:#0c1116; width:14px; margin:0; } QScrollBar::handle:vertical { background:#395166; min-height:30px; border-radius:6px; }
         """
         style = style.replace("__BASE__", str(base)).replace("__TITLE__", str(title)).replace("__HUD__", str(hud))
-        # Replace the original dark-theme colors without disturbing its layout,
-        # spacing or typography. Default remains byte-for-byte visually unchanged.
-        try:
-            from .grizzly_theme import theme_colors, build_palette, recolor_stylesheet
-        except ImportError:
-            from grizzly_theme import theme_colors, build_palette, recolor_stylesheet
-        colors = theme_colors(self._theme_name)
-        style = recolor_stylesheet(style, self._theme_name)
-        app = QApplication.instance()
-        if app:
-            app.setPalette(build_palette(colors))
         self.setStyleSheet(style)
-        # The timeline is custom-painted, not QSS. Give it the same palette and
-        # explicitly invalidate every embedded widget's cached rendering.
-        for w in self.findChildren(QWidget):
-            w.update()
-        self.update()
 
     def _current_resolution(self):
         aspect = self.aspect.currentText()
@@ -6330,7 +6292,6 @@ class MainWindow(QMainWindow):
             "preview_in_main_tab": True,
             "auto_update_enabled": self.auto_update_enabled.isChecked(),
             "font_size_pt": int(self.font_size_slider.value()) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
-            "interface_theme": self._theme_name,
             "play_result_finished": self.play_result_finished.isChecked(),
             "play_result_queue_player": True,
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
@@ -6399,12 +6360,6 @@ class MainWindow(QMainWindow):
             self.font_size_slider.blockSignals(False)
             self._font_size_pt = saved_font
             self._update_font_size_label(saved_font)
-            saved_theme = str(d.get("interface_theme", "default"))
-            theme_idx = self.theme_combo.findData(saved_theme)
-            self.theme_combo.blockSignals(True)
-            self.theme_combo.setCurrentIndex(max(0, theme_idx))
-            self.theme_combo.blockSignals(False)
-            self._theme_name = str(self.theme_combo.currentData() or "default")
             self._apply_style()
             self._restore_tab_order(d.get("tab_order", []))
             self.play_result_finished.setChecked(bool(d.get("play_result_finished", False)))
