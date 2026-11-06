@@ -1373,55 +1373,37 @@ def _h3_reference_labels(refs: Sequence[ReferenceAsset]) -> Dict[str, List[Tuple
 
 
 def _creative_pool_items(value: str, *, allow_commas: bool = False) -> List[str]:
-    """Parse a Creative brief field as an option pool without breaking real sequences.
+    """Parse alternative creative options without merging a comma-separated pool.
 
-    New lines, semicolons and pipes are explicit option separators.  Location/camera
-    fields also accept simple comma-separated lists, but connected choreography such as
-    "from the basement through the hallway to the roof" or "whip pan then rack focus"
-    stays one instruction.
+    For location/camera fields, commas are separators, including when individual
+    options contain words like "through", "from", or "to the".  A comma followed
+    by a continuation clause ("then ...", "while ...", etc.) stays within one
+    choreography instruction.  Newlines, semicolons and pipes always separate.
     """
     raw = str(value or "").strip()
     if not raw:
         return []
 
-    sequence_markers = (
-        " then ", " followed by ", " before ", " after ", " while ",
-        " from ", " through ", " into ", " to the ", " and then ", "->", "→",
-    )
-    normalized_raw = re.sub(r"\s+", " ", raw)
-    low = f" {normalized_raw.lower()} "
-    connected_sequence = any(marker in low for marker in sequence_markers)
+    segments = re.split(r"[\r\n;|]+", raw)
+    parts: List[str] = []
+    for segment in segments:
+        segment = re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", segment).strip()
+        if not segment:
+            continue
+        if not allow_commas or "," not in segment:
+            parts.append(segment)
+            continue
 
-    parts = re.split(r"[\r\n;|]+", raw)
-    parts = [re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", p).strip() for p in parts]
-    parts = [p for p in parts if p]
-
-    if allow_commas and len(parts) == 1 and "," in parts[0]:
-        comma_parts = [p.strip() for p in parts[0].split(",") if p.strip()]
-
-        # Explicit named-option lists use the user-facing format
-        # "Name - description, Name - description, ...".  In that format commas are
-        # guaranteed option separators, so words such as "from" or "to the" inside a
-        # description must NOT cause the entire list to collapse into one option.
-        # This is especially important for location/camera pools such as
-        # "Zion - humans live free from machines, Rooftop - ..." and
-        # "Overhead Shot - shows action from directly above, ...".
-        named_options = [
-            item for item in comma_parts
-            if re.match(r"^.{1,80}?\s+[-–—:]\s+\S+", item)
-        ]
-        looks_like_named_pool = len(comma_parts) >= 2 and len(named_options) == len(comma_parts)
-
-        # Preserve the older compact-list fallback for simple alternatives while still
-        # protecting genuine connected prose/choreography from incidental commas.
-        looks_like_compact_pool = (
-            len(comma_parts) >= 2
-            and not connected_sequence
-            and max(len(item) for item in comma_parts) <= 140
-        )
-
-        if looks_like_named_pool or looks_like_compact_pool:
-            parts = comma_parts
+        comma_parts = [part.strip() for part in segment.split(",") if part.strip()]
+        # "Pan left, then tilt up" is a single sequential camera instruction.
+        # Detect the continuation *after the comma*, not anywhere in the pool:
+        # "a tunnel through the sea, a rooftop" denotes TWO locations.
+        continuation = re.compile(r"^(?:and\s+then|then|while|before|after|followed\s+by)\b", re.I)
+        for candidate in comma_parts:
+            if parts and continuation.match(candidate):
+                parts[-1] += ", " + candidate
+            else:
+                parts.append(candidate)
 
     out: List[str] = []
     seen = set()
