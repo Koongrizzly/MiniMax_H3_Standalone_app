@@ -569,11 +569,14 @@ def fixed_combo(options, current):
     return c
 
 
-def scroll_pane(child):
+def scroll_pane(child, horizontal=True):
     area = QScrollArea()
     area.setWidgetResizable(True)
     area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    area.setHorizontalScrollBarPolicy(
+        Qt.ScrollBarPolicy.ScrollBarAsNeeded if horizontal
+        else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
     area.setMinimumWidth(260)
     area.setFrameShape(QFrame.Shape.NoFrame)
     area.setWidget(child)
@@ -1135,7 +1138,9 @@ class MainWindow(QMainWindow):
         notes.setWordWrap(True); layout.addWidget(notes)
         layout.addStretch()
         self._update_properties_visibility()
-        self.tabs.addTab(scroll_pane(panel),'Effects timeline')
+        # The effects table has its own horizontal scrollbar; disable only the
+        # outer tab scrollbar to prevent sideways jumps when selecting effects.
+        self.tabs.addTab(scroll_pane(panel, horizontal=False),'Effects timeline')
 
     def _build_export_tab(self):
         panel = QWidget(); layout=QVBoxLayout(panel)
@@ -2310,13 +2315,58 @@ class MainWindow(QMainWindow):
         if idx>=len(self.project.get('events',[])):return
         ev=self.project['events'][idx]
         style=ev.get('style','')
-        if style not in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay'):
+        if style not in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout'):
             QMessageBox.information(self,'Select an effect','This effect does not have specialized settings.')
             return
-        dlg=QDialog(self);dlg.setWindowTitle('Edit '+style);dlg.resize(460,310)
+        dlg=QDialog(self);dlg.setWindowTitle('Edit '+style);dlg.resize(520,670 if style == 'Speech Balloon / Callout' else 310)
         outer=QVBoxLayout(dlg);form=QFormLayout();outer.addLayout(form)
         title=QLineEdit(str(ev.get('text','')));form.addRow('Label / heading:',title)
-        if style=='Planar Overlay':
+        if style == 'Speech Balloon / Callout':
+            shape=fixed_combo(['Speech bubble','Rounded bubble','Thought bubble','HUD callout','Comic burst','Caption box','Pointer label'],str(ev.get('balloon_shape','Speech bubble')))
+            balloon_font_size=spin_int(8,180,int(ev.get('balloon_font_size',30)))
+            balloon_width=spin_int(100,1200,int(ev.get('balloon_width',340)))
+            balloon_padding=spin_int(4,80,int(ev.get('balloon_padding',18)))
+            balloon_border=spin_double(0,20,float(ev.get('balloon_border',2)),1,.5)
+            balloon_fill=QLineEdit(str(ev.get('balloon_fill','#F3F5F7')))
+            balloon_text_color=QLineEdit(str(ev.get('balloon_text_color','#151B23')))
+            balloon_fill_opacity=spin_int(0,100,int(ev.get('balloon_fill_opacity',92)))
+            balloon_tail_x=spin_double(-100,100,float(ev.get('balloon_tail_x',12)),1,1)
+            balloon_tail_y=spin_double(-100,100,float(ev.get('balloon_tail_y',18)),1,1)
+            balloon_animation=fixed_combo(['Pop','Slide up','None'],str(ev.get('balloon_animation','Pop')))
+            balloon_animate_duration=spin_double(.05,10,float(ev.get('balloon_animate_duration',.4)),2,.05)
+            for label, widget in [('Bubble shape:',shape),('Text font size:',balloon_font_size),
+                    ('Minimum width (1280px basis):',balloon_width),('Inner padding:',balloon_padding),
+                    ('Border thickness:',balloon_border),('Background color (hex):',balloon_fill),
+                    ('Text color (hex):',balloon_text_color),('Fill opacity (%):',balloon_fill_opacity),
+                    ('Pointer X offset (% frame):',balloon_tail_x),('Pointer Y offset (% frame):',balloon_tail_y),
+                    ('Entrance animation:',balloon_animation),('Entrance duration (s):',balloon_animate_duration)]:
+                form.addRow(label,widget)
+            hint=QLabel('Text supports manual line breaks in the table. The balloon is centered at X/Y and its pointer uses independent X/Y offsets. The event color controls the outline. Use the timeline for Start/End and fades. No PNG required.')
+        elif style in ('Scramble Title','Rolling Number'):
+            anim_duration=spin_double(.05,120,float(ev.get('scramble_duration',1.5)),2,.1)
+            anim_order=fixed_combo(['Left to right','Right to left','Random'],str(ev.get('scramble_order','Left to right')))
+            anim_rate=spin_int(1,120,int(ev.get('scramble_rate',22)))
+            anim_size=spin_int(8,300,int(ev.get('scramble_font_size',72)))
+            for label,widget in [('Animation duration (s):',anim_duration),('Character locking order:',anim_order),
+                                 ('Character changes/sec:',anim_rate),('Main font size:',anim_size)]:
+                form.addRow(label,widget)
+            if style == 'Scramble Title':
+                subtitle=QLineEdit(str(ev.get('scramble_subtitle','Produced by Koon Grizzly')))
+                sub_delay=spin_double(0,120,float(ev.get('scramble_subtitle_delay',1.0)),2,.1)
+                sub_duration=spin_double(.05,120,float(ev.get('scramble_subtitle_duration',1.5)),2,.1)
+                sub_size=spin_int(8,200,int(ev.get('scramble_subtitle_size',26)))
+                sub_gap=spin_int(0,250,int(ev.get('scramble_gap',32)))
+                sub_color=QLineEdit(str(ev.get('scramble_subtitle_color','#ACACAC')))
+                for label,widget in [('Smaller second line:',subtitle),('Subtitle start delay (s):',sub_delay),
+                                     ('Subtitle animation (s):',sub_duration),('Subtitle font size:',sub_size),
+                                     ('Space between lines:',sub_gap),('Subtitle hex color:',sub_color)]:
+                    form.addRow(label,widget)
+                hint=QLabel('Two independent transparent text lines. The title decodes first; the credit starts after its delay. Edit Start/End, position and main color in the effects table.')
+            else:
+                revolutions=spin_int(1,30,int(ev.get('scramble_revolutions',5)))
+                form.addRow('Full reel revolutions:',revolutions)
+                hint=QLabel('Enter your final number in the Label / heading field. Each digit spins vertically and stops at its exact target. Non-digits stay unchanged.')
+        elif style=='Planar Overlay':
             font_size=spin_int(12,240,int(ev.get('planar_font_size',88)))
             image_path=QLineEdit(str(ev.get('planar_image','')))
             choose=button('Browse PNG',lambda: image_path.setText(QFileDialog.getOpenFileName(dlg,'Overlay image','','Images (*.png *.jpg *.jpeg *.webp)')[0] or image_path.text()))
@@ -2369,7 +2419,23 @@ class MainWindow(QMainWindow):
         controls.addWidget(cancel);controls.addWidget(save)
         if dlg.exec()!=QDialog.DialogCode.Accepted:return
         ev['text']=title.text()
-        if style=='Planar Overlay':
+        if style == 'Speech Balloon / Callout':
+            ev.update(balloon_shape=shape.currentText(),balloon_font_size=balloon_font_size.value(),
+                balloon_width=balloon_width.value(),balloon_padding=balloon_padding.value(),
+                balloon_border=balloon_border.value(),balloon_fill=balloon_fill.text(),
+                balloon_text_color=balloon_text_color.text(),balloon_fill_opacity=balloon_fill_opacity.value(),
+                balloon_tail_x=balloon_tail_x.value(),balloon_tail_y=balloon_tail_y.value(),
+                balloon_animation=balloon_animation.currentText(),balloon_animate_duration=balloon_animate_duration.value())
+        elif style in ('Scramble Title','Rolling Number'):
+            ev.update(scramble_duration=anim_duration.value(),scramble_order=anim_order.currentText(),
+                      scramble_rate=anim_rate.value(),scramble_font_size=anim_size.value())
+            if style=='Scramble Title':
+                ev.update(scramble_subtitle=subtitle.text(),scramble_subtitle_delay=sub_delay.value(),
+                          scramble_subtitle_duration=sub_duration.value(),scramble_subtitle_size=sub_size.value(),
+                          scramble_gap=sub_gap.value(),scramble_subtitle_color=sub_color.text())
+            else:
+                ev['scramble_revolutions']=revolutions.value()
+        elif style=='Planar Overlay':
             ev.update(planar_font_size=font_size.value(),planar_image=image_path.text())
         elif style=='Linked Callout':
             ev.update(callout_frame=frame.currentText(),callout_offset_x=offset_x.value(),
@@ -2414,8 +2480,8 @@ class MainWindow(QMainWindow):
                           'Industrial Warning Frame','Horizontal Line','Vertical Line')
         is_text=style in ('Text Overlay','Pop Open','Side Slam','Stamp','Slide in',
                           'Beat punch','Wobble','Glitch','Neon tag','Echo Typography',
-                          'Word Storm','Corner Label','Scrolling Ticker','Text Reveal')
-        self.composite_edit_button.setVisible(style in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay'))
+                          'Word Storm','Corner Label','Scrolling Ticker','Text Reveal','Scramble Title','Rolling Number','Speech Balloon / Callout')
+        self.composite_edit_button.setVisible(style in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout'))
         self.typography_panel.setVisible(is_text)
         self.frame_panel.setVisible(is_frame)
         self.line_panel.setVisible(is_line)
@@ -2442,6 +2508,8 @@ class MainWindow(QMainWindow):
             'Linked Callout': 'TARGET IDENTIFIED', 'Data Card': 'DATA RECORD',
             'Analysis Panel / Counter': 'SYSTEM ANALYSIS', 'Text Reveal': 'FUTURE LOADING',
             'Planar Overlay':'ACCESS GRANTED',
+            'Scramble Title': 'THE SIMULATION', 'Rolling Number': '847291',
+            'Speech Balloon / Callout': 'HELLO, SIMULATION!',
             'Free Line': '', 'Arrow Line': '',
             'Corner Label': 'FOREST - EMPTY 0.87', 'Scrolling Ticker': 'SYSTEM READY  •  AUDIO ACTIVE',
         }.get(style, '' if is_motion else 'HIT!')
@@ -2453,6 +2521,23 @@ class MainWindow(QMainWindow):
               'opacity': 100, 'rotation': 0, 'seed': 1234,
               'font_family': self.effect_font.currentText() if hasattr(self,'effect_font') else 'Anton',
               'frame_width':90, 'frame_height':88, 'line_thickness':2.5}
+        if style == 'Speech Balloon / Callout':
+            ev.update(x=50,y=36,color='#DCE5F0',font_family='Arial',
+                balloon_shape='Speech bubble',balloon_font_size=30,balloon_width=340,
+                balloon_padding=18,balloon_border=2,balloon_fill='#F3F5F7',
+                balloon_text_color='#151B23',balloon_fill_opacity=92,
+                balloon_tail_x=12,balloon_tail_y=18,balloon_animation='Pop',
+                balloon_animate_duration=.4,fade_in=0,fade_out=.25,
+                end=round(start+4,3))
+        if style in ('Scramble Title','Rolling Number'):
+            ev.update(x=50,y=48,color='#ACACAC',font_family='Consolas',
+                      scramble_font_size=72 if style=='Scramble Title' else 92,
+                      scramble_duration=1.5,scramble_order='Left to right',scramble_rate=22,
+                      scramble_subtitle='Produced by Koon Grizzly',scramble_subtitle_delay=1.0,
+                      scramble_subtitle_duration=1.5,scramble_subtitle_size=26,
+                      scramble_subtitle_color='#ACACAC',scramble_gap=32,
+                      scramble_revolutions=5,fade_in=0.0,fade_out=0.35,
+                      end=round(start+4.5,3))
         if style == 'Planar Overlay':
             from .planar import DEFAULT_QUAD
             ev.update(quad=[list(v) for v in DEFAULT_QUAD],planar_font_size=88,color='#DCE5F0',fade_in=0,fade_out=0,end=min(start+5,float(self.project.get('duration') or start+5)))

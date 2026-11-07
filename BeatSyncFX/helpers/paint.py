@@ -427,6 +427,7 @@ MOTION_STUDIO_STYLES = (
     'Warning Stripes', 'Lightning Bolts', 'Glitch Blocks', 'Film Burn',
     'Animated Arrows', 'Echo Typography', 'Word Storm', 'Starfield Rush',
     'Halftone Burst', 'Kinetic Grid',
+    'Scramble Title', 'Rolling Number', 'Speech Balloon / Callout',
     'Speedometer HUD', 'Warning Meter', 'Scanning HUD', 'Arrow Impact',
     'Heartbeat', 'Rotary Mechanism',
     'Equalizer 3-Band', 'Equalizer 12-Band', 'Beat Heart',
@@ -936,6 +937,248 @@ def _draw_planar_overlay(p, w, h, t, event, project):
     p.restore()
 
 
+def _draw_speech_balloon(p: QPainter, w: int, h: int, t: float, event: dict):
+    """Procedural transparent speech/thought/HUD/comic labels, shared by preview/export."""
+    start = float(event.get('start', 0)); end = float(event.get('end', start+1))
+    if not start <= t < end:
+        return
+    sf = min(w/1280.0, h/720.0)
+    alpha = clamp(float(event.get('opacity', 100))/100) * event_fade(event,t,start,end)
+    if alpha <= 0: return
+    kind = str(event.get('balloon_shape', 'Speech bubble'))
+    fs = max(8., float(event.get('balloon_font_size', 30))*sf)
+    font = _font(str(event.get('font_family') or 'Arial'), fs, False)
+    fm = QFontMetricsF(font)
+    lines = str(event.get('text', 'HELLO!')).splitlines()[:10] or ['']
+    padding = max(4., float(event.get('balloon_padding', 18))*sf)
+    min_w = max(60*sf, float(event.get('balloon_width', 340))*sf)
+    max_w = max(min_w, w*.8)
+    # Manual line breaks control layout; excessively long lines wrap deterministically.
+    wrapped = []
+    for line in lines:
+        if fm.horizontalAdvance(line) <= max_w-2*padding:
+            wrapped.append(line)
+        else:
+            cur = ''
+            for word in line.split(' '):
+                candidate = (cur+' '+word).strip()
+                if cur and fm.horizontalAdvance(candidate) > max_w-2*padding:
+                    wrapped.append(cur); cur=word
+                else: cur=candidate
+            wrapped.append(cur)
+    wrapped = wrapped[:12]
+    bw = min(max_w, max(min_w, max((fm.horizontalAdvance(line) for line in wrapped),default=0)+2*padding))
+    line_h = fm.lineSpacing()*1.13
+    bh = max(line_h+2*padding, len(wrapped)*line_h+2*padding)
+    local=t-start
+    anim=max(.05,float(event.get('balloon_animate_duration', .4)))
+    how=str(event.get('balloon_animation', 'Pop'))
+    scale=1.0
+    if how=='Pop': scale=.65+.35*ease_out_cubic(local/anim)
+    if how=='Slide up':
+        shift=(1-ease_out_cubic(local/anim))*35*sf
+    else: shift=0.
+    p.save()
+    p.setOpacity(alpha)
+    p.translate(w*float(event.get('x',50))/100,h*float(event.get('y',50))/100+shift)
+    p.rotate(float(event.get('rotation',0)))
+    p.scale(scale,scale)
+    r=QRectF(-bw/2,-bh/2,bw,bh)
+    ink=str(event.get('balloon_text_color','#151B23'))
+    outline=str(event.get('color','#DCE5F0'))
+    fill=str(event.get('balloon_fill','#F3F5F7'))
+    fill_alpha=clamp(float(event.get('balloon_fill_opacity',92))/100)
+    thick=max(.5,float(event.get('balloon_border',2))*sf)
+    p.setPen(QPen(color(outline),thick))
+    p.setBrush(color(fill,fill_alpha))
+    tipx=w*float(event.get('balloon_tail_x',12))/100
+    tipy=h*float(event.get('balloon_tail_y',18))/100
+    # Tail endpoint is an independent local offset, not locked to the text box.
+    if kind in ('Speech bubble','Rounded bubble','Thought bubble'):
+        body=QPainterPath()
+        radius = (min(28*sf,bh*.3) if kind!='Thought bubble' else min(bh*.32,bw*.14))
+        body.addRoundedRect(r,radius,radius)
+        if kind=='Thought bubble':
+            p.drawPath(body)
+            for factor,size in ((.60,10),(.83,6), (1.,3.5)):
+                p.drawEllipse(QPointF(tipx*factor,tipy*factor),size*sf,size*sf)
+        else:
+            # Triangle tail joins the closest side of the body.
+            tx=max(r.left()+15*sf,min(r.right()-15*sf,tipx))
+            ty=max(r.top()+15*sf,min(r.bottom()-15*sf,tipy))
+            if abs(tipy)>abs(tipx)*bh/max(1,bw):
+                edge=r.bottom() if tipy>=0 else r.top()
+                tail=QPainterPath();tail.moveTo(tx-11*sf,edge)
+                tail.lineTo(tipx,tipy);tail.lineTo(tx+11*sf,edge);tail.closeSubpath()
+            else:
+                edge=r.right() if tipx>=0 else r.left()
+                tail=QPainterPath();tail.moveTo(edge,ty-11*sf)
+                tail.lineTo(tipx,tipy);tail.lineTo(edge,ty+11*sf);tail.closeSubpath()
+            body=body.united(tail)
+            p.drawPath(body)
+    elif kind=='Comic burst':
+        path=QPainterPath()
+        n=20
+        for i in range(n):
+            a=-math.pi/2+i*2*math.pi/n
+            rad=1.0 if i%2==0 else .80
+            point=QPointF(math.cos(a)*bw*.59*rad,math.sin(a)*bh*.69*rad)
+            if i==0:path.moveTo(point)
+            else:path.lineTo(point)
+        path.closeSubpath();p.drawPath(path)
+    else:
+        if kind=='HUD callout':
+            p.setBrush(color(fill,fill_alpha*.68))
+            p.drawRoundedRect(r,4*sf,4*sf)
+            p.drawLine(QPointF(0,r.bottom()),QPointF(tipx*.55,tipy))
+            p.drawEllipse(QPointF(tipx,tipy),3*sf,3*sf)
+        elif kind=='Caption box':
+            p.drawRoundedRect(r,5*sf,5*sf)
+        else:  # Pointer label
+            p.drawRoundedRect(r,8*sf,8*sf)
+            p.drawLine(QPointF(0,r.bottom()),QPointF(tipx,tipy))
+    p.setFont(font)
+    p.setPen(color(ink))
+    top = -len(wrapped)*line_h/2
+    for i,line in enumerate(wrapped):
+        yy=top+i*line_h+(line_h-fm.height())/2+fm.ascent()
+        p.drawText(QPointF(-fm.horizontalAdvance(line)/2,yy),line)
+    p.restore()
+
+
+def _scramble_hash(seed: int, frame: int, index: int, stream: int = 0) -> int:
+    """Stable pseudo-random character index, independent of playback/render order."""
+    n = (int(seed) ^ (int(frame)*0x9E3779B1) ^ (int(index)*0x85EBCA77)
+         ^ (int(stream)*0xC2B2AE3D)) & 0xffffffff
+    n ^= n >> 16
+    n = (n * 0x7FEB352D) & 0xffffffff
+    n ^= n >> 15
+    n = (n * 0x846CA68B) & 0xffffffff
+    return (n ^ (n >> 16)) & 0xffffffff
+
+
+def _scramble_chars(text: str, elapsed: float, duration: float, order: str,
+                    seed: int, rate: float, stream: int = 0) -> str:
+    """Resolve characters independently without advancing state between frames."""
+    if not text:
+        return ''
+    positions = [i for i, ch in enumerate(text) if not ch.isspace()]
+    if order == 'Right to left':
+        positions.reverse()
+    elif order == 'Random':
+        positions.sort(key=lambda i: _scramble_hash(seed, 0, i, stream))
+    ranks = {i: rank for rank, i in enumerate(positions)}
+    alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&@'
+    step = max(0, int(max(0.0, elapsed)*max(1.0, rate)))
+    count = len(positions)
+    result = []
+    for i, ch in enumerate(text):
+        if i not in ranks:
+            result.append(ch)
+        elif elapsed >= duration * (ranks[i] + 1) / max(1, count):
+            result.append(ch)
+        else:
+            result.append(alphabet[_scramble_hash(seed, step, i, stream) % len(alphabet)])
+    return ''.join(result)
+
+
+def _draw_scramble_effect(p: QPainter, w: int, h: int, t: float, event: dict, project: dict):
+    """Two-line title or independent digit reels. Same timestamps in preview and export."""
+    start = float(event.get('start', 0))
+    end = float(event.get('end', start+1))
+    if not start <= t < end:
+        return
+    local = t-start
+    sf = min(w/1280.0, h/720.0)
+    kind = event.get('style')
+    font_family = str(event.get('font_family') or 'Arial')
+    main_size = max(9.0, float(event.get('scramble_font_size', 85)) * sf)
+    color_main = str(event.get('color', '#ACACAC'))
+    alpha = clamp(float(event.get('opacity', 100))/100) * event_fade(event,t,start,end)
+    if alpha <= 0:
+        return
+    p.save()
+    p.setOpacity(alpha)
+    p.translate(w*float(event.get('x', 50))/100, h*float(event.get('y', 50))/100)
+    p.rotate(float(event.get('rotation', 0)))
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    seed = int(event.get('seed', 1234))
+    order = str(event.get('scramble_order', 'Left to right'))
+    rate = max(1, float(event.get('scramble_rate', 22)))
+    duration = max(.01, float(event.get('scramble_duration', 1.5)))
+
+    def draw_cells(text, y, size, tint, fixed_pitch=False):
+        if not text:
+            return
+        font = _font(font_family if not fixed_pitch else 'Consolas', size)
+        if fixed_pitch:
+            font.setStyleHint(QFont.StyleHint.Monospace)
+        metrics = QFontMetricsF(font)
+        # Equal advance for every character; the final target never shifts sideways.
+        advance = max(metrics.horizontalAdvance(ch) for ch in 'MW@#0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ') + 1.0*sf
+        total = len(text)*advance
+        p.setFont(font)
+        p.setPen(color(tint))
+        baseline = y + (metrics.ascent()-metrics.descent())/2
+        for i, ch in enumerate(text):
+            cx = -total/2 + (i+.5)*advance
+            p.drawText(QPointF(cx-metrics.horizontalAdvance(ch)/2, baseline), ch)
+
+    if kind == 'Scramble Title':
+        title = str(event.get('text', 'THE SIMULATION'))
+        subtitle = str(event.get('scramble_subtitle', 'Produced by Koon Grizzly'))
+        delay = max(0.0, float(event.get('scramble_subtitle_delay', 1.0)))
+        sub_duration = max(.01, float(event.get('scramble_subtitle_duration', 1.5)))
+        sub_size = max(7.0, float(event.get('scramble_subtitle_size', 29))*sf)
+        gap = max(0.0, float(event.get('scramble_gap', 32))*sf)
+        first = _scramble_chars(title, local, duration, order, seed, rate, 0)
+        draw_cells(first, -(sub_size+gap)/2, main_size, color_main)
+        if local >= delay:
+            second = _scramble_chars(subtitle, local-delay, sub_duration, order, seed, rate, 1)
+            draw_cells(second, (main_size+gap)/2, sub_size,
+                       str(event.get('scramble_subtitle_color', '#ACACAC')))
+    else:
+        target = str(event.get('text', '847291'))
+        # Numeric and punctuation slots remain exactly as entered.
+        digits = [i for i, c in enumerate(target) if c.isdigit()]
+        count = len(digits)
+        ranks = {j: n for n,j in enumerate(digits if order != 'Right to left' else digits[::-1])}
+        if order == 'Random':
+            ranks = {j:n for n,j in enumerate(sorted(digits,key=lambda j:_scramble_hash(seed,0,j)))}
+        font = _font('Consolas', main_size)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        fm = QFontMetricsF(font)
+        cell = max(fm.horizontalAdvance('0'), fm.horizontalAdvance('8')) + 3*sf
+        total = cell*len(target)
+        p.setFont(font)
+        p.setPen(color(color_main))
+        p.setClipRect(QRectF(-total/2-5*sf,-main_size*.8,total+10*sf,main_size*1.6))
+        for i,ch in enumerate(target):
+            x=-total/2+(i+.5)*cell
+            if i not in ranks:
+                p.drawText(QPointF(x-fm.horizontalAdvance(ch)/2,(fm.ascent()-fm.descent())/2),ch)
+                continue
+            rank=ranks[i]
+            # A staggered slowing reel ends on the exact requested digit.
+            stop=duration*(rank+1)/max(1,count)
+            fraction=clamp(local/max(.01,stop))
+            target_digit=int(ch)
+            loops=max(1, int(event.get('scramble_revolutions', 5)))
+            turns=loops*10+target_digit
+            position=turns*(1-(1-fraction)**2.4)
+            if fraction>=1.0:
+                position=float(turns)
+            integer=int(math.floor(position))
+            offset=position-integer
+            upper=str(integer%10)
+            lower=str((integer+1)%10)
+            baseline=(fm.ascent()-fm.descent())/2
+            p.drawText(QPointF(x-fm.horizontalAdvance(upper)/2,baseline-offset*main_size),upper)
+            if offset>1e-4:
+                p.drawText(QPointF(x-fm.horizontalAdvance(lower)/2,baseline+(1-offset)*main_size),lower)
+    p.restore()
+
+
 def _draw_event_inner(p: QPainter, w: int, h: int, t: float, event: dict, project: dict):
     start = float(event.get('start', 0))
     end = float(event.get('end', start + 1))
@@ -948,6 +1191,12 @@ def _draw_event_inner(p: QPainter, w: int, h: int, t: float, event: dict, projec
     y = h * float(event.get('y', 50))/100
     size = float(event.get('size', 85)) * sf
     kind = event.get('style', 'Stamp')
+    if kind == 'Speech Balloon / Callout':
+        _draw_speech_balloon(p,w,h,t,event)
+        return
+    if kind in ('Scramble Title', 'Rolling Number'):
+        _draw_scramble_effect(p,w,h,t,event,project)
+        return
     if kind == 'Planar Overlay':
         _draw_planar_overlay(p,w,h,t,event,project)
         return
