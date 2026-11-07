@@ -1242,7 +1242,23 @@ class MainWindow(QMainWindow):
         self.global_preview_splitter.setStretchFactor(1, 1)
         self.global_preview_splitter.setSizes([0, 1200])
         self.global_preview_splitter.splitterMoved.connect(self._remember_global_preview_width)
-        outer.addWidget(self.global_preview_splitter, 1)
+        # The embedded editors can report a tall minimumSizeHint after their
+        # delayed startup/refresh.  If the splitter is placed directly in the
+        # main layout, Qt may satisfy that minimum by growing the *central
+        # widget* beyond the maximized client area, pushing the fixed Generate
+        # footer below the screen.  A bounded workspace scroll area absorbs
+        # those minimum-size changes; the footer stays outside and visible.
+        self.workspace_scroll = QScrollArea(root)
+        self.workspace_scroll.setObjectName("MainWorkspaceScroll")
+        self.workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.workspace_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.workspace_scroll.setMinimumSize(0, 0)
+        self.workspace_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.global_preview_splitter.setMinimumSize(0, 0)
+        self.workspace_scroll.setWidget(self.global_preview_splitter)
+        outer.addWidget(self.workspace_scroll, 1)
 
         self._build_generation_tab()
         self._build_prompt_builder_tab()
