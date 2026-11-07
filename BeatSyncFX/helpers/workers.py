@@ -13,6 +13,7 @@ from PySide6.QtGui import QImage, QPainter
 
 from .core import ROOT, _windows_no_console, analyze_audio
 from .paint import paint_effects
+from .video_distortion import needs_video, apply_video_effects, stutter_target
 
 
 class BeatWorker(QThread):
@@ -154,15 +155,20 @@ class RenderWorker(QThread):
             self.failed.emit('Selected replacement audio does not exist: ' + music)
             return
         out.parent.mkdir(parents=True, exist_ok=True)
+        process_video = needs_video(p)
         cmd = [self.ffmpeg, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error',
                '-i', video,
                '-f', 'rawvideo', '-pixel_format', 'bgra', '-video_size', f'{width}x{height}',
                '-framerate', str(fps), '-i', 'pipe:0']
         if music:
             cmd += ['-i', music]
-        filters = (f'[0:v:0]fps={fps},scale={width}:{height}:flags=lanczos,setsar=1[base];'
-                   '[base][1:v:0]overlay=x=0:y=0:shortest=1:format=auto,'
-                   'format=yuv420p[vout]')
+        if process_video:
+            # The raw input contains the processed source AND its original overlays.
+            filters = '[1:v:0]format=yuv420p[vout]'
+        else:
+            filters = (f'[0:v:0]fps={fps},scale={width}:{height}:flags=lanczos,setsar=1[base];'
+                       '[base][1:v:0]overlay=x=0:y=0:shortest=1:format=auto,'
+                       'format=yuv420p[vout]')
         cmd += ['-filter_complex', filters, '-map', '[vout]']
         if music:
             cmd += ['-map', '2:a:0', '-af', 'apad']
@@ -194,25 +200,56 @@ class RenderWorker(QThread):
                 err.append(raw.decode('utf-8', errors='replace').rstrip())
                 if len(err) > 120:
                     del err[:60]
+        decode_proc = None
         try:
+            if process_video:
+                decoder_cmd = [self.ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'error',
+                               '-i', video, '-an', '-vf',
+                               f'fps={fps},scale={width}:{height}:flags=lanczos,setsar=1',
+                               '-f', 'rawvideo', '-pix_fmt', 'bgra', 'pipe:1']
+                decode_proc = subprocess.Popen(decoder_cmd, stdout=subprocess.PIPE,
+                                               stderr=subprocess.DEVNULL, **_windows_no_console())
             self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
                                           stdout=subprocess.DEVNULL, bufsize=0, **_windows_no_console())
             reader = threading.Thread(target=read_stderr, args=(self._proc,), daemon=True)
             reader.start()
             transparent = QImage(width, height, QImage.Format.Format_ARGB32)
+            freeze_frame = None
+            freeze_time = None
+            byte_count = width*height*4
             for i in range(count):
                 if self.stop_now:
                     break
-                transparent.fill(0)
+                t = i/fps
+                if process_video:
+                    raw = decode_proc.stdout.read(byte_count)
+                    if len(raw) != byte_count:
+                        raise RuntimeError(f'Source video decode ended at frame {i} of {count}')
+                    source = QImage(raw,width,height,width*4,QImage.Format.Format_ARGB32).copy()
+                    target = stutter_target(p,t,fps)
+                    if target is not None:
+                        if freeze_time != target or freeze_frame is None:
+                            freeze_frame=source.copy()
+                            freeze_time=target
+                        source=freeze_frame.copy()
+                    else:
+                        freeze_frame=None
+                        freeze_time=None
+                    transparent=apply_video_effects(source,p,t)
+                else:
+                    transparent.fill(0)
                 painter = QPainter(transparent)
                 try:
-                    paint_effects(painter, width, height, i/fps, p)
+                    paint_effects(painter, width, height, t, p)
                 finally:
                     painter.end()
                 # Format_ARGB32 on little-endian Windows is BGRA, matching ffmpeg's rawvideo input.
                 self._proc.stdin.write(transparent.bits().tobytes())
                 if i % max(1, fps // 2) == 0 or i == count - 1:
                     self.progress.emit(i + 1, count)
+            if decode_proc is not None:
+                decode_proc.stdout.close()
+                decode_proc.wait(timeout=10)
             try:
                 self._proc.stdin.close()
             except OSError:
@@ -230,6 +267,12 @@ class RenderWorker(QThread):
             else:
                 self.done.emit(str(out))
         except Exception as exc:
+            try:
+                if decode_proc and decode_proc.poll() is None:
+                    decode_proc.kill()
+                    decode_proc.wait(timeout=10)
+            except Exception:
+                pass
             try:
                 if self._proc and self._proc.poll() is None:
                     self._proc.kill()

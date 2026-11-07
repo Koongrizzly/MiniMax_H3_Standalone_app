@@ -15,6 +15,9 @@ def main():
     snapshot, ffmpeg, destination = sys.argv[1:]
     project = json.loads(Path(snapshot).read_text(encoding="utf-8"))
     app = QApplication.instance() or QApplication([])
+    # Queue renders use their own Qt process; GUI font registration is not inherited.
+    from .fonts import register_fonts
+    register_fonts()
     worker = RenderWorker(project, ffmpeg, destination)
     result = {"status": "failed"}
     def progress(i, total):

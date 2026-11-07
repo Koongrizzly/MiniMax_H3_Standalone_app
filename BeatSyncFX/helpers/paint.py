@@ -109,13 +109,16 @@ def draw_text(p: QPainter, text: str, x: float, y: float, size: float, family: s
 
 
 BEAT_EFFECTS = ('Border pulse', 'Side bars', 'Circle kick', 'Full-frame flash',
-                'Beat grid', 'Beat rays', 'Beat diamonds', 'Beat scanline')
+                'Beat grid', 'Beat rays', 'Beat diamonds', 'Beat scanline',
+                'Horizontal Tearing', 'RGB Split', 'Frame Stutter',
+                'Signal Dropout', 'Block Corruption', 'Impact Zoom')
 
 
 def _draw_beats(p: QPainter, w: int, h: int, t: float, project: dict, override=None):
     o = override if override is not None else project.get('options', {})
     kind = o.get('beat_style', 'Off')
-    if kind == 'Off':
+    if kind == 'Off' or kind in ('Horizontal Tearing', 'RGB Split', 'Frame Stutter',
+                                 'Signal Dropout', 'Block Corruption', 'Impact Zoom'):
         return
     strength, n = pulse(t, float(project.get('bpm', 120)), float(project.get('t0', 0)),
                         float(o.get('beat_decay', .24)), int(o.get('beat_every', 1)))

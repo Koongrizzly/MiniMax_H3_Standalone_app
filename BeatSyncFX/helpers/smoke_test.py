@@ -15,8 +15,8 @@ from .workers import RenderWorker
 
 def run():
     app = QApplication.instance() or QApplication([])
-    for font in ('Anton-Regular.ttf', 'Inter-Variable.ttf'):
-        assert QFontDatabase.addApplicationFont(str(ROOT/'assets'/'fonts'/font)) >= 0, 'Font missing: '+font
+    from .fonts import register_fonts
+    register_fonts()
     ffmpeg, ffprobe = locate_ffmpeg(load_settings().get('ffmpeg', ''))
     if not (ffmpeg and ffprobe):
         raise RuntimeError('ffmpeg and ffprobe not found. Place them in presets/bin or PATH.')

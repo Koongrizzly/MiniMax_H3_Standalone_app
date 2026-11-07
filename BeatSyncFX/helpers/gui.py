@@ -22,6 +22,7 @@ from .core import (ROOT, new_project, load_project, save_project, load_settings,
                   save_settings, save_effects_template, load_effects_template, locate_ffmpeg, ffmpeg_default_directory, probe_video, snap_beat, split_lyrics,
                   import_slopcore_words, import_whisper_json, import_subtitles, import_beatmap)
 from .paint import paint_effects, MOTION_STUDIO_STYLES, BEAT_EFFECTS
+from .video_distortion import apply_video_effects, needs_video, preview_stutter
 from .motion_math import ENTRIES, EXITS
 from .workers import BeatWorker, WhisperWorker, WhisperCppWorker, RenderWorker, MultibandWorker
 
@@ -462,7 +463,11 @@ class Preview(QWidget):
         dw, dh = w * factor, h * factor
         left, top = (self.width() - dw)/2, (self.height() - dh)/2
         if not self.frame.isNull():
-            p.drawImage(int(left), int(top), self.frame.scaled(int(dw), int(dh),
+            video_frame = self.frame
+            if needs_video(project):
+                video_frame = preview_stutter(video_frame, project, self.app.current_time(), self.app.ffmpeg)
+                video_frame = apply_video_effects(video_frame, project, self.app.current_time())
+            p.drawImage(int(left), int(top), video_frame.scaled(int(dw), int(dh),
                         Qt.AspectRatioMode.IgnoreAspectRatio,
                         Qt.TransformationMode.SmoothTransformation))
         else:
@@ -654,8 +659,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage('Offline editor ready. Open a video to begin.')
 
     def _font_setup(self):
-        for filename in ('Anton-Regular.ttf', 'Inter-Variable.ttf'):
-            QFontDatabase.addApplicationFont(str(ROOT / 'assets' / 'fonts' / filename))
+        from .fonts import register_fonts
+        register_fonts()
 
     def _create_ui(self):
         top = QWidget(); self.setCentralWidget(top)
@@ -770,6 +775,7 @@ class MainWindow(QMainWindow):
         self.beat_color = ColorPickerField('#22DDEE')
         self.beat_decay = spin_double(.03, 1.5, .24, 2, .03)
         self.beat_palette = fixed_combo(['Solid','Rainbow'], 'Solid')
+        self.beat_color.setToolTip('Color is used for graphic overlays; video distortion effects use source pixels.')
         self.beat_start = spin_double(0, 99999, 0, 3, .01)
         self.beat_end = spin_double(0, 99999, 5, 3, .01)
         style.addRow('Effect', self.beat_style)
@@ -799,8 +805,10 @@ class MainWindow(QMainWindow):
         self.legacy_beat_note=QLabel('')
         layout.addWidget(self.legacy_beat_note)
         layout.addWidget(button('Disable old full-video beat effect',self.disable_legacy_beat))
-        note=QLabel('Beat effects share the song beat grid but each has its own Start/End, color and settings. '
-                    'Several can play together. Rainbow cycles through colors as the beat moves.')
+        note=QLabel('Beat effects share the song beat grid but each has its own Start/End and settings. '
+                    'Video Distortion effects modify the footage itself; color/rainbow apply only to graphic overlays. '
+                    'Frame Stutter freezes the video momentarily while music stays in sync. '
+                    'Multiple effects can be layered.')
         note.setWordWrap(True)
         layout.addWidget(note)
         self._beat_event_indices=[]
