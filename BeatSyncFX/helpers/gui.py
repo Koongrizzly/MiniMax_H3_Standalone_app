@@ -2899,11 +2899,16 @@ class MainWindow(QMainWindow):
             return
         self.status.setText('Analyzing bass, midrange, treble and energy offline...')
         self._bands_worker=MultibandWorker(self.ffmpeg,audio)
-        self._bands_worker.ready.connect(self.bands_ready)
+        signature = self._band_audio_signature()
+        self._bands_worker.ready.connect(
+            lambda result, signature=signature: self.bands_ready(result, signature))
         self._bands_worker.failed.connect(lambda error:self.message('Audio analysis failed: '+error))
         self._bands_worker.start()
 
-    def bands_ready(self, result):
+    def bands_ready(self, result, signature=None):
+        if signature is not None and signature != self._band_audio_signature():
+            self.status.setText('Audio source changed; previous analysis discarded. Rendering will analyze the current source.')
+            return
         self.project['audio_envelopes']=result
         self.project['audio_envelopes_source']=self._band_audio_signature()
         from .audio_reactivity import energy_at
@@ -3029,6 +3034,8 @@ class MainWindow(QMainWindow):
         if Path(path).resolve()==Path(self.project['video']).resolve():
             self.message('Choose a DIFFERENT output path. Source video must not be overwritten.');return
         self._render=RenderWorker(copy.deepcopy(self.project),self.ffmpeg,path)
+        self._render.audio_analyzed.connect(self._render_audio_ready)
+        self._render.analysis_status.connect(self.status.setText)
         self._render.progress.connect(self.render_progress)
         self._render.failed.connect(self.render_failed)
         self._render.done.connect(self.render_done)
@@ -3036,6 +3043,13 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False);self.cancel_button.setEnabled(True)
         self.progress.setValue(0);self.status.setText('Rendering entirely offline...')
         self._render.start()
+
+    def _render_audio_ready(self, result, signature):
+        # The user may have selected different media while export was running.
+        if signature == self._band_audio_signature():
+            self.project['audio_envelopes'] = result
+            self.project['audio_envelopes_source'] = signature
+            self.preview.update()
 
     def render_progress(self,i,total):
         self.progress.setValue(int(100*i/total))

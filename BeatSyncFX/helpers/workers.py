@@ -13,6 +13,7 @@ from PySide6.QtGui import QImage, QPainter
 
 from .core import ROOT, _windows_no_console, analyze_audio
 from .paint import paint_effects
+from .render_audio import prepare_render_audio
 from .video_distortion import needs_video, apply_video_effects, stutter_target
 
 
@@ -124,6 +125,8 @@ class RenderWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
     cancelled = Signal()
+    audio_analyzed = Signal(object, object)
+    analysis_status = Signal(str)
 
     def __init__(self, project: dict, ffmpeg: str, destination: str):
         super().__init__()
@@ -154,6 +157,19 @@ class RenderWorker(QThread):
         if music and not Path(music).is_file():
             self.failed.emit('Selected replacement audio does not exist: ' + music)
             return
+        if self.stop_now:
+            self.cancelled.emit()
+            return
+        try:
+            refreshed = prepare_render_audio(p, self.ffmpeg, self.analysis_status.emit)
+        except Exception as exc:
+            self.failed.emit('Cannot prepare audio-reactive effects: ' + str(exc))
+            return
+        if self.stop_now:
+            self.cancelled.emit()
+            return
+        if refreshed is not None:
+            self.audio_analyzed.emit(*refreshed)
         out.parent.mkdir(parents=True, exist_ok=True)
         process_video = needs_video(p)
         cmd = [self.ffmpeg, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error',
