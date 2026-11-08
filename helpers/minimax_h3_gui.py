@@ -1400,7 +1400,16 @@ class MainWindow(QMainWindow):
             "ON: Audio 1 is encoded into H3's target audio latent and locked during denoising, so the video follows the exact real timing while the untouched Audio 1 file is used in the final output. "
             "Additional audio files, if any, stay normal references."
         )
-        rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios); rfl.addWidget(self.lock_source_audio); v.addWidget(self.ref_group)
+        rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios); rfl.addWidget(self.lock_source_audio);
+        # RefMod experimental opt-in: preserves original raw image/video/audio references.
+        # Credits: Luisa (luisacaotica) original RefMod; Gary's integration/testing with ChatGPT.
+        self.refmods = RefList("Saved H3 RefMods (experimental; max 8)", "H3 RefMods (*.safetensors)", 8)
+        self.refmods.setToolTip("Load RefMod reference latents into MiniMax H3 Ref2VA. This first version does not yet restore the Qwen3-VL visual-token path; compare identity carefully with raw references.")
+        self.refmod_create_button = QPushButton("Create RefMod from images / 360 video...")
+        self.refmod_create_button.setToolTip("Uses the existing H3 video VAE to save a Full Reference identity RefMod. No diffusion model or training required.")
+        self.refmod_create_button.clicked.connect(self._create_refmod_dialog)
+        rfl.addWidget(self.refmods); rfl.addWidget(self.refmod_create_button)
+        v.addWidget(self.ref_group)
 
         loras = QGroupBox("LoRA adapters (up to 3)"); lf = QFormLayout(loras)
         lnote = QLabel(f"Optional MiniMax H3 diffusion-model LoRAs. Browse starts in {DEFAULT_LORA_DIR}. Files from any other folder can also be selected. Strength 1.0 = normal; 0 disables that slot.")
@@ -6299,7 +6308,7 @@ class MainWindow(QMainWindow):
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(), "latent_continuation": self.latent_continuation.isChecked(),
             "combine_frames_latent": self.combine_frames_latent.isChecked(),
-            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "lock_source_audio": self.lock_source_audio.isChecked(),
+            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "refmods": self.refmods.paths(), "lock_source_audio": self.lock_source_audio.isChecked(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
@@ -6356,7 +6365,7 @@ class MainWindow(QMainWindow):
             self.continue_video.edit.setText("" if continue_last_setting else d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",90)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 4)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self.combine_frames_latent.setChecked(bool(d.get("combine_frames_latent", False))); self._sync_continue_video_options()
-            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
+            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.refmods.set_paths(d.get("refmods", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
             old_output = d.get("output", "")
@@ -7017,6 +7026,90 @@ exit /b %RC%
         except Exception as exc:
             self.append_log(f"[LLM] Automatic Prompt Builder model unload warning: {exc}\n")
 
+    def _create_refmod_dialog(self):
+        """Create a Full Reference RefMod in an isolated subprocess (never main Qt thread)."""
+        if not PYTHON.is_file():
+            QMessageBox.warning(self, "MiniMax environment missing", f"Cannot find: {PYTHON}")
+            return
+        images, _ = QFileDialog.getOpenFileNames(
+            self, "Choose 1-8 reference images (Cancel for video)",
+            _dialog_start_dir("ref_images", fallback=ROOT),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        videos = []
+        if not images:
+            video, _ = QFileDialog.getOpenFileName(
+                self, "Choose a 360-degree reference video (Cancel to abort)",
+                _dialog_start_dir("ref_videos", fallback=ROOT),
+                "Videos (*.mp4 *.mov *.mkv *.webm *.avi)")
+            if not video:
+                return
+            videos = [video]
+        if len(images) > 8:
+            QMessageBox.warning(self, "Too many images", "Select at most eight images for one character.")
+            return
+        name, ok = QFileDialog.getSaveFileName(
+            self, "Save H3 RefMod", str(ROOT / "models" / "minimax_h3" / "refmods" / (Path((images or videos)[0]).stem + ".safetensors")),
+            "H3 RefMods (*.safetensors)")
+        if not ok or not name:
+            return
+        destination = Path(name)
+        if destination.suffix.lower() != ".safetensors":
+            destination = destination.with_suffix(".safetensors")
+        if destination.exists() and QMessageBox.question(
+                self, "Overwrite RefMod?", f"Replace existing RefMod?\n{destination}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        vae = self.video_vae_model.path()
+        if vae and Path(vae).is_dir():
+            candidates = list(Path(vae).rglob("*.safetensors"))
+            vae = str(candidates[0]) if len(candidates) == 1 else ""
+        if not vae or not Path(vae).is_file():
+            vae_dir = ROOT / "models" / "minimax_h3" / "video_vae"
+            candidates = list(vae_dir.rglob("*.safetensors")) if vae_dir.is_dir() else []
+            if len(candidates) == 1:
+                vae = str(candidates[0])
+            else:
+                vae, _ = QFileDialog.getOpenFileName(
+                    self, "Select your installed MiniMax H3 VIDEO VAE", str(vae_dir),
+                    "Safetensors (*.safetensors)")
+        if not vae or not Path(vae).is_file():
+            QMessageBox.warning(self, "Video VAE required", "Select your installed H3 video VAE to create a RefMod.")
+            return
+        if getattr(self, "_refmod_creation", None) is not None and self._refmod_creation.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(self, "RefMod busy", "One RefMod creation is already running.")
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        proc = QProcess(self)
+        proc.setProgram(str(PYTHON))
+        proc.setWorkingDirectory(str(ROOT))
+        argv = ["-m", "runtime.refmod_create", "--vae", str(vae),
+                "--name", destination.stem, "--output", str(destination.parent),
+                "--mode", "encode", "--concept-type", "identity",
+                "--resolution", "512", "--max-tokens", "10240"]
+        for item in images:
+            argv.extend(["--image", item])
+        for item in videos:
+            argv.extend(["--video", item])
+        proc.setArguments(argv)
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._refmod_creation = proc
+        self._refmod_creation_path = str(destination)
+        self.refmod_create_button.setEnabled(False)
+        self.refmod_create_button.setText("Creating RefMod...")
+        proc.readyReadStandardOutput.connect(lambda: self.append_log(
+            bytes(proc.readAllStandardOutput()).decode(errors="replace")))
+        def finished(code, status):
+            self.refmod_create_button.setEnabled(True)
+            self.refmod_create_button.setText("Create RefMod from images / 360 video...")
+            if code == 0 and destination.is_file():
+                self.refmods.set_paths(self.refmods.paths() + [str(destination)])
+                QMessageBox.information(self, "RefMod created", f"Saved RefMod:\n{destination}\n\nIt is now selected for Ref2VA generation.")
+            else:
+                QMessageBox.warning(self, "RefMod creation failed", "Check the MiniMax H3 log for the extractor error. Your existing references were not changed.")
+        proc.finished.connect(finished)
+        proc.start()
+
     def generate(self):
         prompt=self.prompt.toPlainText().strip()
         if not prompt: QMessageBox.warning(self,"Prompt required","Enter a prompt before adding the job to the queue."); return
@@ -7069,8 +7162,16 @@ exit /b %RC%
             if not self.first.path() and not self.last.path() and not manual_continue_video and not continue_last:
                 QMessageBox.warning(self,"Visual input required","Choose a first frame, last frame, Continue video, or Continue last result for FL2VA."); return
         elif mode==2:
-            refs=self.ref_images.paths()+self.ref_videos.paths()+self.ref_audios.paths()
+            refs=self.ref_images.paths()+self.ref_videos.paths()+self.ref_audios.paths()+self.refmods.paths()
+            if self.refmods.paths() and (self.ref_images.paths() or self.ref_videos.paths() or self.ref_audios.paths()):
+                QMessageBox.warning(self, "RefMod test mode", "For the first experimental RefMod integration, clear ordinary image/video/audio references. Mixing them changes Qwen reference numbering and is not validated yet.")
+                return
             if not refs: QMessageBox.warning(self,"Reference required","Add at least one Ref2VA reference."); return
+            for modpath in self.refmods.paths():
+                if not Path(modpath).is_file():
+                    QMessageBox.warning(self, "RefMod missing", f"Cannot find the selected RefMod:\n{modpath}")
+                    return
+                args += ["--refmod", modpath]
             args += ["--ref-image-size",self.ref_size.currentText()]
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
