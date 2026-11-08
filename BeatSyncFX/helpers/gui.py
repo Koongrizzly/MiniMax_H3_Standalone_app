@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QColorDialog, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
     QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
     QVBoxLayout, QWidget, QHeaderView, QInputDialog, QDialog, QRadioButton, QButtonGroup,
+    QTreeWidget, QTreeWidgetItem, QAbstractItemView,
 )
 
 from .core import (ROOT, new_project, load_project, save_project, load_settings,
@@ -1029,15 +1030,69 @@ class MainWindow(QMainWindow):
         self.snap.setChecked(True)
         self.snap.toggled.connect(lambda b: self.change_option('snap_events',bool(b)))
         layout.addWidget(self.snap)
-        # Single selector for all ordinary text and graphic effect events.
-        # Countdown and imported image assets need file/target dialogs and keep dedicated buttons.
-        effect_bar = QHBoxLayout(); layout.addLayout(effect_bar)
-        effect_bar.addWidget(QLabel('Effect:'))
+        # Browser-only organization: the underlying effect style strings stay unchanged.
         self.effect_style = fixed_combo(
             ['Text Overlay', 'Pop Open', 'Side Slam', 'Stamp', 'Slide in', 'Beat punch',
              'Wobble', 'Glitch', 'Neon tag', *MOTION_STUDIO_STYLES], 'Echo Typography')
-        effect_bar.addWidget(self.effect_style, 1)
-        effect_bar.addWidget(button('Add selected effect', self.add_selected_effect))
+        self.effect_style.hide()  # Keep compatibility with all existing effect handlers.
+        effect_header = QHBoxLayout(); layout.addLayout(effect_header)
+        effect_header.addWidget(QLabel('Effect library:'))
+        self.effect_search = QLineEdit()
+        self.effect_search.setPlaceholderText('Search by effect name or what it does...')
+        self.effect_search.setClearButtonEnabled(True)
+        effect_header.addWidget(self.effect_search, 1)
+        effect_header.addWidget(button('Add selected effect', self.add_selected_effect))
+        self.effect_tree = QTreeWidget()
+        self.effect_tree.setColumnCount(2)
+        self.effect_tree.setHeaderLabels(['Effect', 'What it does'])
+        self.effect_tree.setMinimumHeight(225)
+        self.effect_tree.setMaximumHeight(340)
+        self.effect_tree.setAlternatingRowColors(True)
+        # QTreeWidget defaults to a light Fusion Base/AlternateBase even when
+        # the surrounding BeatSyncFX widgets are dark. Keep row backgrounds,
+        # text and selected-row colors together so no row becomes unreadable.
+        self.effect_tree.setStyleSheet("""
+            QTreeWidget {
+                background-color: #0b131c;
+                alternate-background-color: #192733;
+                color: #ecf1f5;
+                border: 1px solid #314554;
+                selection-background-color: #276077;
+                selection-color: #ffffff;
+            }
+            QTreeWidget::item {
+                color: #ecf1f5;
+                padding: 2px 3px;
+            }
+            QTreeWidget::item:selected {
+                background-color: #276077;
+                color: #ffffff;
+            }
+            QTreeWidget::item:hover:!selected {
+                background-color: #294052;
+            }
+            QTreeWidget QHeaderView::section {
+                background-color: #263847;
+                color: #e4eef5;
+            }
+        """)
+        self.effect_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.effect_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.effect_tree.setToolTip('Expand a category and click an effect. Double-click to add it at the playhead.')
+        self.effect_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.effect_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.effect_tree)
+        self.effect_hint = QLabel('Choose an effect to see what it does.')
+        self.effect_hint.setWordWrap(True)
+        layout.addWidget(self.effect_hint)
+        self._build_effect_browser()
+        self.effect_search.textChanged.connect(self._filter_effect_browser)
+        self.effect_tree.currentItemChanged.connect(self._effect_browser_selected)
+        self.effect_tree.itemDoubleClicked.connect(self._effect_browser_add)
+        self.effect_tree.itemExpanded.connect(self._effect_category_changed)
+        self.effect_tree.itemCollapsed.connect(self._effect_category_changed)
+        self.effect_style.currentTextChanged.connect(self._sync_effect_browser_selection)
+        self._sync_effect_browser_selection(self.effect_style.currentText())
         actions = QHBoxLayout(); layout.addLayout(actions)
         actions.addWidget(button('Add countdown', self.add_countdown))
         actions.addWidget(button('Add PNG / GIF', self.add_image_overlay))
@@ -1141,6 +1196,159 @@ class MainWindow(QMainWindow):
         # The effects table has its own horizontal scrollbar; disable only the
         # outer tab scrollbar to prevent sideways jumps when selecting effects.
         self.tabs.addTab(scroll_pane(panel, horizontal=False),'Effects timeline')
+
+    # Effect-browser metadata is deliberately UI-only: never stored in event JSON.
+    _EFFECT_GROUPS = (
+        ('Text & Titles', '#AD93E5', ('Text Overlay', 'Pop Open', 'Side Slam', 'Stamp', 'Slide in',
+          'Beat punch', 'Wobble', 'Neon tag', 'Echo Typography', 'Word Storm', 'Scramble Title',
+          'Rolling Number', 'Speech Balloon / Callout', 'Corner Label', 'Scrolling Ticker',
+          'Text Reveal', 'Comic Burst')),
+        ('Music Reactive', '#45BFA4', ('Equalizer 3-Band', 'Equalizer 12-Band', 'Beat Heart',
+          'Heartbeat', 'Kinetic Grid')),
+        ('Visual & Glitch', '#D7A35A', ('Glitch', 'Particle Spray', 'Neon Rings',
+          'Lightning Bolts', 'Glitch Blocks', 'Film Burn', 'Starfield Rush',
+          'Halftone Burst', 'Warning Stripes')),
+        ('Tracking & HUD', '#75AADB', ('Radar Sweep', 'Speedometer HUD', 'Warning Meter',
+          'Scanning HUD', 'Linked Callout', 'Data Card', 'Analysis Panel / Counter',
+          'Planar Overlay')),
+        ('Shapes & Motion', '#C8A1CF', ('Animated Arrows', 'Arrow Impact', 'Rotary Mechanism')),
+    )
+    _EFFECT_DESCRIPTIONS = {
+        'Text Overlay': 'Static text over your video',
+        'Pop Open': 'Text pops into view', 'Side Slam': 'Text slams in from the side',
+        'Stamp': 'Text lands like a stamp', 'Slide in': 'Text slides into place',
+        'Beat punch': 'Text punches on a beat', 'Wobble': 'Text rocks and wobbles',
+        'Glitch': 'Flickering digital text glitch', 'Neon tag': 'Bright neon-style label',
+        'Echo Typography': 'Repeated text trails', 'Word Storm': 'Words scatter across the frame',
+        'Scramble Title': 'Random characters decode into title and credit',
+        'Rolling Number': 'Spinning digits stop at your chosen number',
+        'Speech Balloon / Callout': 'Speech, thought and pointer bubbles',
+        'Corner Label': 'Small label in a screen corner',
+        'Scrolling Ticker': 'Text scrolls across the frame',
+        'Text Reveal': 'Text appears progressively',
+        'Comic Burst': 'Comic-style impact burst',
+        'Equalizer 3-Band': 'Three bars move with the audio',
+        'Equalizer 12-Band': 'Twelve music-driven frequency bars',
+        'Beat Heart': 'Heart reacts to the music',
+        'Heartbeat': 'Animated heartbeat graphic',
+        'Kinetic Grid': 'Moving geometric grid',
+        'Particle Spray': 'Burst of moving particles',
+        'Neon Rings': 'Pulsing rings of light',
+        'Lightning Bolts': 'Animated electrical flashes',
+        'Glitch Blocks': 'Random digital block interference',
+        'Film Burn': 'Bright film-burn transition',
+        'Starfield Rush': 'Fast-moving starfield',
+        'Halftone Burst': 'Comic-print dot pattern',
+        'Warning Stripes': 'Animated diagonal warning stripes',
+        'Radar Sweep': 'Rotating radar scan',
+        'Speedometer HUD': 'Animated speed gauge',
+        'Warning Meter': 'Animated alert level gauge',
+        'Scanning HUD': 'Futuristic scanning overlay',
+        'Linked Callout': 'Object label with connector line',
+        'Data Card': 'Information panel with editable content',
+        'Analysis Panel / Counter': 'Technical panel and numeric counter',
+        'Planar Overlay': 'Perspective-aligned graphic overlay',
+        'Animated Arrows': 'Moving direction arrows',
+        'Arrow Impact': 'Arrow flies into a target',
+        'Rotary Mechanism': 'Spinning mechanical graphic',
+    }
+
+    def _build_effect_browser(self):
+        self._effect_tree_items = {}
+        self._effect_group_items = {}
+        assigned = set()
+        for title, color, names in self._EFFECT_GROUPS:
+            heading = QTreeWidgetItem([title, ''])
+            heading.setData(0, Qt.ItemDataRole.UserRole, '')
+            heading.setForeground(0, QColor(color))
+            font = heading.font(0); font.setBold(True); heading.setFont(0, font)
+            self.effect_tree.addTopLevelItem(heading)
+            self._effect_group_items[title] = heading
+            for name in names:
+                if name not in [self.effect_style.itemText(i) for i in range(self.effect_style.count())] or name in assigned:
+                    continue
+                self._effect_add_tree_item(heading, name, color)
+                assigned.add(name)
+        remaining = [self.effect_style.itemText(i) for i in range(self.effect_style.count())
+                     if self.effect_style.itemText(i) not in assigned]
+        if remaining:
+            heading = QTreeWidgetItem(['Frames & Other', ''])
+            heading.setForeground(0, QColor('#91B8A4'))
+            font = heading.font(0); font.setBold(True); heading.setFont(0, font)
+            self.effect_tree.addTopLevelItem(heading)
+            self._effect_group_items['Frames & Other'] = heading
+            for name in remaining:
+                self._effect_add_tree_item(heading, name, '#91B8A4')
+        expanded = self.settings.get('effect_browser_expanded', ['Text & Titles'])
+        if not isinstance(expanded, list):
+            expanded = ['Text & Titles']
+        for title, item in self._effect_group_items.items():
+            item.setExpanded(title in expanded)
+
+    def _effect_add_tree_item(self, parent, name, color):
+        desc = self._EFFECT_DESCRIPTIONS.get(name, self._describe_other_effect(name))
+        item = QTreeWidgetItem([name, desc])
+        item.setData(0, Qt.ItemDataRole.UserRole, name)
+        item.setToolTip(0, desc)
+        item.setToolTip(1, desc)
+        parent.addChild(item)
+        self._effect_tree_items[name] = item
+
+    @staticmethod
+    def _describe_other_effect(name):
+        low = name.lower()
+        if 'frame' in low or 'border' in low: return 'Decorative animated frame or border'
+        if 'line' in low: return 'Animated line graphic'
+        if 'box' in low or 'corner' in low or 'bracket' in low: return 'Shape overlay around a subject'
+        return 'Animated visual overlay: ' + name.lower()
+
+    def _filter_effect_browser(self, query):
+        q = query.strip().casefold()
+        for title, heading in self._effect_group_items.items():
+            group_match = q in title.casefold()
+            any_visible = False
+            for i in range(heading.childCount()):
+                child = heading.child(i)
+                match = not q or group_match or q in child.text(0).casefold() or q in child.text(1).casefold()
+                child.setHidden(not match)
+                any_visible |= match
+            heading.setHidden(not any_visible)
+            if q:
+                heading.setExpanded(any_visible)
+            else:
+                expanded = self.settings.get('effect_browser_expanded', ['Text & Titles'])
+                heading.setExpanded(title in expanded)
+
+    def _effect_browser_selected(self, current, previous):
+        if current is None:
+            return
+        name = current.data(0, Qt.ItemDataRole.UserRole)
+        if name:
+            self.effect_style.setCurrentText(name)
+            self.effect_hint.setText('%s — %s' % (name, current.text(1)))
+
+    def _effect_browser_add(self, item, column):
+        name = item.data(0, Qt.ItemDataRole.UserRole)
+        if name:
+            self.effect_style.setCurrentText(name)
+            self.add_selected_effect()
+
+    def _sync_effect_browser_selection(self, name):
+        item = self._effect_tree_items.get(name)
+        if item is None:
+            return
+        if self.effect_tree.currentItem() is not item:
+            self.effect_tree.blockSignals(True)
+            self.effect_tree.setCurrentItem(item)
+            self.effect_tree.blockSignals(False)
+        self.effect_hint.setText('%s — %s' % (name, item.text(1)))
+
+    def _effect_category_changed(self, item):
+        if self.effect_search.text().strip():
+            return
+        expanded = [title for title, heading in self._effect_group_items.items() if heading.isExpanded()]
+        self.settings['effect_browser_expanded'] = expanded
+        save_settings(self.settings)
 
     def _build_export_tab(self):
         panel = QWidget(); layout=QVBoxLayout(panel)
