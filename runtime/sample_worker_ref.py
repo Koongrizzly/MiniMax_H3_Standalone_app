@@ -182,7 +182,7 @@ def main():
     for n in ('width','height','frames','steps','seed'): ap.add_argument('--'+n,type=int,required=True)
     for n in ('cfg','shift','audio-shift'): ap.add_argument('--'+n,type=float,required=True)
     ap.add_argument('--sampler',default='euler'); ap.add_argument('--scheduler',default='simple'); ap.add_argument('--ref-image-size',choices=['match','max'],default='match')
-    ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
+    ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--refmod',action='append',default=[]); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
     ap.add_argument('--lock-source-audio-index', type=int, default=0, help='1-based standalone --ref-audio slot to use as the target H3 audio latent with denoise mask 0. 0 keeps normal Ref2VA audio generation.')
     ap.add_argument('--ref-audio-subject', action='append', type=int, default=[], help='Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic.')
     ap.add_argument('--lora',action='append',default=[]); ap.add_argument('--lora-strength',action='append',type=float,default=[])
@@ -247,6 +247,25 @@ def main():
         scale=min(1.0, math.sqrt((ns.width*ns.height)/(w*h))) if ns.ref_image_size=='match' else min(1.0,REF_IMAGE_SHORT_EDGE/min(w,h))
         tw=max(CANVAS_MULTIPLE,round(w*scale/CANVAS_MULTIPLE)*CANVAS_MULTIPLE); th=max(CANVAS_MULTIPLE,round(h*scale/CANVAS_MULTIPLE)*CANVAS_MULTIPLE)
         r=resize(img,tw,th); z=_encode_visual_reference(vv, r, manager, label=f'reference image {len(ref_blocks)+1} ({tw}x{th})'); ref_items.append({'type':'image','data':r.cpu()}); ref_blocks.append({'kind':'image','latent_h':th//16,'latent_w':tw//16,'latent':z})
+    # RefMods directly supply already-encoded visual/audio latents.
+    # Original RefMod algorithm: Luisa (luisacaotica); integration shared by Gary.
+    # No duplicate VAE encoding and no modification of existing raw references.
+    if ns.refmod:
+        from runtime.refmod_support.core import H3RefMod
+        for mod_path in ns.refmod[:8]:
+            path = Path(mod_path)
+            if not path.is_file() or path.suffix.lower() != ".safetensors":
+                raise FileNotFoundError(f"RefMod file missing: {path}")
+            mod = H3RefMod.load(str(path.with_suffix("")), device="cpu")
+            block = mod.ref_block(strength=1.0)
+            if block is None:
+                continue
+            # Label is for logging only; Qwen visual context reconstruction is
+            # NOT yet supported in this first experimental integration.
+            ref_blocks.append(block)
+            print(f"[REFMOD] Loaded {mod.name}: kind={mod.kind}, tokens={mod.token_count}, mode={mod.mode}", flush=True)
+            if mod.description:
+                print(f"[REFMOD] Prompt hint: {mod.description}", flush=True)
     video_data=[]
     for path in ns.ref_video[:3]:
         vf=load_video_24(path,frame_count); vh,vw=vf.shape[1],vf.shape[2]; cw,ch=adapt_canvas(vw,vh)
