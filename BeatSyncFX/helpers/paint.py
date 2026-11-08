@@ -1336,6 +1336,47 @@ def _draw_event_without_audio(p: QPainter, w: int, h: int, t: float, event: dict
     p.restore()
 
 
+
+
+def _paint_media_layers(p, width, height, t, project):
+    """Media compositing shared by interactive preview and final render."""
+    from .media_layers import is_video, source_time
+    layers = project.get('media_layers', [])
+    for index, layer in enumerate(layers):
+        source_t = source_time(layer, t)
+        if source_t is None:
+            continue
+        path = str(layer.get('path', ''))
+        if is_video(path):
+            provider = project.get('_media_frame_provider')
+            img = provider.frame(index, layer, source_t) if provider else None
+            if img is None:
+                continue
+            _draw_media_image(p, width, height, t, layer, img)
+        else:
+            # Reuse legacy animated image decoder and draw implementation.
+            legacy = dict(layer, text=path)
+            _draw_overlay(p, width, height, t, legacy)
+
+
+def _draw_media_image(p, w, h, t, layer, img):
+    start = float(layer.get('start',0))
+    end = float(layer.get('end',start+1))
+    alpha = event_fade(layer,t,start,end) * clamp(float(layer.get('opacity',100))/100)
+    if alpha <= 0:
+        return
+    scale = min(w/1280,h/720)
+    ww = max(1,float(layer.get('size',300))*scale)
+    hh = ww * img.height()/max(1,img.width())
+    x=w*float(layer.get('x',50))/100
+    y=h*float(layer.get('y',50))/100
+    p.save()
+    p.setOpacity(alpha)
+    p.translate(x,y)
+    p.rotate(float(layer.get('rotation',0)))
+    p.drawImage(QRectF(-ww/2,-hh/2,ww,hh),img)
+    p.restore()
+
 def paint_effects(p: QPainter, width: int, height: int, t: float, project: dict):
     """Draw only transparent foreground pixels; leaves caller's background untouched."""
     if width < 2 or height < 2:
@@ -1346,6 +1387,7 @@ def paint_effects(p: QPainter, width: int, height: int, t: float, project: dict)
     p.setClipRect(0, 0, width, height)
     _draw_beats(p, width, height, t, project)
     _draw_lyrics(p, width, height, t, project)
+    _paint_media_layers(p, width, height, t, project)
     from .shape_keyframes import geometry_at
     for event in project.get('events', []):
         if str(event.get('style', '')).startswith('Beat: '):

@@ -25,6 +25,7 @@ from .core import (ROOT, new_project, load_project, save_project, load_settings,
 from .paint import paint_effects, MOTION_STUDIO_STYLES, BEAT_EFFECTS
 from .video_distortion import apply_video_effects, needs_video, preview_stutter
 from .motion_math import ENTRIES, EXITS
+from .media_layers import VideoFrames, is_video, media_duration
 from .workers import BeatWorker, WhisperWorker, WhisperCppWorker, RenderWorker, MultibandWorker
 
 try:
@@ -168,6 +169,78 @@ class EffectsTimeline(QWidget):
         self._drag=None
 
 
+class MediaTimeline(QWidget):
+    """Dedicated media-only tracks, draggable start and right-edge trim."""
+    def __init__(self, app):
+        super().__init__(app)
+        self.app=app
+        self._drag=None
+        self.setMinimumHeight(165)
+        self.setMouseTracking(True)
+
+    def _geometry(self):
+        layers=self.app.project.get('media_layers',[])
+        duration=max(1., float(self.app.project.get('duration',0)),
+                     max((float(x.get('end',0)) for x in layers),default=0))
+        return duration, max(1,self.width()-154)
+
+    def paintEvent(self,event):
+        p=QPainter(self);p.fillRect(self.rect(),QColor('#0b131c'))
+        duration, usable=self._geometry()
+        p.setPen(QColor('#8096a8'))
+        for n in range(11):
+            x=140+usable*n/10
+            p.drawLine(int(x),24,int(x),self.height()-8)
+            p.drawText(int(x)+2,17,f'{duration*n/10:.1f}s')
+        layers=self.app.project.get('media_layers',[])
+        selected=self.app.media_table.currentRow() if hasattr(self.app,'media_table') else -1
+        self._hits=[]
+        for i,layer in enumerate(layers):
+            y=30+i*32
+            if y > self.height()-24:break
+            x=140+float(layer.get('start',0))/duration*usable
+            end=140+float(layer.get('end',0))/duration*usable
+            ww=max(3,end-x)
+            p.setPen(QColor('#e1eaf3'));p.drawText(5,y+18,str(layer.get('name','Media'))[:18])
+            c=QColor('#589bd2' if is_video(layer.get('path','')) else '#8b75c8')
+            if i==selected:c=c.lighter(135)
+            p.fillRect(int(x),y,int(ww),24,c)
+            p.setPen(QColor('#ffffff'));p.drawText(int(x)+5,y+17,'video' if is_video(layer.get('path','')) else 'image')
+            self._hits.append((i,x,y,ww))
+        time=self.app.current_time()
+        x=140+time/duration*usable
+        p.setPen(QColor('#f4d15a'));p.drawLine(int(x),23,int(x),self.height()-2)
+        p.end()
+
+    def mousePressEvent(self,event):
+        if event.button()!=Qt.MouseButton.LeftButton:return
+        x,y=event.position().x(),event.position().y()
+        for i,left,top,width in reversed(self._hits):
+            if left<=x<=left+width and top<=y<=top+24:
+                item=self.app.project['media_layers'][i]
+                self.app.media_table.selectRow(i)
+                self._drag=(i,'resize' if left+width-x<12 else 'move',x,
+                            float(item['start']),float(item['end']))
+                return
+
+    def mouseMoveEvent(self,event):
+        if not self._drag:return
+        i,mode,origin,start,end=self._drag
+        duration, usable=self._geometry()
+        delta=(event.position().x()-origin)*duration/usable
+        item=self.app.project['media_layers'][i]
+        if mode=='move':
+            item['start']=round(max(0,start+delta),3)
+            item['end']=round(item['start']+end-start,3)
+        else:
+            item['end']=round(max(start+.04,end+delta),3)
+        self.app.refresh_media_layers(select=i)
+        self.app.preview.update()
+
+    def mouseReleaseEvent(self,event):
+        self._drag=None
+
+
 class Preview(QWidget):
     def __init__(self, app):
         super().__init__()
@@ -304,6 +377,22 @@ class Preview(QWidget):
 
     def mousePressEvent(self, event):
         if event.button()!=Qt.MouseButton.LeftButton: return
+        if hasattr(self.app,'media_table') and self.app.tabs.currentWidget() == self.app.media_tab:
+            i=self.app.media_table.currentRow()
+            layers=self.app.project.get('media_layers',[])
+            if i>=0 and i<len(layers):
+                layer=layers[i]
+                if float(layer.get('start',0)) <= self.app.current_time() < float(layer.get('end',0)):
+                    if self.app.player and self.app.player.playbackState()==QMediaPlayer.PlaybackState.PlayingState:
+                        self.app.player.pause()
+                    x,y=self._point(event.position())
+                    w,h,_,_=self._canvas()
+                    cx=w*float(layer.get('x',50))/100
+                    cy=h*float(layer.get('y',50))/100
+                    ww=float(layer.get('size',300))*min(w/1280,h/720)
+                    if abs(x-cx)<max(40,ww/2+15) and abs(y-cy)<max(40,ww/2+15):
+                        self._media_drag=(i,x,y,float(layer.get('x',50)),float(layer.get('y',50)))
+                        return
         if getattr(self,'draw_kind',None):
             self.draw_origin=self._point(event.position())
             self.draw_current=self.draw_origin
@@ -343,6 +432,16 @@ class Preview(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event):
+        if getattr(self,'_media_drag',None) is not None:
+            index,oldx,oldy,startx,starty=self._media_drag
+            x,y=self._point(event.position())
+            w,h,_,_=self._canvas()
+            layer=self.app.project['media_layers'][index]
+            layer['x']=round(max(-100,min(200,startx+(x-oldx)*100/w)),2)
+            layer['y']=round(max(-100,min(200,starty+(y-oldy)*100/h)),2)
+            self.app.refresh_media_layers(select=index)
+            self.update()
+            return
         if not hasattr(self,'drag_mode') or self.drag_mode is None:
             self.setCursor(self.mouseHoverCursor(event.position()))
             return
@@ -442,6 +541,10 @@ class Preview(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if getattr(self,'_media_drag',None) is not None:
+            self._media_drag=None
+            self.update()
+            return
         if getattr(self,'drag_mode',None)=='drawing':
             self._create_shape(self.draw_kind,self.draw_origin,self._point(event.position()))
             self.draw_kind=None
@@ -478,7 +581,26 @@ class Preview(QWidget):
         p.save()
         p.translate(left, top)
         p.scale(factor, factor)
-        paint_effects(p, w, h, self.app.current_time(), project)
+        project['_media_frame_provider'] = self.app._preview_media_provider
+        try:
+            paint_effects(p, w, h, self.app.current_time(), project)
+        finally:
+            project.pop('_media_frame_provider', None)
+        if hasattr(self.app,'media_tab') and self.app.tabs.currentWidget()==self.app.media_tab:
+            row=self.app.media_table.currentRow()
+            layers=project.get('media_layers',[])
+            if 0<=row<len(layers):
+                layer=layers[row]
+                if float(layer.get('start',0))<=self.app.current_time()<float(layer.get('end',0)):
+                    from PySide6.QtCore import QRectF
+                    cx=w*float(layer.get('x',50))/100
+                    cy=h*float(layer.get('y',50))/100
+                    ww=max(1,float(layer.get('size',300))*min(w/1280,h/720))
+                    hh=ww/max(.1,float(layer.get('source_ratio',16/9)))
+                    p.save();p.translate(cx,cy);p.rotate(float(layer.get('rotation',0)))
+                    p.setPen(QColor('#36D4ED'));p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.drawRect(QRectF(-ww/2,-hh/2,ww,hh))
+                    p.restore()
         idx=getattr(self,'selected',None)
         if idx is not None and idx<len(project.get('events',[])) and float(project['events'][idx].get('start',0)) <= self.app.current_time() < float(project['events'][idx].get('end',0)):
             from .shape_keyframes import geometry_at
@@ -645,6 +767,7 @@ class MainWindow(QMainWindow):
         self._track_completion_timer.setInterval(250)
         self._track_completion_timer.timeout.connect(self._check_tracking_completion)
         self._render = None
+        self._preview_media_provider = VideoFrames(self.ffmpeg, preview=True)
         self._seeking = False
         self._manual_time = 0.0
         self._tap_words = []
@@ -735,6 +858,7 @@ class MainWindow(QMainWindow):
         self._build_sync_tab()
         self._build_lyrics_tab()
         self._build_events_tab()
+        self._build_media_tab()
         self._build_export_tab()
 
         footer = QHBoxLayout(); whole.addLayout(footer)
@@ -1095,7 +1219,7 @@ class MainWindow(QMainWindow):
         self._sync_effect_browser_selection(self.effect_style.currentText())
         actions = QHBoxLayout(); layout.addLayout(actions)
         actions.addWidget(button('Add countdown', self.add_countdown))
-        actions.addWidget(button('Add PNG / GIF', self.add_image_overlay))
+        # PNG/GIF/video overlays live in the dedicated Media Layers tab.
         self.composite_edit_button = button('Edit selected effect', self.edit_composite_effect)
         actions.addWidget(self.composite_edit_button)
         actions.addWidget(button('Delete selected', self.delete_event))
@@ -1189,7 +1313,7 @@ class MainWindow(QMainWindow):
         self.event_table.setToolTip('Double-click a Color cell to choose a color visually')
         self.event_table.itemSelectionChanged.connect(self.on_event_selection_changed)
         layout.addWidget(self.event_table,1)
-        notes = QLabel('Countdown: Start is first visible frame, End is the TARGET (zero) timestamp. Text is an optional label.\nImage / GIF: Text stores the selected local image path; Size controls width. All effects stop exactly at End.')
+        notes = QLabel('Countdown: Start is first visible frame; End is the zero timestamp. Media overlays are in the Media Layers tab.')
         notes.setWordWrap(True); layout.addWidget(notes)
         layout.addStretch()
         self._update_properties_visibility()
@@ -1409,6 +1533,8 @@ class MainWindow(QMainWindow):
         self.preview.update()
 
     def _refresh_controls(self):
+        if hasattr(self, 'media_table'):
+            self.refresh_media_layers()
         p=self.project; o=p['options']
         for ctl, key in [(self.bpm,'bpm'),(self.t0,'t0')]:
             ctl.blockSignals(True); ctl.setValue(float(p[key])); ctl.blockSignals(False)
@@ -1615,6 +1741,8 @@ class MainWindow(QMainWindow):
                 self.message('Could not find BOTH ffmpeg and ffprobe. Place ffprobe.exe beside ffmpeg.exe.')
                 return
             self.ffmpeg,self.ffprobe=newexe,newprobe
+            self._preview_media_provider.close()
+            self._preview_media_provider = VideoFrames(self.ffmpeg, preview=True)
             self.settings['ffmpeg']=newexe; save_settings(self.settings)
             self.ffmpeg_button.setText('Re-locate FFmpeg')
             self.status.setText('FFmpeg configured: '+newexe)
@@ -1628,6 +1756,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.message(str(exc)); return
         self.project=p; self.project_file=path
+        self._preview_media_provider.close()
         self._refresh_controls()
         if p.get('video'):
             self._video_loaded(p['video'])
@@ -1646,6 +1775,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.message('Cannot load effects template: '+str(exc)); return
         self.project=p
+        self._preview_media_provider.close()
         # A template does not change the current full project's save destination.
         self._refresh_controls()
         self.status.setText('Applied effects template to current media: '+Path(path).name)
@@ -2939,6 +3069,164 @@ class MainWindow(QMainWindow):
         else:
             self.status.setText('Audio reaction saved to selected effect(s). Start/End times preserved.')
 
+    def _build_media_tab(self):
+        panel=QWidget(); layout=QVBoxLayout(panel)
+        desc=QLabel('PNG, GIF, WebP and video layers. Drag a clip on this timeline; drag its right edge to change its duration. All layers use the main video clock.')
+        desc.setWordWrap(True);layout.addWidget(desc)
+        bar=QHBoxLayout();layout.addLayout(bar)
+        bar.addWidget(button('Add PNG / GIF',lambda: self.add_media_files(images_only=True)))
+        bar.addWidget(button('Add video clip',self.add_media_files))
+        bar.addWidget(button('Remove layer',self.remove_media_layer))
+        bar.addWidget(button('Move up',lambda:self.move_media_layer(-1)))
+        bar.addWidget(button('Move down',lambda:self.move_media_layer(1)))
+        self.media_timeline=MediaTimeline(self)
+        layout.addWidget(self.media_timeline)
+        self.media_table=QTableWidget(0,4)
+        self.media_table.setHorizontalHeaderLabels(['Layer (bottom → top)','Start','End','Type'])
+        self.media_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
+        self.media_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.media_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.media_table.setMinimumHeight(130)
+        self.media_table.setMaximumHeight(220)
+        self.media_table.itemSelectionChanged.connect(self.media_selected)
+        layout.addWidget(self.media_table)
+        props=QGroupBox('Selected layer properties');form=QFormLayout(props)
+        def dbl(lo,hi,value):return spin_double(lo,hi,value)
+        self.media_start=spin_double(0,999999,0,3,.04)
+        self.media_end=spin_double(0,999999,3,3,.04)
+        self.media_x=spin_int(-100,200,50)
+        self.media_y=spin_int(-100,200,50)
+        self.media_width=spin_int(10,4000,300)
+        self.media_opacity=spin_int(0,100,100)
+        self.media_rotation=spin_int(-360,360,0)
+        self.media_speed=dbl(.1,8,1)
+        self.media_trim=dbl(0,99999,0)
+        self.media_loop=QCheckBox('Loop until layer ends')
+        self.media_loop.setChecked(True)
+        self.media_fade_in=dbl(0,20,.28)
+        self.media_fade_out=dbl(0,20,.28)
+        for label,ctrl in [('Start (s)',self.media_start),('End (s)',self.media_end),
+                           ('X position %',self.media_x),('Y position %',self.media_y),
+                           ('Width (1280px reference)',self.media_width),('Opacity %',self.media_opacity),
+                           ('Rotation °',self.media_rotation),('Playback speed',self.media_speed),
+                           ('Source trim (s)',self.media_trim),('Fade in (s)',self.media_fade_in),
+                           ('Fade out (s)',self.media_fade_out)]:
+            form.addRow(label,ctrl)
+        form.addRow(self.media_loop)
+        form.addRow(button('Apply layer properties',self.apply_media_properties))
+        layout.addWidget(props)
+        note=QLabel('Video overlays are muted (your main soundtrack stays unchanged). PNG/GIF and video are rendered in the same compositing pass. Save the project to preserve layers.')
+        note.setWordWrap(True);layout.addWidget(note)
+        self.media_tab=scroll_pane(panel)
+        self.tabs.addTab(self.media_tab,'Media Layers')
+        self.refresh_media_layers()
+
+    def add_media_files(self, checked=False, images_only=False):
+        pattern=('Images (*.png *.gif *.webp *.jpg *.jpeg *.bmp)' if images_only else
+                 'Media (*.png *.gif *.webp *.jpg *.jpeg *.bmp *.mp4 *.mov *.mkv *.webm *.avi *.m4v)')
+        paths,_=QFileDialog.getOpenFileNames(self,'Add media layers','',pattern+';;All files (*)')
+        if not paths:return
+        start=round(self.current_time(),3)
+        for path in paths:
+            video=is_video(path)
+            duration=media_duration(self.ffprobe,path) if video else 0.
+            ratio=16/9
+            if video and self.ffprobe:
+                try:
+                    import subprocess
+                    cmd=[str(self.ffprobe),'-v','error','-select_streams','v:0',
+                         '-show_entries','stream=width,height','-of','csv=p=0:s=x',path]
+                    kwargs={'capture_output':True,'text':True,'timeout':12}
+                    if hasattr(subprocess,'CREATE_NO_WINDOW'):
+                        kwargs['creationflags']=subprocess.CREATE_NO_WINDOW
+                    res=subprocess.run(cmd,**kwargs)
+                    sw,sh=map(int,res.stdout.strip().split('x')[:2])
+                    if sw>0 and sh>0:ratio=sw/sh
+                except (OSError,ValueError,subprocess.TimeoutExpired):
+                    pass
+            layer={'path':path,'name':Path(path).name,'start':start,
+                   'end':round(start+min(5.,duration) if duration>0 else start+3.,3),
+                   'x':50,'y':50,'size':300,'opacity':100,'rotation':0,
+                   'speed':1.,'trim':0.,'loop':True,'source_duration':duration,
+                   'source_ratio':ratio,
+                   'fade_in':.28,'fade_out':.28}
+            self.project.setdefault('media_layers',[]).append(layer)
+        self.refresh_media_layers(select=len(self.project['media_layers'])-1)
+        self.preview.update()
+
+    def refresh_media_layers(self,select=None):
+        if not hasattr(self,'media_table'):return
+        layers=self.project.setdefault('media_layers',[])
+        table=self.media_table
+        row=table.currentRow() if select is None else select
+        table.blockSignals(True)
+        table.setRowCount(len(layers))
+        for i,layer in enumerate(layers):
+            vals=[layer.get('name',Path(str(layer.get('path',''))).name),
+                  f"{float(layer.get('start',0)):.3f}",f"{float(layer.get('end',0)):.3f}",
+                  'Video' if is_video(layer.get('path','')) else 'Image/GIF']
+            for j,val in enumerate(vals):
+                cell=QTableWidgetItem(str(val))
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                table.setItem(i,j,cell)
+        if 0<=row<len(layers):table.selectRow(row)
+        table.blockSignals(False)
+        self.media_selected()
+        if hasattr(self,'media_timeline'):
+            self.media_timeline.setMinimumHeight(max(165,32*len(layers)+40))
+            self.media_timeline.update()
+
+    def media_selected(self):
+        if not hasattr(self,'media_table'):return
+        i=self.media_table.currentRow()
+        layers=self.project.get('media_layers',[])
+        if i<0 or i>=len(layers):return
+        layer=layers[i]
+        for name,key,default in [
+            ('media_start','start',0),('media_end','end',3),('media_x','x',50),
+            ('media_y','y',50),('media_width','size',300),('media_opacity','opacity',100),
+            ('media_rotation','rotation',0),('media_speed','speed',1),('media_trim','trim',0),
+            ('media_fade_in','fade_in',.28),('media_fade_out','fade_out',.28)]:
+            getattr(self,name).setValue(float(layer.get(key,default)))
+        self.media_loop.setChecked(bool(layer.get('loop',True)))
+        self.media_timeline.update()
+
+    def apply_media_properties(self):
+        i=self.media_table.currentRow()
+        layers=self.project.get('media_layers',[])
+        if i<0 or i>=len(layers):return
+        values={'start':self.media_start.value(),'end':self.media_end.value(),
+                'x':self.media_x.value(),'y':self.media_y.value(),
+                'size':self.media_width.value(),'opacity':self.media_opacity.value(),
+                'rotation':self.media_rotation.value(),'speed':self.media_speed.value(),
+                'trim':self.media_trim.value(),'loop':self.media_loop.isChecked(),
+                'fade_in':self.media_fade_in.value(),'fade_out':self.media_fade_out.value()}
+        if values['end']<=values['start']:
+            self.message('Layer end must be later than start.');return
+        layers[i].update(values)
+        self._preview_media_provider.close()
+        self.refresh_media_layers(select=i)
+        self.preview.update()
+
+    def remove_media_layer(self):
+        i=self.media_table.currentRow()
+        layers=self.project.get('media_layers',[])
+        if 0<=i<len(layers):
+            layers.pop(i)
+            self._preview_media_provider.close()
+            self.refresh_media_layers(select=min(i,len(layers)-1))
+            self.preview.update()
+
+    def move_media_layer(self,step):
+        i=self.media_table.currentRow()
+        layers=self.project.get('media_layers',[])
+        j=i+step
+        if i>=0 and 0<=j<len(layers):
+            layers[i],layers[j]=layers[j],layers[i]
+            self._preview_media_provider.close()
+            self.refresh_media_layers(select=j)
+            self.preview.update()
+
     def add_countdown(self):
         start = round(self.current_time(), 3)
         target, ok = QInputDialog.getDouble(self, 'Countdown target',
@@ -2952,15 +3240,7 @@ class MainWindow(QMainWindow):
         self.refresh_event_table(); self.preview.update()
 
     def add_image_overlay(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, 'Choose transparent image or animated GIF', '',
-            'Overlay images (*.png *.gif *.webp *.jpg *.jpeg *.bmp);;All files (*)')
-        if not filepath:
-            return
-        start = round(self.current_time(),3)
-        self.project['events'].append({'start':start,'end':round(start+3,3),
-            'style':'Image / GIF','text':filepath,'x':50,'y':50,
-            'size':300,'color':'#FFFFFF','opacity':100,'rotation':0,'speed':1})
-        self.refresh_event_table();self.preview.update()
+        self.add_media_files(images_only=True)
 
     def delete_event(self):
         rows=sorted({v.row() for v in self.event_table.selectedItems()},reverse=True)

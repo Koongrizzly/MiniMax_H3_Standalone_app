@@ -41,7 +41,7 @@ DEFAULT_OPTIONS = {
 def new_project() -> dict:
     return {'version': 1, 'video': '', 'audio': '', 'duration': 0.0,
             'width': 1280, 'height': 720, 'bpm': 120.0, 't0': 0.0,
-            'lyrics_text': '', 'words': [], 'lyric_segments': [], 'events': [], 'options': dict(DEFAULT_OPTIONS)}
+            'lyrics_text': '', 'words': [], 'lyric_segments': [], 'events': [], 'media_layers': [], 'options': dict(DEFAULT_OPTIONS)}
 
 
 def load_settings() -> dict:
@@ -82,6 +82,8 @@ def save_project(path: str, project: dict) -> None:
     for event in dat.get('events', []):
         if event.get('style') == 'Image / GIF':
             event['text'] = _make_relative(event.get('text', ''), dest.parent)
+    for layer in dat.get('media_layers', []):
+        layer['path'] = _make_relative(layer.get('path', ''), dest.parent)
     atomic_json(dest, dat)
 
 
@@ -103,6 +105,8 @@ def save_effects_template(path: str, project: dict) -> None:
     for event in dat.get('events', []):
         if event.get('style') == 'Image / GIF':
             event['text'] = _make_relative(event.get('text', ''), dest.parent)
+    for layer in dat.get('media_layers', []):
+        layer['path'] = _make_relative(layer.get('path', ''), dest.parent)
     atomic_json(dest, dat)
 
 
@@ -113,7 +117,7 @@ def load_effects_template(path: str, current_project: dict | None = None) -> dic
     if not isinstance(dat, dict) or dat.get('format') != 'beatsyncfx-effects-template-v1':
         raise ValueError('Not a BeatSync FX effects template. Use Load project for full project files.')
     base = json.loads(json.dumps(current_project)) if current_project else new_project()
-    for key in ('lyrics_text', 'words', 'lyric_segments', 'events', 'bpm', 't0'):
+    for key in ('lyrics_text', 'words', 'lyric_segments', 'events', 'media_layers', 'bpm', 't0'):
         if key in dat:
             base[key] = dat[key]
     base['options'] = {**DEFAULT_OPTIONS, **base.get('options', {}), **dat.get('options', {})}
@@ -122,7 +126,12 @@ def load_effects_template(path: str, current_project: dict | None = None) -> dic
         if event.get('style') == 'Image / GIF' and event.get('text'):
             file = Path(event['text'])
             event['text'] = str((loc.parent / file).resolve()) if not file.is_absolute() else str(file)
-    return base
+    for layer in base.get('media_layers', []):
+        if layer.get('path'):
+            file = Path(layer['path'])
+            layer['path'] = str((loc.parent / file).resolve()) if not file.is_absolute() else str(file)
+    from .media_layers import normalize_legacy
+    return normalize_legacy(base)
 
 
 def load_project(path: str) -> dict:
@@ -141,7 +150,12 @@ def load_project(path: str) -> dict:
         if event.get('style') == 'Image / GIF' and event.get('text'):
             file = Path(event['text'])
             event['text'] = str((loc.parent / file).resolve()) if not file.is_absolute() else str(file)
-    return project
+    for layer in project.get('media_layers', []):
+        if layer.get('path'):
+            file = Path(layer['path'])
+            layer['path'] = str((loc.parent / file).resolve()) if not file.is_absolute() else str(file)
+    from .media_layers import normalize_legacy
+    return normalize_legacy(project)
 
 
 def ffmpeg_default_directory() -> Path:

@@ -217,6 +217,9 @@ class RenderWorker(QThread):
                 if len(err) > 120:
                     del err[:60]
         decode_proc = None
+        from .media_layers import VideoFrames
+        media_provider = VideoFrames(self.ffmpeg, fps=fps)
+        p['_media_frame_provider'] = media_provider
         try:
             if process_video:
                 decoder_cmd = [self.ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'error',
@@ -297,6 +300,9 @@ class RenderWorker(QThread):
                 pass
             out.unlink(missing_ok=True)
             self.failed.emit(f'Export stopped: {exc}\n' + '\n'.join(err[-12:]))
+        finally:
+            media_provider.close()
+            p.pop('_media_frame_provider', None)
 
 class MultibandWorker(QThread):
     ready = Signal(object)
