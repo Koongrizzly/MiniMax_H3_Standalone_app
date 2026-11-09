@@ -203,6 +203,30 @@ class VRAMManager:
         except Exception as exc:
             self._log(f"V9 CUDA allocator guard unavailable: {exc}", force=True)
 
+    def refmod_decode_checkpoint(self, label: str, *, trim: bool = False) -> None:
+        """Report RefMod VAE working-set pressure at a stage boundary.
+
+        This cannot evict live activations; the worker must run under
+        inference_mode and use bounded decoding. Preserve the allocator guard.
+        """
+        if not torch.cuda.is_available():
+            return
+        if trim:
+            self.trim_cuda_cache(reason=f'refmod-decode-{label}', force=True)
+        try:
+            allocated = int(torch.cuda.memory_allocated())
+            reserved = int(torch.cuda.memory_reserved())
+            free, total = self._cuda_free()
+            self._log(
+                f"RefMod VAE decode checkpoint ({label}) | "
+                f"allocated={self._gb(allocated)} reserved={self._gb(reserved)} "
+                f"CUDA free={self._gb(free) if free is not None else 'n/a'} "
+                f"runtime floor={self._gb(self.runtime_floor_bytes())}",
+                force=True,
+            )
+        except Exception as exc:
+            self._log(f"RefMod decode checkpoint unavailable: {exc}", force=True)
+
     def trim_cuda_cache(self, reason: str = "runtime", force: bool = False) -> int:
         if not self.is_stage_managed() or not torch.cuda.is_available():
             return 0

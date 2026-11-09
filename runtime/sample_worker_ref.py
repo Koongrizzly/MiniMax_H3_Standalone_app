@@ -279,12 +279,39 @@ def main():
                     # The same H3 video VAE is already loaded above; decode once,
                     # then pass frames via the NATIVE Qwen3-VL minimax_ref_items API.
                     from runtime.headless_h3 import decode_video
+                    # The reference VAE decoder is inference-only. Without
+                    # inference_mode, each spatial/temporal attention block can
+                    # retain a full backward graph: on RTX 3090 this drove even
+                    # a 0.49 MB RefMod to the 22 GiB allocator ceiling.
+                    # Keep the original latents and spatial dimensions intact.
+                    latent_for_qwen = block['latent']
+                    print(
+                        f"[REFMOD] Qwen reconstruction BEGIN | name={mod.name} "
+                        f"| latent_shape={tuple(latent_for_qwen.shape)} "
+                        "| direct tiled VAE decode | autograd=off | spatial scale=original",
+                        flush=True,
+                    )
+                    if manager is not None:
+                        manager.refmod_decode_checkpoint(f"before {mod.name}", trim=True)
+                    if ns.extended_logging:
+                        log_mem(f"RefMod {mod.name} BEFORE full-quality decode", sync=True)
                     try:
-                        decoded = decode_video(block['latent'], vv, force_tiled=False)
+                        with torch.inference_mode():
+                            decoded = decode_video(
+                                latent_for_qwen, vv, force_tiled=True,
+                                tile_size=128, tile_overlap=32,
+                            )
+                        if manager is not None:
+                            manager.refmod_decode_checkpoint(f"after {mod.name}", trim=True)
+                        if ns.extended_logging:
+                            log_mem(f"RefMod {mod.name} AFTER full-quality decode", sync=True)
                     except Exception as exc:
+                        if manager is not None:
+                            manager.refmod_decode_checkpoint(f"failure {mod.name}", trim=False)
                         raise RuntimeError(
                             f"Cannot reconstruct Qwen visual reference from RefMod '{mod.name}': {exc}. "
-                            "Turn off 'Qwen3-VL visual conditioning' to use legacy latent-only mode."
+                            "Full-resolution inference-only tiled VAE decode failed; "
+                            "leave the Qwen visual toggle off to use latent-only RefMod conditioning."
                         ) from exc
                     if decoded.ndim != 4 or decoded.shape[-1] != 3 or decoded.shape[0] < 1:
                         raise RuntimeError(f"Unexpected VAE decoded shape for {mod.name}: {tuple(decoded.shape)}")
