@@ -51,6 +51,9 @@ Main Features :
 
 ---
 
+- 11//09/2026 : Refmods added
+  - Grizzlymax now allows creating and using Refmods
+
 - 10/31/2026 :
   BeatSyncFX (Slopcore creator)
 ![MiniMax H3 INT4 Standalone](/presets/setsave/2026-11-01%2010_16_09-.jpg)
