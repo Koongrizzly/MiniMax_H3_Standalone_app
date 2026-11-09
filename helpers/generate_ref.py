@@ -98,6 +98,7 @@ def main():
     ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0); ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="beta")
     ap.add_argument("--refmod-qwen-vision", action="store_true", help="Enable Qwen3-VL visual reconstruction from selected RefMods")
+    ap.add_argument("--t2va-refmods", action="store_true", help="Text-prompt generation using saved RefMods through the proven Ref2VA conditioning worker (experimental)")
     ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--refmod", action="append", default=[], help="H3 RefMod safetensors (experimental)"); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--ref-audio-subject", action="append", type=int, default=[], help="Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic."); ap.add_argument("--lock-source-audio-index", type=int, default=0, help="1-based standalone ref-audio slot to lock as the target H3 audio and mux unchanged to the result"); ap.add_argument("--save-generated-audio-original", default="", help="Also save MP4 with MiniMax decoded audio to this path before muxing source audio (Music Clip Creator)"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
@@ -165,7 +166,17 @@ def main():
         mode_name = "experimental long-duration" if ns.experimental_long_duration else "normal"
         print(f"ERROR: maximum allowed requested frame count in {mode_name} mode is {max_frames} ({max_frames / 24.0:.3f} seconds at 24 FPS)"); return 2
     if ns.width % 32 or ns.height % 32: print("ERROR: width and height must be valid preset values divisible by 32"); return 2
-    if not (ns.ref_image or ns.ref_video or ns.ref_audio or ns.refmod): print("ERROR: Ref2VA needs at least one reference"); return 2
+    if ns.t2va_refmods:
+        if not ns.refmod:
+            print("ERROR: T2VA RefMod test requires at least one saved --refmod", flush=True)
+            return 2
+        if ns.ref_image or ns.ref_video or ns.ref_audio or ns.lock_source_audio_index:
+            print("ERROR: T2VA RefMod test accepts saved RefMods only (no raw reference files)", flush=True)
+            return 2
+        print("[REFMOD-T2VA] Experimental text-prompt + saved-RefMod generation using Ref2VA conditioning backend.", flush=True)
+    elif not (ns.ref_image or ns.ref_video or ns.ref_audio or ns.refmod):
+        print("ERROR: Ref2VA needs at least one reference", flush=True)
+        return 2
 
     errors, info, diff, ref, te, vv, av = validate(
         require_vae=True, mode="ref2va",
@@ -208,8 +219,9 @@ def main():
         return 2
     if ns.seed < 0: ns.seed = int.from_bytes(os.urandom(4), "little") % 99_000_000
     else: ns.seed = int(ns.seed) % 99_000_000
-    out = Path(ns.output) if ns.output else ROOT / "output" / f"minimax_h3_ref2va_{time.strftime('%Y%m%d_%H%M%S')}.mp4"; out.parent.mkdir(parents=True, exist_ok=True)
-    print(f"MiniMax-H3 Ref2VA W4A8 | {ns.width}x{ns.height} | requested frames={ns.frames} | steps={ns.steps} | CFG={ns.cfg:g} | shift={ns.shift:g} | audio shift={ns.audio_shift:g} | seed={ns.seed}", flush=True)
+    default_prefix = "minimax_h3_t2va_refmod" if ns.t2va_refmods else "minimax_h3_ref2va"
+    out = Path(ns.output) if ns.output else ROOT / "output" / f"{default_prefix}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"; out.parent.mkdir(parents=True, exist_ok=True)
+    print(f"MiniMax-H3 {'T2VA + RefMods (Ref2VA conditioning)' if ns.t2va_refmods else 'Ref2VA'} W4A8 | {ns.width}x{ns.height} | requested frames={ns.frames} | steps={ns.steps} | CFG={ns.cfg:g} | shift={ns.shift:g} | audio shift={ns.audio_shift:g} | seed={ns.seed}", flush=True)
     print(f"Using checkpoint: {Path(ref).name}", flush=True)
     print(f"Using text encoder: {Path(te).name}", flush=True)
     print(f"Using video VAE: {Path(vv).name}", flush=True)
@@ -306,6 +318,7 @@ def main():
         for lp, strength in zip(ns.lora, ns.lora_strength): cmd += ["--lora", str(Path(lp).resolve()), "--lora-strength", str(strength)]
         if ns.extended_logging: cmd += ["--extended-logging"]
         if ns.refmod_qwen_vision: cmd += ["--refmod-qwen-vision"]
+        if ns.t2va_refmods: cmd += ["--t2va-refmods"]
         for p in ns.refmod[:8]: cmd += ["--refmod", str(Path(p).resolve())]
         for p in ns.ref_image[:9]: cmd += ["--ref-image", str(Path(p).resolve())]
         for p in ns.ref_video[:3]: cmd += ["--ref-video", str(Path(p).resolve())]

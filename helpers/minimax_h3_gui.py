@@ -778,14 +778,23 @@ class FolderRow(QWidget):
 
 
 class RefList(QWidget):
-    def __init__(self, title, filt, max_items, parent=None):
+    def __init__(self, title, filt, max_items, parent=None, ordered_slots=False):
         super().__init__(parent); self.filt = filt; self.max_items = max_items
+        self.ordered_slots = bool(ordered_slots)
         self.preview_dialog = None
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         top = QHBoxLayout(); top.addWidget(QLabel(title)); top.addStretch()
         add = QPushButton("Add…"); rem = QPushButton("Remove"); prev = QPushButton("Preview"); full = QPushButton("Fullscreen")
         add.clicked.connect(self.add); rem.clicked.connect(self.remove); prev.clicked.connect(self.preview_selected); full.clicked.connect(self.preview_selected_fullscreen)
-        top.addWidget(add); top.addWidget(rem); top.addWidget(prev); top.addWidget(full); lay.addLayout(top)
+        top.addWidget(add); top.addWidget(rem); top.addWidget(prev); top.addWidget(full)
+        if self.ordered_slots:
+            up = QPushButton("Move up"); down = QPushButton("Move down")
+            up.setToolTip("Move selected RefMod one slot earlier. Visual slots map to <Subject 1>, <Subject 2>, ...")
+            down.setToolTip("Move selected RefMod one slot later.")
+            up.clicked.connect(lambda: self._move_selected(-1))
+            down.clicked.connect(lambda: self._move_selected(1))
+            top.addWidget(up); top.addWidget(down)
+        lay.addLayout(top)
         self.list = QListWidget()
         self.list.setMinimumHeight(118)
         self.list.setViewMode(QListWidget.ViewMode.IconMode)
@@ -808,6 +817,30 @@ class RefList(QWidget):
             item.setIcon(QIcon(icon_pix))
         return item
 
+    def _refresh_slot_labels(self):
+        if not self.ordered_slots:
+            return
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            path = str(item.data(Qt.ItemDataRole.UserRole))
+            item.setText(f"#{index + 1}  {Path(path).name}")
+            item.setToolTip(f"Selected RefMod slot {index + 1}\n{path}\n"
+                            "Visual <Video>/<Picture> numbering depends on reference kind. "
+                            "The worker prints exact marker assignments in the log.")
+
+    def _move_selected(self, direction):
+        item = self.list.currentItem() or (self.list.selectedItems()[0] if self.list.selectedItems() else None)
+        if item is None:
+            return
+        old = self.list.row(item)
+        new = old + direction
+        if new < 0 or new >= self.list.count():
+            return
+        item = self.list.takeItem(old)
+        self.list.insertItem(new, item)
+        self.list.setCurrentItem(item)
+        self._refresh_slot_labels()
+
     def _selected_path(self):
         item = self.list.currentItem() or (self.list.selectedItems()[0] if self.list.selectedItems() else None)
         return item.data(Qt.ItemDataRole.UserRole) if item else ""
@@ -826,9 +859,11 @@ class RefList(QWidget):
             if p not in existing:
                 self.list.addItem(self._make_item(p))
                 existing.add(p)
+        self._refresh_slot_labels()
 
     def remove(self):
         for it in self.list.selectedItems(): self.list.takeItem(self.list.row(it))
+        self._refresh_slot_labels()
 
     def _ensure_preview_dialog(self):
         if self.preview_dialog is None:
@@ -858,6 +893,7 @@ class RefList(QWidget):
     def set_paths(self, vals):
         self.list.clear()
         for p in (vals or [])[:self.max_items]: self.list.addItem(self._make_item(str(p)))
+        self._refresh_slot_labels()
 
 
 def _human_bytes(value):
@@ -1386,10 +1422,10 @@ class MainWindow(QMainWindow):
         fl.addRow("", self.combine_frames_latent)
         fl.addRow("", self.glue_results); fl.addRow("", self.continue_last_result); fl.addRow("", self.continue_audio_memory_row); v.addWidget(self.fl_group)
 
-        self.ref_group = QGroupBox("Ref2VA references"); rfl = QVBoxLayout(self.ref_group)
-        note = QLabel("Prompt tags follow the native order: <Picture 1..9>, <Audio n> paired before <Video n>, then standalone <Audio n>."); note.setWordWrap(True); rfl.addWidget(note)
+        self.ref_group = QGroupBox("Reference inputs / saved RefMods"); rfl = QVBoxLayout(self.ref_group)
+        note = QLabel("Prompt tags follow the native order: <Picture 1..9>, <Audio n> paired before <Video n>, then standalone <Audio n>."); note.setWordWrap(True); rfl.addWidget(note); self.ref2va_raw_note = note
         self.ref_size = QComboBox(); self.ref_size.addItems(["match", "max"])
-        rs = QFormLayout(); rs.addRow("Reference image size", self.ref_size); rfl.addLayout(rs)
+        rs = QFormLayout(); self.ref2va_size_label = QLabel("Reference image size"); rs.addRow(self.ref2va_size_label, self.ref_size); rfl.addLayout(rs)
         self.ref_images = RefList("Reference images (max 9)", "Images (*.png *.jpg *.jpeg *.webp *.bmp)", 9)
         self.ref_videos = RefList("Reference videos (max 3; soundtrack extracted when present)", "Video (*.mp4 *.mov *.mkv *.webm *.avi)", 3)
         self.ref_audios = RefList("Standalone reference audio (max 3)", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg)", 3)
@@ -1403,7 +1439,7 @@ class MainWindow(QMainWindow):
         rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios); rfl.addWidget(self.lock_source_audio);
         # RefMod experimental opt-in: preserves original raw image/video/audio references.
         # Credits: Luisa (luisacaotica) original RefMod; Gary's integration/testing with ChatGPT.
-        self.refmods = RefList("Saved H3 RefMods (experimental; max 8)", "H3 RefMods (*.safetensors)", 8)
+        self.refmods = RefList("Saved H3 RefMods (experimental; max 8)", "H3 RefMods (*.safetensors)", 8, ordered_slots=True)
         self.refmods.setToolTip("Select saved visual and/or audio RefMods. A separate voice RefMod can accompany a visual RefMod. Qwen3-VL visual reference reconstruction can be enabled for improved character identity; voice identity is experimental.")
         self.refmod_create_button = QPushButton("Create RefMod from images / 360 video...")
         self.refmod_create_button.setToolTip("Uses the existing H3 video VAE to save a Full Reference identity RefMod. No diffusion model or training required.")
@@ -1419,8 +1455,25 @@ class MainWindow(QMainWindow):
             "No additional model download. Uses more VRAM during prompt encoding. "
             "Unchecked preserves the original latent-only RefMod behavior."
         )
+        self.t2va_use_refmods = QCheckBox("Use saved RefMods in Text to video (experimental)")
+        self.t2va_use_refmods.setChecked(False)
+        self.t2va_use_refmods.setToolTip(
+            "Opt-in T2VA test. With no first frame, selected saved RefMods supply the identity "
+            "conditioning. Uses the already-working H3 Ref2VA conditioning worker and "
+            "Ref2VA-compatible checkpoint, not the separate native T2VA worker. "
+            "Ordinary Text to video is untouched when unchecked."
+        )
+        rfl.addWidget(self.t2va_use_refmods)
         rfl.addWidget(self.refmods); rfl.addWidget(self.refmod_create_button); rfl.addWidget(self.refmod_voice_button)
         rfl.addWidget(self.refmod_qwen_vision)
+        self.refmod_assignment_hint = QLabel(
+            "Multi-character: move visual RefMods into character order (singer, guitarist, drummer). "
+            "With Qwen visual conditioning ON, the worker binds them to <Subject 1>, <Subject 2>, "
+            "<Subject 3> and logs the matching <Video n>/<Picture n> markers. "
+            "Use <Subject n> in your prompt. Voice RefMods have separate audio slots."
+        )
+        self.refmod_assignment_hint.setWordWrap(True)
+        rfl.addWidget(self.refmod_assignment_hint)
         v.addWidget(self.ref_group)
 
         loras = QGroupBox("LoRA adapters (up to 3)"); lf = QFormLayout(loras)
@@ -5735,7 +5788,13 @@ class MainWindow(QMainWindow):
             )
 
     def _sync_mode(self):
-        i = self.mode.currentIndex(); self.fl_group.setVisible(i == 1); self.ref_group.setVisible(i == 2)
+        i = self.mode.currentIndex(); self.fl_group.setVisible(i == 1); self.ref_group.setVisible(i in (0, 2))
+        # In T2VA, expose only saved RefMods: ordinary image/video/audio inputs
+        # belong to Ref2VA, while T2VA+RefMods is explicitly opt-in.
+        for widget in (self.ref2va_raw_note, self.ref2va_size_label, self.ref_size,
+                       self.ref_images, self.ref_videos, self.ref_audios, self.lock_source_audio):
+            widget.setVisible(i == 2)
+        self.t2va_use_refmods.setVisible(i == 0)
         self._sync_continue_video_options()
 
     def _sync_continue_video_options(self):
@@ -6320,7 +6379,7 @@ class MainWindow(QMainWindow):
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(), "latent_continuation": self.latent_continuation.isChecked(),
             "combine_frames_latent": self.combine_frames_latent.isChecked(),
-            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "refmods": self.refmods.paths(), "refmod_qwen_vision": self.refmod_qwen_vision.isChecked(), "lock_source_audio": self.lock_source_audio.isChecked(),
+            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "refmods": self.refmods.paths(), "refmod_qwen_vision": self.refmod_qwen_vision.isChecked(), "t2va_use_refmods": self.t2va_use_refmods.isChecked(), "lock_source_audio": self.lock_source_audio.isChecked(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
@@ -6377,7 +6436,7 @@ class MainWindow(QMainWindow):
             self.continue_video.edit.setText("" if continue_last_setting else d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",90)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 4)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self.combine_frames_latent.setChecked(bool(d.get("combine_frames_latent", False))); self._sync_continue_video_options()
-            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.refmods.set_paths(d.get("refmods", [])); self.refmod_qwen_vision.setChecked(bool(d.get("refmod_qwen_vision", False))); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
+            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.refmods.set_paths(d.get("refmods", [])); self.refmod_qwen_vision.setChecked(bool(d.get("refmod_qwen_vision", False))); self.t2va_use_refmods.setChecked(bool(d.get("t2va_use_refmods", False))); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
             old_output = d.get("output", "")
@@ -7213,7 +7272,8 @@ exit /b %RC%
         # Generation always gets first claim on VRAM. If the integrated Prompt Builder
         # currently has a local LLM loaded, unload it exactly like its Settings button.
         self._unload_prompt_builder_llm_for_generation()
-        script="helpers/generate.py" if mode<2 else "helpers/generate_ref.py"
+        t2va_refmod_test = bool(mode == 0 and self.t2va_use_refmods.isChecked())
+        script="helpers/generate_ref.py" if (mode == 2 or t2va_refmod_test) else "helpers/generate.py"
         for row, strength in self.lora_rows:
             lp = row.path()
             if lp and float(strength.value()) != 0.0 and not Path(lp).is_file():
@@ -7252,6 +7312,22 @@ exit /b %RC%
                 QMessageBox.warning(self,"Glue source required","Glue results requires either a selected Continue video or Continue last result."); return
             if not self.first.path() and not self.last.path() and not manual_continue_video and not continue_last:
                 QMessageBox.warning(self,"Visual input required","Choose a first frame, last frame, Continue video, or Continue last result for FL2VA."); return
+        elif mode == 0 and t2va_refmod_test:
+            # Keep pure T2VA unchanged unless the user opted into RefMod testing.
+            # Reuse the validated Ref2VA conditioning worker: this is text-prompt
+            # generation with saved refs, not a new native T2VA sampling path.
+            mods = self.refmods.paths()
+            if not mods:
+                QMessageBox.warning(self, "T2VA RefMods required", "Select at least one saved RefMod or disable the T2VA RefMod test option.")
+                return
+            for modpath in mods:
+                if not Path(modpath).is_file():
+                    QMessageBox.warning(self, "RefMod missing", f"Cannot find the selected RefMod:\n{modpath}")
+                    return
+                args += ["--refmod", modpath]
+            if self.refmod_qwen_vision.isChecked():
+                args += ["--refmod-qwen-vision"]
+            args += ["--t2va-refmods"]
         elif mode==2:
             refs=self.ref_images.paths()+self.ref_videos.paths()+self.ref_audios.paths()+self.refmods.paths()
             if self.refmods.paths() and (self.ref_images.paths() or self.ref_videos.paths() or self.ref_audios.paths()):
@@ -7280,7 +7356,9 @@ exit /b %RC%
                     QMessageBox.warning(self, "Source audio required", "Use Audio 1 as exact source / output needs at least one standalone audio file in Audio slot 1.")
                     return
                 args += ["--lock-source-audio-index", "1"]
-        args += self.model_override_args(mode)
+        # RefMod T2VA uses the Ref2VA-conditioned diffusion checkpoint/worker.
+        # An enabled hybrid is passed to --ref2va-checkpoint, matching working Ref2VA.
+        args += self.model_override_args(2 if t2va_refmod_test else mode)
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():
             args += ["--vram-manager-auto" if self.vram_manager_auto_bypass.isChecked() else "--vram-manager"]
@@ -7315,9 +7393,9 @@ exit /b %RC%
             model_path = str(resolved_hybrid)
             model_label = f"Hybrid: {resolved_hybrid.name}"
         else:
-            model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
-            model_label=Path(model_path).name if model_path else ("Ref2VA default" if mode==2 else "FL2VA default")
-        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":self.mode.currentText(),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 90) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation),"combine_frames_latent":bool(combine_frames_latent)}
+            model_path=self.ref2va_model.path() if (mode==2 or t2va_refmod_test) else self.fl2va_model.path()
+            model_label=Path(model_path).name if model_path else ("Ref2VA-conditioned default" if (mode==2 or t2va_refmod_test) else "FL2VA default")
+        job={"id":uuid.uuid4().hex,"job_number":self._take_next_job_number(),"state":"pending","created_at":time.time(),"started_at":None,"finished_at":None,"elapsed":0,"mode":mode,"mode_name":("Text to video + RefMods (experimental)" if t2va_refmod_test else self.mode.currentText()),"model_label":model_label,"output":str(out),"seed":self.seed.value(),"actual_seed":None,"resolution":f"{w} × {h}","frames":frames,"steps":self.steps.value(),"prompt":prompt,"args":args,"progress":None,"phase":"Waiting","error":"","cancel_reason":"","settings":self.settings_dict(),"log_tail":"","continue_last_result":bool(continue_last),"continue_from_job_id":continue_from_job_id,"continue_from_job_number":continue_from_job_number,"manual_continue_video":manual_continue_video,"continue_context_frames":int(self.continue_context.currentData() or 90) if mode==1 else None,"glue_results":bool(glue_results),"continue_audio_memory":bool(continue_audio_memory),"latent_continuation":bool(latent_continuation),"combine_frames_latent":bool(combine_frames_latent)}
         self.queue_jobs.append(job); self.save_last(); self._save_queue_state(); self._refresh_queue_views(); self.status.setText("Job added to queue")
         if self.gen_vsr_toggle.isChecked():
             scale = int(self.gen_vsr_scale.currentData() or 2)
