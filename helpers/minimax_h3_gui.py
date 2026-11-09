@@ -1404,14 +1404,23 @@ class MainWindow(QMainWindow):
         # RefMod experimental opt-in: preserves original raw image/video/audio references.
         # Credits: Luisa (luisacaotica) original RefMod; Gary's integration/testing with ChatGPT.
         self.refmods = RefList("Saved H3 RefMods (experimental; max 8)", "H3 RefMods (*.safetensors)", 8)
-        self.refmods.setToolTip("Select saved visual and/or audio RefMods. A separate voice RefMod can accompany a visual RefMod. Full Qwen3-VL visual-token reconstruction is not yet implemented; voice identity is experimental.")
+        self.refmods.setToolTip("Select saved visual and/or audio RefMods. A separate voice RefMod can accompany a visual RefMod. Qwen3-VL visual reference reconstruction can be enabled for improved character identity; voice identity is experimental.")
         self.refmod_create_button = QPushButton("Create RefMod from images / 360 video...")
         self.refmod_create_button.setToolTip("Uses the existing H3 video VAE to save a Full Reference identity RefMod. No diffusion model or training required.")
         self.refmod_create_button.clicked.connect(self._create_refmod_dialog)
         self.refmod_voice_button = QPushButton("Create Voice RefMod from audio...")
         self.refmod_voice_button.setToolTip("Encode up to 30 seconds of a voice sample with the installed H3 audio VAE, saving a separate audio RefMod. Voice cloning is not guaranteed.")
         self.refmod_voice_button.clicked.connect(self._create_voice_refmod_dialog)
+        self.refmod_qwen_vision = QCheckBox("RefMod Qwen3-VL visual conditioning (experimental)")
+        self.refmod_qwen_vision.setChecked(False)
+        self.refmod_qwen_vision.setToolTip(
+            "Decode selected visual RefMods with the existing H3 video VAE and feed their images "
+            "to the existing Qwen3-VL encoder in addition to the usual H3 latent references. "
+            "No additional model download. Uses more VRAM during prompt encoding. "
+            "Unchecked preserves the original latent-only RefMod behavior."
+        )
         rfl.addWidget(self.refmods); rfl.addWidget(self.refmod_create_button); rfl.addWidget(self.refmod_voice_button)
+        rfl.addWidget(self.refmod_qwen_vision)
         v.addWidget(self.ref_group)
 
         loras = QGroupBox("LoRA adapters (up to 3)"); lf = QFormLayout(loras)
@@ -6311,7 +6320,7 @@ class MainWindow(QMainWindow):
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(), "latent_continuation": self.latent_continuation.isChecked(),
             "combine_frames_latent": self.combine_frames_latent.isChecked(),
-            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "refmods": self.refmods.paths(), "lock_source_audio": self.lock_source_audio.isChecked(),
+            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(), "refmods": self.refmods.paths(), "refmod_qwen_vision": self.refmod_qwen_vision.isChecked(), "lock_source_audio": self.lock_source_audio.isChecked(),
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": self.system_hud_toggle.isChecked(),
@@ -6368,7 +6377,7 @@ class MainWindow(QMainWindow):
             self.continue_video.edit.setText("" if continue_last_setting else d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",90)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 4)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self.latent_continuation.setChecked(bool(d.get("latent_continuation", False))); self.combine_frames_latent.setChecked(bool(d.get("combine_frames_latent", False))); self._sync_continue_video_options()
-            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.refmods.set_paths(d.get("refmods", [])); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
+            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", [])); self.refmods.set_paths(d.get("refmods", [])); self.refmod_qwen_vision.setChecked(bool(d.get("refmod_qwen_vision", False))); self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
             old_output = d.get("output", "")
@@ -7254,6 +7263,8 @@ exit /b %RC%
                     QMessageBox.warning(self, "RefMod missing", f"Cannot find the selected RefMod:\n{modpath}")
                     return
                 args += ["--refmod", modpath]
+            if self.refmods.paths() and self.refmod_qwen_vision.isChecked():
+                args += ["--refmod-qwen-vision"]
             args += ["--ref-image-size",self.ref_size.currentText()]
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
