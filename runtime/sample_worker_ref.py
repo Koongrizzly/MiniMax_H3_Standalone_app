@@ -183,6 +183,7 @@ def main():
     for n in ('cfg','shift','audio-shift'): ap.add_argument('--'+n,type=float,required=True)
     ap.add_argument('--sampler',default='euler'); ap.add_argument('--scheduler',default='simple'); ap.add_argument('--ref-image-size',choices=['match','max'],default='match')
     ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--refmod',action='append',default=[]); ap.add_argument('--refmod-qwen-vision',action='store_true',help='Decode visual RefMods using the existing H3 VAE and show them to Qwen3-VL'); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
+    ap.add_argument('--t2va-refmods',action='store_true',help='Experimental T2VA text-prompt entry via Ref2VA conditioning backend')
     ap.add_argument('--lock-source-audio-index', type=int, default=0, help='1-based standalone --ref-audio slot to use as the target H3 audio latent with denoise mask 0. 0 keeps normal Ref2VA audio generation.')
     ap.add_argument('--ref-audio-subject', action='append', type=int, default=[], help='Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic.')
     ap.add_argument('--lora',action='append',default=[]); ap.add_argument('--lora-strength',action='append',type=float,default=[])
@@ -212,6 +213,10 @@ def main():
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
         print(f"[VRAM-MGR] V11.6 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+    if ns.t2va_refmods:
+        if not ns.refmod or ns.ref_image or ns.ref_video or ns.ref_audio:
+            raise ValueError('T2VA RefMod mode requires saved RefMods only')
+        print('[REFMOD-T2VA] Text-only scene prompt; identity provided by saved RefMods via the Ref2VA-conditioning worker.', flush=True)
     if len(ns.lora)!=len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora)>3: raise ValueError('Maximum 3 LoRAs are supported')
     manager=None
@@ -252,6 +257,8 @@ def main():
     # No duplicate VAE encoding and no modification of existing raw references.
     voice_refmods = []
     visual_refmod_count = 0
+    visual_refmod_tokens = 0
+    refmod_visual_bindings = []  # (subject_number, Qwen marker, human-readable name)
     if ns.refmod:
         from runtime.refmod_support.core import H3RefMod
         for mod_path in ns.refmod[:8]:
@@ -272,6 +279,7 @@ def main():
             else:
                 ref_blocks.append(block)
                 visual_refmod_count += 1
+                visual_refmod_tokens += max(0, int(mod.token_count or 0))
                 if ns.refmod_qwen_vision:
                     # RefMod visual-conditioning bridge adapted for GrizzlyMax.
                     # Original format/extractor by Luisa; Gary supplied testing and
@@ -328,7 +336,11 @@ def main():
                                           'timestamps': [i / 2.0 for i in range(frames.shape[0])]})
                         marker = f"<Video {sum(i['type'] == 'video' for i in ref_items)}>"
                     del decoded
-                    print(f"[REFMOD] Qwen3-VL visual conditioning: {mod.name} -> {marker}", flush=True)
+                    # Marker indices are based on the actual Qwen ref_items sequence,
+                    # not on the selected-file number (voice mods may be interleaved).
+                    subject_n = visual_refmod_count
+                    refmod_visual_bindings.append((subject_n, marker, mod.name))
+                    print(f"[REFMOD] Qwen3-VL visual identity: {mod.name} -> {marker} -> <Subject {subject_n}>", flush=True)
             print(f"[REFMOD] Loaded {mod.name}: kind={mod.kind}, tokens={mod.token_count}, mode={mod.mode}", flush=True)
             if mod.description:
                 print(f"[REFMOD] Prompt hint: {mod.description}", flush=True)
@@ -419,6 +431,20 @@ def main():
     print('Loading MiniMax H3 text encoder for Ref2VA...',flush=True); clip=comfy.sd.load_clip([ns.text_encoder],clip_type=comfy.sd.CLIPType.MINIMAX)
     if ns.extended_logging: log_mem('after text encoder object load')
     effective_prompt = ns.prompt
+    if refmod_visual_bindings:
+        # Explicitly bind each registered Qwen reference to a distinct subject.
+        # This does NOT promise perfect identity separation, but ensures the
+        # tokenizer sees the correct <Video n>/<Picture n> reference markers.
+        import re as _re
+        # Remove our own previously generated declarations if copied into a prompt.
+        effective_prompt = _re.sub(
+            r'(?im)^\s*<(?:Video|Picture)\s+\d+>\s+is the visual identity reference for\s+<Subject\s+\d+>[^\n]*\n?',
+            '', effective_prompt,
+        ).lstrip()
+        lines = [f"{marker} is the visual identity reference for <Subject {subject_n}> "
+                 f"({name})." for subject_n, marker, name in refmod_visual_bindings]
+        effective_prompt = "\n".join(lines) + "\n" + effective_prompt
+        print('[REFMOD] Auto-bound visual RefMods: ' + ' | '.join(lines), flush=True)
     if voice_prompt_lines:
         # Replace any manually-entered voice-binding lines with the runtime-
         # resolved bindings. Reference-video soundtracks can consume <Audio n>
@@ -459,7 +485,12 @@ def main():
     else:
         _flush_models()
     if ns.extended_logging: log_mem('after text encoder flush', sync=True)
-    if manager is not None: manager.set_stage('diffusion')
+    if manager is not None:
+        manager.set_stage('diffusion')
+        # RefMod visual latents remain full quality. Multiple character refs add
+        # attention activation pressure not captured by Comfy's native hint.
+        if visual_refmod_count >= 2:
+            manager.arm_multi_refmod_diffusion(visual_refmod_count, visual_refmod_tokens)
     if ns.extended_logging: _log_checkpoint('Ref2VA diffusion checkpoint', ns.diffusion); log_mem('before diffusion model load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
     print('Loading W4A8 Ref2VA diffusion model...',flush=True)
     model=comfy.sd.load_diffusion_model(ns.diffusion)

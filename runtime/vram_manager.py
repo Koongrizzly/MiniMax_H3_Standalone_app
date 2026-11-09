@@ -103,6 +103,8 @@ class VRAMManager:
         self._ultra_diffusion_pressure = False
         self._extreme_floor_logged = False
         self._ultra_admission_logged = False
+        # Additional activation runway only for >=2 visual RefMods.
+        self._multi_refmod_target_bytes = 0
 
     @staticmethod
     def _gb(n: int) -> str:
@@ -118,6 +120,31 @@ class VRAMManager:
     def residency_target_free_bytes(self) -> int:
         return max(self.runtime_floor_bytes(), int(float(self.cfg.residency_target_free_gb) * _GIB))
 
+    def arm_multi_refmod_diffusion(self, visual_count: int, reference_tokens: int = 0):
+        """Conservatively reserve activation VRAM for multi-character RefMod sampling.
+
+        Comfy's native sampler memory hint does not account for the added
+        reference-conditioning tokens (observed 39,412 tokens with two RefMods).
+        The normal/one-character path is untouched. No references are downscaled.
+        """
+        count = max(0, int(visual_count))
+        if count < 2 or not self.is_stage_managed("diffusion"):
+            self._multi_refmod_target_bytes = 0
+            return
+        tokens = max(0, int(reference_tokens))
+        # Keep headroom above the failed 3.66 GiB after model load. Scale for
+        # additional references, capped to avoid eliminating the resident model.
+        reserve_gb = min(10.0, 6.5 + 1.25 * (count - 2) + max(0, tokens - 10000) / 10000 * 0.75)
+        self._multi_refmod_target_bytes = max(self.load_headroom_bytes(), int(reserve_gb * _GIB))
+        self._sampling_target_free_bytes = max(self._sampling_target_free_bytes, self._multi_refmod_target_bytes)
+        self._set_comfy_reserve(self._multi_refmod_target_bytes)
+        self._log(
+            f"multi-RefMod diffusion admission armed | visual RefMods={count} | "
+            f"reference tokens={tokens} | reserved activation runway="
+            f"{self._gb(self._multi_refmod_target_bytes)} | full-quality references preserved",
+            force=True,
+        )
+
     def load_headroom_bytes(self) -> int:
         if self.stage == "diffusion":
             gb = self.cfg.diffusion_load_headroom_gb
@@ -125,7 +152,7 @@ class VRAMManager:
             gb = self.cfg.vae_load_headroom_gb
         else:
             gb = self.cfg.text_load_headroom_gb
-        return max(self.runtime_floor_bytes(), int(float(gb) * _GIB))
+        return max(self.runtime_floor_bytes(), int(float(gb) * _GIB), int(self._multi_refmod_target_bytes) if self.stage == "diffusion" else 0)
 
     @staticmethod
     def _normalize_stage(stage: str) -> str:
@@ -152,6 +179,7 @@ class VRAMManager:
     def set_stage(self, stage: str):
         self.stage = self._normalize_stage(stage)
         if self.stage != "diffusion":
+            self._multi_refmod_target_bytes = 0
             self._extreme_diffusion_pressure = False
             self._ultra_diffusion_pressure = False
             self._extreme_floor_logged = False
@@ -409,6 +437,8 @@ class VRAMManager:
                 return manager._orig_load_models_gpu(models, *args, **kwargs)
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
+            if manager.stage == "diffusion" and manager._multi_refmod_target_bytes:
+                reserve = max(reserve, manager._multi_refmod_target_bytes)
             # V11.6: while Qwen conditioning admission is armed, keep the large
             # activation runway visible to *every* Comfy load call.  encode() calls
             # CLIP.load_model(tokens) again, so dropping back to the 0.5 GiB runtime
