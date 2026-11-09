@@ -250,6 +250,7 @@ def main():
     # RefMods directly supply already-encoded visual/audio latents.
     # Original RefMod algorithm: Luisa (luisacaotica); integration shared by Gary.
     # No duplicate VAE encoding and no modification of existing raw references.
+    voice_refmods = []
     if ns.refmod:
         from runtime.refmod_support.core import H3RefMod
         for mod_path in ns.refmod[:8]:
@@ -262,7 +263,13 @@ def main():
                 continue
             # Label is for logging only; Qwen visual context reconstruction is
             # NOT yet supported in this first experimental integration.
-            ref_blocks.append(block)
+            if mod.kind == "audio":
+                # Audio Qwen markers must be registered in the same order as
+                # native reference audio. Keep audio RefMods separate until
+                # the audio VAE processing stage for correct <Audio n> indexing.
+                voice_refmods.append((mod, block))
+            else:
+                ref_blocks.append(block)
             print(f"[REFMOD] Loaded {mod.name}: kind={mod.kind}, tokens={mod.token_count}, mode={mod.mode}", flush=True)
             if mod.description:
                 print(f"[REFMOD] Prompt hint: {mod.description}", flush=True)
@@ -288,6 +295,18 @@ def main():
             ref_items.append({'type':'video','data':qwen,'timestamps':timestamps})
             ref_blocks.append({'kind':'video_audio' if at else 'video','latent_t':z.shape[2],'latent_h':ch//16,'latent_w':cw//16,'ref_audio_t':at,'latent':z,'audio_latent':az})
         voice_prompt_lines = []
+        # Stored audio latents do not require loading or encoding the original
+        # voice file. Each voice RefMod becomes a regular H3 audio reference.
+        for voice_i, (mod, block) in enumerate(voice_refmods, 1):
+            ref_items.append({'type': 'audio'})
+            ref_blocks.append(block)
+            audio_index = sum(1 for item in ref_items if item.get('type') == 'audio')
+            # Auto-bind the first voice mod to Subject 1, second to Subject 2.
+            # These declarations describe conditioning, not guaranteed cloning.
+            if voice_i <= 9:
+                voice_prompt_lines.append(
+                    f"<Audio {audio_index}> is the voice timbre reference for <Subject {voice_i}>.")
+                print(f"[REFMOD] Voice reference {mod.name}: <Audio {audio_index}> -> <Subject {voice_i}>", flush=True)
         locked_source_audio = None
         for standalone_i, path in enumerate(ns.ref_audio[:3]):
             az,at=encode_audio(avae,load_audio(path)); az=_cpu_latent(az); ref_items.append({'type':'audio'}); ref_blocks.append({'kind':'audio','ref_audio_t':at,'audio_latent':az})
