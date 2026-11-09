@@ -542,6 +542,12 @@ class Preview(QWidget):
 
     def mouseReleaseEvent(self, event):
         if getattr(self,'_media_drag',None) is not None:
+            if hasattr(self.app,'media_table'):
+                i=self.app.media_table.currentRow()
+                layers=self.app.project.get('media_layers',[])
+                if 0 <= i < len(layers) and layers[i].get('media_keyframes'):
+                    from .media_layers import set_geometry_key
+                    set_geometry_key(layers[i],self.app.current_time())
             self._media_drag=None
             self.update()
             return
@@ -1327,7 +1333,7 @@ class MainWindow(QMainWindow):
           'Beat punch', 'Wobble', 'Neon tag', 'Echo Typography', 'Word Storm', 'Scramble Title',
           'Rolling Number', 'Speech Balloon / Callout', 'Corner Label', 'Scrolling Ticker',
           'Text Reveal', 'Comic Burst')),
-        ('Music Reactive', '#45BFA4', ('Equalizer 3-Band', 'Equalizer 12-Band', 'Beat Heart',
+        ('Music Reactive', '#45BFA4', ('Equalizer 3-Band', 'Equalizer 12-Band', 'Equalizer LED', 'Equalizer Radial', 'Equalizer Mirror', 'Beat Heart',
           'Heartbeat', 'Kinetic Grid')),
         ('Visual & Glitch', '#D7A35A', ('Glitch', 'Particle Spray', 'Neon Rings',
           'Lightning Bolts', 'Glitch Blocks', 'Film Burn', 'Starfield Rush',
@@ -1353,6 +1359,9 @@ class MainWindow(QMainWindow):
         'Comic Burst': 'Comic-style impact burst',
         'Equalizer 3-Band': 'Three bars move with the audio',
         'Equalizer 12-Band': 'Twelve music-driven frequency bars',
+        'Equalizer LED': 'Segmented LED columns bouncing to twelve audio bands',
+        'Equalizer Radial': 'Circular ring of audio-reactive frequency spokes',
+        'Equalizer Mirror': 'Mirrored frequency bars grow upward and downward',
         'Beat Heart': 'Heart reacts to the music',
         'Heartbeat': 'Animated heartbeat graphic',
         'Kinetic Grid': 'Moving geometric grid',
@@ -2653,13 +2662,31 @@ class MainWindow(QMainWindow):
         if idx>=len(self.project.get('events',[])):return
         ev=self.project['events'][idx]
         style=ev.get('style','')
-        if style not in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout'):
+        if style not in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout',
+                         'Equalizer 3-Band','Equalizer 12-Band','Equalizer LED','Equalizer Radial','Equalizer Mirror'):
             QMessageBox.information(self,'Select an effect','This effect does not have specialized settings.')
             return
-        dlg=QDialog(self);dlg.setWindowTitle('Edit '+style);dlg.resize(520,670 if style == 'Speech Balloon / Callout' else 310)
+        dlg=QDialog(self);dlg.setWindowTitle('Edit '+style);dlg.resize(520,670 if style == 'Speech Balloon / Callout' else (470 if style.startswith('Equalizer') else 310))
         outer=QVBoxLayout(dlg);form=QFormLayout();outer.addLayout(form)
         title=QLineEdit(str(ev.get('text','')));form.addRow('Label / heading:',title)
-        if style == 'Speech Balloon / Callout':
+        if style.startswith('Equalizer'):
+            mode=fixed_combo(['Single color','Rainbow','Bass / Mid / High'],str(ev.get('eq_color_mode','Single color')))
+            form.addRow('Color mode:',mode)
+            colors=[]
+            for name, key, fallback in [('Single color','color','#00E5FF'),
+                                         ('Bass','eq_bass_color','#FF5279'),
+                                         ('Mid','eq_mid_color','#42D6FF'),
+                                         ('High','eq_high_color','#E9DA5F')]:
+                entry=QLineEdit(str(ev.get(key,fallback)))
+                choose=button('Pick...',lambda edit=entry, label=name: (lambda picked: edit.setText(picked.name()) if picked.isValid() else None)(QColorDialog.getColor(QColor(edit.text()),dlg,'Choose '+label+' color',QColorDialog.ColorDialogOption.DontUseNativeDialog)))
+                line=QWidget();row=QHBoxLayout(line);row.setContentsMargins(0,0,0,0)
+                row.addWidget(entry,1);row.addWidget(choose)
+                form.addRow(name+':',line)
+                colors.append(entry)
+            segments=spin_int(5,32,int(ev.get('eq_segments',14)))
+            if style == 'Equalizer LED':form.addRow('LED segments / column:',segments)
+            hint=QLabel('Single uses one chosen color. Rainbow distributes colors across frequency bands. Bass / Mid / High assigns three chosen colors to low, middle and high frequencies. All modes use analyzed audio during preview and export. Set location, size and duration in the effects timeline.')
+        elif style == 'Speech Balloon / Callout':
             shape=fixed_combo(['Speech bubble','Rounded bubble','Thought bubble','HUD callout','Comic burst','Caption box','Pointer label'],str(ev.get('balloon_shape','Speech bubble')))
             balloon_font_size=spin_int(8,180,int(ev.get('balloon_font_size',30)))
             balloon_width=spin_int(100,1200,int(ev.get('balloon_width',340)))
@@ -2757,7 +2784,17 @@ class MainWindow(QMainWindow):
         controls.addWidget(cancel);controls.addWidget(save)
         if dlg.exec()!=QDialog.DialogCode.Accepted:return
         ev['text']=title.text()
-        if style == 'Speech Balloon / Callout':
+        if style.startswith('Equalizer'):
+            from PySide6.QtGui import QColor as _Color
+            edits=[entry.text().strip() for entry in colors]
+            for raw in edits:
+                if not _Color(raw).isValid():
+                    QMessageBox.warning(self,'Invalid color','Use the color picker or enter valid HTML colors such as #42D6FF.')
+                    return
+            ev.update(color=edits[0],eq_color_mode=mode.currentText(),
+                      eq_bass_color=edits[1],eq_mid_color=edits[2],eq_high_color=edits[3],
+                      eq_segments=segments.value())
+        elif style == 'Speech Balloon / Callout':
             ev.update(balloon_shape=shape.currentText(),balloon_font_size=balloon_font_size.value(),
                 balloon_width=balloon_width.value(),balloon_padding=balloon_padding.value(),
                 balloon_border=balloon_border.value(),balloon_fill=balloon_fill.text(),
@@ -2819,7 +2856,7 @@ class MainWindow(QMainWindow):
         is_text=style in ('Text Overlay','Pop Open','Side Slam','Stamp','Slide in',
                           'Beat punch','Wobble','Glitch','Neon tag','Echo Typography',
                           'Word Storm','Corner Label','Scrolling Ticker','Text Reveal','Scramble Title','Rolling Number','Speech Balloon / Callout')
-        self.composite_edit_button.setVisible(style in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout'))
+        self.composite_edit_button.setVisible(style in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout','Equalizer 3-Band','Equalizer 12-Band','Equalizer LED','Equalizer Radial','Equalizer Mirror'))
         self.typography_panel.setVisible(is_text)
         self.frame_panel.setVisible(is_frame)
         self.line_panel.setVisible(is_line)
@@ -2841,7 +2878,8 @@ class MainWindow(QMainWindow):
             'Speedometer HUD': 'SPEED', 'Warning Meter': 'WARNING',
             'Scanning HUD': 'SCANNING', 'Arrow Impact': 'IMPACT!',
             'Heartbeat': 'HEARTBEAT', 'Rotary Mechanism': 'ROTARY',
-            'Equalizer 3-Band': '', 'Equalizer 12-Band': '', 'Beat Heart': '',
+            'Equalizer 3-Band': '', 'Equalizer 12-Band': '', 'Equalizer LED': '',
+            'Equalizer Radial': '', 'Equalizer Mirror': '', 'Beat Heart': '',
             'Object Box': '', 'Object Corners': '', 'Object Brackets': '',
             'Linked Callout': 'TARGET IDENTIFIED', 'Data Card': 'DATA RECORD',
             'Analysis Panel / Counter': 'SYSTEM ANALYSIS', 'Text Reveal': 'FUTURE LOADING',
@@ -2887,15 +2925,18 @@ class MainWindow(QMainWindow):
             ev.update(frame_width=18,frame_height=26,callout_offset_x=17,callout_offset_y=-12,callout_font_size=22,callout_frame='Corners',color='#9FB6CC',end=min(start+5,float(self.project.get('duration') or start+5)))
         elif style == 'Data Card':
             ev.update(x=72,y=27,card_width=24,card_font_size=21,card_rows='TYPE | SYNTHETIC\nSTATUS | ACTIVE\nID | 001',card_barcode=True,color='#A1B7CE',end=min(start+5,float(self.project.get('duration') or start+5)))
-        if style in ('Equalizer 3-Band','Equalizer 12-Band','Beat Heart'):
+        if style in ('Equalizer 3-Band','Equalizer 12-Band','Equalizer LED','Equalizer Radial','Equalizer Mirror','Beat Heart'):
             ev['color'] = '#00E5FF' if 'Equalizer' in style else '#FF4C84'
             ev['size'] = 110
             ev['end'] = round(min(float(self.project.get('duration') or (start+8)), start+8),3)
             ev['fade_in'] = 0.0
             ev['fade_out'] = 0.0
             if ev['end'] <= start: ev['end'] = round(start+2.,3)
+            if style.startswith('Equalizer'):
+                ev.update(eq_color_mode='Single color',eq_bass_color='#FF5279',
+                          eq_mid_color='#42D6FF',eq_high_color='#E9DA5F',eq_segments=14)
         self.project.setdefault('events', []).append(ev)
-        if style in ('Equalizer 3-Band','Equalizer 12-Band','Beat Heart') and not self._audio_bands_current():
+        if style in ('Equalizer 3-Band','Equalizer 12-Band','Equalizer LED','Equalizer Radial','Equalizer Mirror','Beat Heart') and not self._audio_bands_current():
             self.analyze_bands()
         self.refresh_event_table()
         self.preview.update()
@@ -3101,6 +3142,10 @@ class MainWindow(QMainWindow):
         self.media_rotation=spin_int(-360,360,0)
         self.media_speed=dbl(.1,8,1)
         self.media_trim=dbl(0,99999,0)
+        self.media_mask=NoWheelCombo()
+        self.media_mask.addItems(['Rectangle','Rounded rectangle','Circle','Ellipse'])
+        self.media_freeze=QCheckBox('Freeze video/image at chosen source time')
+        self.media_freeze_at=dbl(0,99999,0)
         self.media_loop=QCheckBox('Loop until layer ends')
         self.media_loop.setChecked(True)
         self.media_fade_in=dbl(0,20,.28)
@@ -3112,8 +3157,20 @@ class MainWindow(QMainWindow):
                            ('Source trim (s)',self.media_trim),('Fade in (s)',self.media_fade_in),
                            ('Fade out (s)',self.media_fade_out)]:
             form.addRow(label,ctrl)
+        form.addRow('Shape / mask',self.media_mask)
+        form.addRow(self.media_freeze)
+        form.addRow('Freeze at source (s)',self.media_freeze_at)
         form.addRow(self.media_loop)
         form.addRow(button('Apply layer properties',self.apply_media_properties))
+        keyrow=QHBoxLayout()
+        keyrow.addWidget(button('Set keyframe at playhead',self.set_media_keyframe))
+        keyrow.addWidget(button('Clear keyframes',self.clear_media_keyframes))
+        form.addRow('Motion',keyrow)
+        layouts=QHBoxLayout()
+        for title,code in [('Left half','left'),('Right half','right'),('Top half','top'),('Bottom half','bottom'),('Corner PiP','pip'),('Full frame','full')]:
+            layouts.addWidget(button(title,lambda _=False,c=code:self.media_layout_preset(c)))
+        form.addRow('Layout presets',layouts)
+
         layout.addWidget(props)
         note=QLabel('Video overlays are muted (your main soundtrack stays unchanged). PNG/GIF and video are rendered in the same compositing pass. Save the project to preserve layers.')
         note.setWordWrap(True);layout.addWidget(note)
@@ -3189,6 +3246,10 @@ class MainWindow(QMainWindow):
             ('media_fade_in','fade_in',.28),('media_fade_out','fade_out',.28)]:
             getattr(self,name).setValue(float(layer.get(key,default)))
         self.media_loop.setChecked(bool(layer.get('loop',True)))
+        self.media_mask.setCurrentText(str(layer.get('mask','Rectangle')))
+        self.media_freeze.setChecked(bool(layer.get('freeze',False)))
+        self.media_freeze_at.setValue(float(layer.get('freeze_at',layer.get('trim',0))))
+
         self.media_timeline.update()
 
     def apply_media_properties(self):
@@ -3200,11 +3261,51 @@ class MainWindow(QMainWindow):
                 'size':self.media_width.value(),'opacity':self.media_opacity.value(),
                 'rotation':self.media_rotation.value(),'speed':self.media_speed.value(),
                 'trim':self.media_trim.value(),'loop':self.media_loop.isChecked(),
-                'fade_in':self.media_fade_in.value(),'fade_out':self.media_fade_out.value()}
+                'fade_in':self.media_fade_in.value(),'fade_out':self.media_fade_out.value(),
+                'mask':self.media_mask.currentText(),'freeze':self.media_freeze.isChecked(),
+                'freeze_at':self.media_freeze_at.value()}
         if values['end']<=values['start']:
             self.message('Layer end must be later than start.');return
         layers[i].update(values)
         self._preview_media_provider.close()
+        self.refresh_media_layers(select=i)
+        self.preview.update()
+
+    def set_media_keyframe(self):
+        from .media_layers import set_geometry_key
+        i=self.media_table.currentRow()
+        layers=self.project.get('media_layers',[])
+        if not 0 <= i < len(layers):return
+        self.apply_media_properties()
+        # Properties are captured exactly as visible in the editor.
+        count=set_geometry_key(layers[i],self.current_time())
+        self.status.setText(f'Media layer: {count} position/size/opacity keyframe(s)')
+        self.preview.update()
+
+    def clear_media_keyframes(self):
+        i=self.media_table.currentRow()
+        layers=self.project.get('media_layers',[])
+        if not 0 <= i < len(layers):return
+        layers[i].pop('media_keyframes',None)
+        self.status.setText('Media layer keyframes cleared.')
+        self.preview.update()
+
+    def media_layout_preset(self,kind):
+        """1280x720-based predictable positioning, also works on portrait output."""
+        i=self.media_table.currentRow()
+        layers=self.project.get('media_layers',[])
+        if not 0 <= i < len(layers):return
+        layer=layers[i]
+        ratio=max(.1,float(layer.get('source_ratio',16/9)))
+        positions={
+            'left':(25,50,640),'right':(75,50,640),
+            'top':(50,25,640),'bottom':(50,75,640),
+            'pip':(81,19,360),'full':(50,50,1280)}
+        x,y,width=positions[kind]
+        if kind in ('top','bottom'):
+            width=min(1280,360*ratio)
+        # Fills the expected region by width, preserving the aspect ratio.
+        layer.update({'x':x,'y':y,'size':width,'rotation':0})
         self.refresh_media_layers(select=i)
         self.preview.update()
 

@@ -399,26 +399,18 @@ def _draw_countdown(p, w, h, t, event, project):
 
 
 def _draw_overlay(p, w, h, t, event):
-    start, end = float(event.get('start', 0)), float(event.get('end', 0))
+    """Image/GIF layer drawing through the same geometry and mask path as video."""
+    start, end = float(event.get('start',0)),float(event.get('end',0))
     if not start <= t < end:
         return
-    fade = event_fade(event, t, start, end)
-    if fade <= 0:
+    from .media_layers import source_time
+    source_t = source_time(event,t)
+    if source_t is None:
         return
-    img = overlay_frame(str(event.get('text', '')), t - start, float(event.get('speed', 1)))
-    if img is None:
-        return
-    sf = min(w / 1280, h / 720)
-    intended_width = max(1, float(event.get('size', 250)) * sf)
-    intended_height = intended_width * img.height() / max(1, img.width())
-    x = w * float(event.get('x', 50)) / 100
-    y = h * float(event.get('y', 50)) / 100
-    p.save()
-    p.setOpacity(clamp(float(event.get('opacity', 100)) / 100) * fade)
-    p.translate(x, y)
-    p.rotate(float(event.get('rotation', 0)))
-    p.drawImage(QRectF(-intended_width/2, -intended_height/2, intended_width, intended_height), img)
-    p.restore()
+    # overlay_frame expects playback elapsed and applies its own speed.
+    img = overlay_frame(str(event.get('text','')), source_t, 1.)
+    if img is not None:
+        _draw_media_image(p,w,h,t,event,img)
 
 
 # Visual effects are deterministic, transparent and clipped to event time boundaries.
@@ -430,7 +422,7 @@ MOTION_STUDIO_STYLES = (
     'Scramble Title', 'Rolling Number', 'Speech Balloon / Callout',
     'Speedometer HUD', 'Warning Meter', 'Scanning HUD', 'Arrow Impact',
     'Heartbeat', 'Rotary Mechanism',
-    'Equalizer 3-Band', 'Equalizer 12-Band', 'Beat Heart',
+    'Equalizer 3-Band', 'Equalizer 12-Band', 'Equalizer LED', 'Equalizer Radial', 'Equalizer Mirror', 'Beat Heart',
     'Linked Callout', 'Data Card', 'Analysis Panel / Counter', 'Text Reveal', 'Planar Overlay',
     *FRAME_STYLES,
 )
@@ -612,27 +604,86 @@ def _draw_motion_studio(p, w, h, t, event, project, kind):
             p.setBrush(color(cstr,.75))
             for i,b in enumerate(digest):
                 p.drawRect(QRectF(left+i*unit*2,by-(7+((b>>4)%7))*sf,unit*(.55+(b%3)*.3), (7+((b>>4)%7))*sf))
-    elif kind in ('Equalizer 3-Band', 'Equalizer 12-Band'):
-        n = 3 if kind == 'Equalizer 3-Band' else 12
-        if n == 3:
+    elif kind in ('Equalizer 3-Band', 'Equalizer 12-Band', 'Equalizer LED', 'Equalizer Radial', 'Equalizer Mirror'):
+        # One timestamp-driven audio source for Qt preview and export.
+        # Preserve legacy equalizer geometry by default for existing projects.
+        mode = str(event.get('eq_color_mode', 'Single color'))
+        bass_color = str(event.get('eq_bass_color', '#FF5279'))
+        mid_color = str(event.get('eq_mid_color', '#42D6FF'))
+        high_color = str(event.get('eq_high_color', '#E9DA5F'))
+        spectrum = spectrum_at(project.get('audio_envelopes'), t, .055)
+        if kind == 'Equalizer 3-Band':
             vals = [energy_at(project.get('audio_envelopes'), t, band, .065)
                     for band in ('Bass', 'Midrange', 'Treble')]
         else:
-            vals = spectrum_at(project.get('audio_envelopes'), t, .055)
-        # Anchor is centre of the whole instrument, with upward-growing bars.
+            vals = spectrum
+        n = len(vals)
         height = max(12., base*1.7)
         width = max(12., base*2.25)
-        gap = max(2.*sf, width/(n*7))
-        bw = (width-gap*(n-1))/n
+        spacing = clamp(float(event.get('eq_spacing', 14))/100, .015, .4)
+        def band_color(i):
+            if mode == 'Rainbow':
+                import colorsys
+                # Frequency-position rainbow, stable across frames and export.
+                rgb = colorsys.hsv_to_rgb((i/max(1,n-1)*.83) % 1., .9, 1.)
+                return QColor.fromRgbF(*rgb)
+            if mode == 'Bass / Mid / High':
+                group = (i*3//n)
+                return color((bass_color, mid_color, high_color)[min(2,group)])
+            return color(cstr)
         p.setPen(Qt.PenStyle.NoPen)
-        for i,v in enumerate(vals):
-            level = clamp(float(v))
-            bh = height*(.055+.945*level)
-            bx = -width/2+i*(bw+gap)
-            p.setBrush(color(cstr, .16))
-            p.drawRoundedRect(QRectF(bx,-height/2,bw,height),min(bw/3,5*sf),min(bw/3,5*sf))
-            p.setBrush(color(cstr))
-            p.drawRoundedRect(QRectF(bx,height/2-bh,bw,bh),min(bw/3,5*sf),min(bw/3,5*sf))
+        if kind == 'Equalizer Radial':
+            # Circular frequency spikes, no temporal state, with subtle inner ring.
+            radius_inner = max(12.,base*.6)
+            max_span = max(8.,base*.95)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(color(cstr,.2),max(1,2*sf)))
+            p.drawEllipse(QPointF(0,0),radius_inner,radius_inner)
+            count = 48
+            for i in range(count):
+                v = clamp(float(vals[i % n]))
+                ang = math.pi*2*i/count - math.pi/2
+                radial = radius_inner + max_span*(.07+.93*v)
+                p.setPen(QPen(band_color(i*n//count),max(1.5,base*.043), Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(radius_inner*math.cos(ang),radius_inner*math.sin(ang)),
+                           QPointF(radial*math.cos(ang),radial*math.sin(ang)))
+        elif kind == 'Equalizer LED':
+            gap = max(1.5*sf, width*spacing/n)
+            bw = max(1.,(width-gap*(n-1))/n)
+            steps = max(5,min(32,int(event.get('eq_segments',14))))
+            seggap = max(1.*sf,height*.015)
+            stepheight = max(1.,(height-seggap*(steps-1))/steps)
+            for i,v in enumerate(vals):
+                count = int(round(clamp(float(v))*steps))
+                bx=-width/2+i*(bw+gap)
+                for segment in range(steps):
+                    by=height/2-(segment+1)*(stepheight+seggap)+seggap
+                    p.setBrush(color('#293541',.45) if segment>=count else band_color(i))
+                    p.drawRoundedRect(QRectF(bx,by,bw,stepheight),max(1.,bw*.15),max(1.,bw*.15))
+        elif kind == 'Equalizer Mirror':
+            # Symmetrical bars extend from the center line in both directions.
+            gap=max(1.5*sf,width*spacing/n)
+            bw=max(1.,(width-gap*(n-1))/n)
+            p.setPen(QPen(color(cstr,.26),max(1.,sf)))
+            p.drawLine(QPointF(-width/2,0),QPointF(width/2,0))
+            p.setPen(Qt.PenStyle.NoPen)
+            for i,v in enumerate(vals):
+                half=(height*.5)*(.035+.965*clamp(float(v)))
+                bx=-width/2+i*(bw+gap)
+                p.setBrush(band_color(i))
+                p.drawRoundedRect(QRectF(bx,-half,bw,half*2),min(bw/3,5*sf),min(bw/3,5*sf))
+        else:
+            # Existing 3/12 band design stays visually unchanged by default.
+            gap = max(2.*sf, width/(n*7)) if 'eq_spacing' not in event else max(1.5*sf,width*spacing/n)
+            bw = (width-gap*(n-1))/n
+            for i,v in enumerate(vals):
+                level = clamp(float(v))
+                bh = height*(.055+.945*level)
+                bx = -width/2+i*(bw+gap)
+                p.setBrush(color(cstr, .16))
+                p.drawRoundedRect(QRectF(bx,-height/2,bw,height),min(bw/3,5*sf),min(bw/3,5*sf))
+                p.setBrush(band_color(i))
+                p.drawRoundedRect(QRectF(bx,height/2-bh,bw,bh),min(bw/3,5*sf),min(bw/3,5*sf))
     elif kind == 'Beat Heart':
         bass = energy_at(project.get('audio_envelopes'), t, 'Bass', .07)
         heartbeat = max(bass, kick*.75) if project.get('audio_envelopes') else kick
@@ -1360,21 +1411,39 @@ def _paint_media_layers(p, width, height, t, project):
 
 
 def _draw_media_image(p, w, h, t, layer, img):
+    """Shared alpha, shape clipping and keyframe transform for all media types."""
+    from .media_layers import geometry_at
+    animated = geometry_at(layer,t)
     start = float(layer.get('start',0))
     end = float(layer.get('end',start+1))
-    alpha = event_fade(layer,t,start,end) * clamp(float(layer.get('opacity',100))/100)
-    if alpha <= 0:
+    alpha = event_fade(layer,t,start,end) * clamp(float(animated.get('opacity',100))/100)
+    if alpha <= 0 or img.isNull():
         return
     scale = min(w/1280,h/720)
-    ww = max(1,float(layer.get('size',300))*scale)
+    ww = max(1,float(animated.get('size',300))*scale)
     hh = ww * img.height()/max(1,img.width())
-    x=w*float(layer.get('x',50))/100
-    y=h*float(layer.get('y',50))/100
+    x = w*float(animated.get('x',50))/100
+    y = h*float(animated.get('y',50))/100
+    shape = str(layer.get('mask','Rectangle'))
     p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing,True)
     p.setOpacity(alpha)
     p.translate(x,y)
-    p.rotate(float(layer.get('rotation',0)))
-    p.drawImage(QRectF(-ww/2,-hh/2,ww,hh),img)
+    p.rotate(float(animated.get('rotation',0)))
+    rect = QRectF(-ww/2,-hh/2,ww,hh)
+    if shape != 'Rectangle':
+        clip = QPainterPath()
+        if shape == 'Circle':
+            d = min(ww,hh)
+            clip.addEllipse(QRectF(-d/2,-d/2,d,d))
+        elif shape == 'Rounded rectangle':
+            clip.addRoundedRect(rect, min(ww,hh)*.12,min(ww,hh)*.12)
+        elif shape == 'Ellipse':
+            clip.addEllipse(rect)
+        else:
+            clip.addRect(rect)
+        p.setClipPath(clip, Qt.ClipOperation.IntersectClip)
+    p.drawImage(rect,img)
     p.restore()
 
 def paint_effects(p: QPainter, width: int, height: int, t: float, project: dict):

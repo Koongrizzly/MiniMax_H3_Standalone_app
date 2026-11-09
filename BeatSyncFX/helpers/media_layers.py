@@ -51,6 +51,46 @@ def media_duration(ffprobe, filename):
         return 0.0
 
 
+def geometry_at(layer, timeline_t):
+    """Interpolate layer geometry; keys store absolute project timestamps.
+
+    Keys are optional and old projects retain their constant geometry.
+    """
+    keys = sorted((k for k in layer.get('media_keyframes', [])
+                   if isinstance(k, dict) and 'time' in k),
+                  key=lambda k: float(k['time']))
+    if not keys:
+        return layer
+    t = float(timeline_t)
+    if t <= float(keys[0]['time']):
+        a = b = keys[0]; ratio = 0.0
+    elif t >= float(keys[-1]['time']):
+        a = b = keys[-1]; ratio = 0.0
+    else:
+        for left, right in zip(keys, keys[1:]):
+            if float(left['time']) <= t <= float(right['time']):
+                a, b = left, right
+                ratio = (t-float(a['time'])) / max(0.000001,float(b['time'])-float(a['time']))
+                break
+    out = dict(layer)
+    for field in ('x','y','size','rotation','opacity'):
+        default = {'x':50,'y':50,'size':300,'rotation':0,'opacity':100}[field]
+        out[field] = float(a.get(field,layer.get(field,default))) * (1-ratio) + float(b.get(field,layer.get(field,default))) * ratio
+    return out
+
+
+def set_geometry_key(layer, timeline_t, values=None):
+    """Insert or replace a geometry key, preserving every unrelated layer field."""
+    values = values or layer
+    key = {'time': round(float(timeline_t),4)}
+    for field in ('x','y','size','rotation','opacity'):
+        key[field] = float(values.get(field,layer.get(field,{'x':50,'y':50,'size':300,'rotation':0,'opacity':100}[field])))
+    previous = [k for k in layer.get('media_keyframes',[])
+                if abs(float(k.get('time',-1))-key['time'])>.0001]
+    layer['media_keyframes'] = sorted(previous+[key],key=lambda k:float(k['time']))
+    return len(layer['media_keyframes'])
+
+
 def source_time(layer, timeline_t):
     """Return media-relative source time, or None if its clip isn't active."""
     start, end = float(layer.get('start', 0)), float(layer.get('end', 0))
@@ -58,6 +98,8 @@ def source_time(layer, timeline_t):
         return None
     speed = max(.01, float(layer.get('speed', 1)))
     position = float(layer.get('trim', 0)) + (timeline_t - start) * speed
+    if bool(layer.get('freeze', False)):
+        position = float(layer.get('freeze_at', layer.get('trim', 0)))
     duration = float(layer.get('source_duration', 0))
     if duration > 0:
         trim = min(max(0.,float(layer.get('trim', 0))), duration)
