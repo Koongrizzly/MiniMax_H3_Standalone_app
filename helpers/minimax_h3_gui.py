@@ -14,7 +14,7 @@ except Exception:
     QWebEnginePage = None
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
+    QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QInputDialog,
     QPlainTextEdit, QLineEdit, QFileDialog, QMessageBox, QTabWidget, QTabBar, QScrollArea,
     QCheckBox, QListWidget, QListWidgetItem, QFrame, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QMenu, QSplitter, QSlider, QProgressBar, QGraphicsView, QGraphicsScene,
@@ -1404,11 +1404,14 @@ class MainWindow(QMainWindow):
         # RefMod experimental opt-in: preserves original raw image/video/audio references.
         # Credits: Luisa (luisacaotica) original RefMod; Gary's integration/testing with ChatGPT.
         self.refmods = RefList("Saved H3 RefMods (experimental; max 8)", "H3 RefMods (*.safetensors)", 8)
-        self.refmods.setToolTip("Load RefMod reference latents into MiniMax H3 Ref2VA. This first version does not yet restore the Qwen3-VL visual-token path; compare identity carefully with raw references.")
+        self.refmods.setToolTip("Select saved visual and/or audio RefMods. A separate voice RefMod can accompany a visual RefMod. Full Qwen3-VL visual-token reconstruction is not yet implemented; voice identity is experimental.")
         self.refmod_create_button = QPushButton("Create RefMod from images / 360 video...")
         self.refmod_create_button.setToolTip("Uses the existing H3 video VAE to save a Full Reference identity RefMod. No diffusion model or training required.")
         self.refmod_create_button.clicked.connect(self._create_refmod_dialog)
-        rfl.addWidget(self.refmods); rfl.addWidget(self.refmod_create_button)
+        self.refmod_voice_button = QPushButton("Create Voice RefMod from audio...")
+        self.refmod_voice_button.setToolTip("Encode up to 30 seconds of a voice sample with the installed H3 audio VAE, saving a separate audio RefMod. Voice cloning is not guaranteed.")
+        self.refmod_voice_button.clicked.connect(self._create_voice_refmod_dialog)
+        rfl.addWidget(self.refmods); rfl.addWidget(self.refmod_create_button); rfl.addWidget(self.refmod_voice_button)
         v.addWidget(self.ref_group)
 
         loras = QGroupBox("LoRA adapters (up to 3)"); lf = QFormLayout(loras)
@@ -7079,6 +7082,12 @@ exit /b %RC%
         if getattr(self, "_refmod_creation", None) is not None and self._refmod_creation.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(self, "RefMod busy", "One RefMod creation is already running.")
             return
+        resolution, ok = QInputDialog.getItem(
+            self, "RefMod image fidelity", "Short-edge encoding resolution (higher uses more VRAM and tokens):",
+            ["512 (previous default)", "768 (balanced)", "1024 (higher detail)"], 1, False)
+        if not ok:
+            return
+        refmod_resolution = resolution.split()[0]
         destination.parent.mkdir(parents=True, exist_ok=True)
         proc = QProcess(self)
         proc.setProgram(str(PYTHON))
@@ -7086,7 +7095,7 @@ exit /b %RC%
         argv = ["-m", "runtime.refmod_create", "--vae", str(vae),
                 "--name", destination.stem, "--output", str(destination.parent),
                 "--mode", "encode", "--concept-type", "identity",
-                "--resolution", "512", "--max-tokens", "10240"]
+                "--resolution", refmod_resolution, "--max-tokens", "10240"]
         for item in images:
             argv.extend(["--image", item])
         for item in videos:
@@ -7107,6 +7116,79 @@ exit /b %RC%
                 QMessageBox.information(self, "RefMod created", f"Saved RefMod:\n{destination}\n\nIt is now selected for Ref2VA generation.")
             else:
                 QMessageBox.warning(self, "RefMod creation failed", "Check the MiniMax H3 log for the extractor error. Your existing references were not changed.")
+        proc.finished.connect(finished)
+        proc.start()
+
+    def _create_voice_refmod_dialog(self):
+        """Encode a voice-only RefMod, separate from the visual RefMod.
+
+        Uses GrizzlyMax's existing audio VAE and FFmpeg path in a subprocess.
+        Original RefMod format by Luisa; Gary's shared experiments helped
+        establish the visual/audio split. Thanks to Gary and ChatGPT.
+        """
+        if not PYTHON.is_file():
+            QMessageBox.warning(self, "MiniMax environment missing", f"Cannot find: {PYTHON}")
+            return
+        sample, _ = QFileDialog.getOpenFileName(
+            self, "Choose voice sample (first 30 seconds encoded)",
+            _dialog_start_dir("ref_audios", fallback=ROOT),
+            "Audio/Video (*.wav *.mp3 *.flac *.m4a *.ogg *.aac *.mp4 *.mkv *.mov)")
+        if not sample:
+            return
+        name, ok = QFileDialog.getSaveFileName(
+            self, "Save Voice RefMod", str(ROOT / "models" / "minimax_h3" / "refmods" / (Path(sample).stem + "_voice.safetensors")),
+            "H3 RefMods (*.safetensors)")
+        if not ok or not name:
+            return
+        destination = Path(name)
+        if destination.suffix.lower() != ".safetensors":
+            destination = destination.with_suffix(".safetensors")
+        if destination.exists() and QMessageBox.question(
+                self, "Overwrite Voice RefMod?", f"Replace existing file?\n{destination}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        vae = self.audio_vae_model.path()
+        if vae and Path(vae).is_dir():
+            candidates = list(Path(vae).rglob("*.safetensors"))
+            vae = str(candidates[0]) if len(candidates) == 1 else ""
+        if not vae or not Path(vae).is_file():
+            vae_dir = ROOT / "models" / "minimax_h3" / "audio_vae"
+            candidates = list(vae_dir.rglob("*.safetensors")) if vae_dir.is_dir() else []
+            if len(candidates) == 1:
+                vae = str(candidates[0])
+            else:
+                vae, _ = QFileDialog.getOpenFileName(
+                    self, "Select installed H3 AUDIO VAE", str(vae_dir),
+                    "Safetensors (*.safetensors)")
+        if not vae or not Path(vae).is_file():
+            QMessageBox.warning(self, "Audio VAE required", "Select your installed MiniMax H3 audio VAE.")
+            return
+        if getattr(self, "_refmod_creation", None) is not None and self._refmod_creation.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(self, "RefMod busy", "Another RefMod creation is still running.")
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        proc = QProcess(self)
+        proc.setProgram(str(PYTHON))
+        proc.setWorkingDirectory(str(ROOT))
+        proc.setArguments(["-m", "runtime.refmod_voice_create", "--audio", sample,
+                           "--audio-vae", str(vae), "--output", str(destination)])
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._refmod_creation = proc
+        self.refmod_voice_button.setEnabled(False)
+        self.refmod_voice_button.setText("Creating Voice RefMod...")
+        proc.readyReadStandardOutput.connect(lambda: self.append_log(
+            bytes(proc.readAllStandardOutput()).decode(errors="replace")))
+        def finished(code, status):
+            self.refmod_voice_button.setEnabled(True)
+            self.refmod_voice_button.setText("Create Voice RefMod from audio...")
+            if code == 0 and destination.is_file():
+                self.refmods.set_paths(self.refmods.paths() + [str(destination)])
+                QMessageBox.information(self, "Voice RefMod created",
+                    f"Saved voice reference:\n{destination}\n\nSelected for Ref2VA. Voice fidelity still requires testing.")
+            else:
+                QMessageBox.warning(self, "Voice RefMod creation failed",
+                    "See MiniMax H3 log for the audio extractor error.")
         proc.finished.connect(finished)
         proc.start()
 
