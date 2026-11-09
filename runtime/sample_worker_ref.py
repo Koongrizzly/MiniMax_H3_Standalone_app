@@ -182,7 +182,7 @@ def main():
     for n in ('width','height','frames','steps','seed'): ap.add_argument('--'+n,type=int,required=True)
     for n in ('cfg','shift','audio-shift'): ap.add_argument('--'+n,type=float,required=True)
     ap.add_argument('--sampler',default='euler'); ap.add_argument('--scheduler',default='simple'); ap.add_argument('--ref-image-size',choices=['match','max'],default='match')
-    ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--refmod',action='append',default=[]); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
+    ap.add_argument('--ref-image',action='append',default=[]); ap.add_argument('--refmod',action='append',default=[]); ap.add_argument('--refmod-qwen-vision',action='store_true',help='Decode visual RefMods using the existing H3 VAE and show them to Qwen3-VL'); ap.add_argument('--ref-video',action='append',default=[]); ap.add_argument('--ref-audio',action='append',default=[])
     ap.add_argument('--lock-source-audio-index', type=int, default=0, help='1-based standalone --ref-audio slot to use as the target H3 audio latent with denoise mask 0. 0 keeps normal Ref2VA audio generation.')
     ap.add_argument('--ref-audio-subject', action='append', type=int, default=[], help='Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic.')
     ap.add_argument('--lora',action='append',default=[]); ap.add_argument('--lora-strength',action='append',type=float,default=[])
@@ -251,6 +251,7 @@ def main():
     # Original RefMod algorithm: Luisa (luisacaotica); integration shared by Gary.
     # No duplicate VAE encoding and no modification of existing raw references.
     voice_refmods = []
+    visual_refmod_count = 0
     if ns.refmod:
         from runtime.refmod_support.core import H3RefMod
         for mod_path in ns.refmod[:8]:
@@ -270,6 +271,37 @@ def main():
                 voice_refmods.append((mod, block))
             else:
                 ref_blocks.append(block)
+                visual_refmod_count += 1
+                if ns.refmod_qwen_vision:
+                    # RefMod visual-conditioning bridge adapted for GrizzlyMax.
+                    # Original format/extractor by Luisa; Gary supplied testing and
+                    # integration experiments developed with ChatGPT.
+                    # The same H3 video VAE is already loaded above; decode once,
+                    # then pass frames via the NATIVE Qwen3-VL minimax_ref_items API.
+                    from runtime.headless_h3 import decode_video
+                    try:
+                        decoded = decode_video(block['latent'], vv, force_tiled=False)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Cannot reconstruct Qwen visual reference from RefMod '{mod.name}': {exc}. "
+                            "Turn off 'Qwen3-VL visual conditioning' to use legacy latent-only mode."
+                        ) from exc
+                    if decoded.ndim != 4 or decoded.shape[-1] != 3 or decoded.shape[0] < 1:
+                        raise RuntimeError(f"Unexpected VAE decoded shape for {mod.name}: {tuple(decoded.shape)}")
+                    if mod.kind == 'image':
+                        ref_items.append({'type': 'image', 'data': decoded[:1].float().clamp(0, 1)})
+                        marker = f"<Picture {sum(i['type'] == 'image' for i in ref_items)}>"
+                    else:
+                        # Maximum eight distinct visual views. Avoid enormous Qwen
+                        # memory usage when decoding longer video RefMods.
+                        frame_indices = torch.linspace(0, decoded.shape[0]-1,
+                                                       min(8, decoded.shape[0])).round().long()
+                        frames = decoded.index_select(0, frame_indices).float().clamp(0, 1)
+                        ref_items.append({'type': 'video', 'data': frames,
+                                          'timestamps': [i / 2.0 for i in range(frames.shape[0])]})
+                        marker = f"<Video {sum(i['type'] == 'video' for i in ref_items)}>"
+                    del decoded
+                    print(f"[REFMOD] Qwen3-VL visual conditioning: {mod.name} -> {marker}", flush=True)
             print(f"[REFMOD] Loaded {mod.name}: kind={mod.kind}, tokens={mod.token_count}, mode={mod.mode}", flush=True)
             if mod.description:
                 print(f"[REFMOD] Prompt hint: {mod.description}", flush=True)
@@ -284,6 +316,8 @@ def main():
         frames=frames[:n]; z=_encode_visual_reference(vv, frames, manager, label=f'reference video {len(video_data)+1} ({cw}x{ch}, {n}f)')
         sample_idx=list(range(0,frames.shape[0],FPS//2)); qwen=frames[sample_idx].cpu()
         video_data.append((path,z,ch,cw,qwen,[i/2.0 for i in range(len(sample_idx))]))
+    if ns.refmod_qwen_vision and visual_refmod_count:
+        print(f"[REFMOD] Qwen3-VL visual bridge active for {visual_refmod_count} visual RefMod(s).", flush=True)
     del vv; _flush_models()
     if ns.extended_logging: log_mem('after Ref2VA visual reference encode / VAE flush', sync=True)
     if manager is not None: manager.set_stage('reference')
