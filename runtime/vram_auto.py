@@ -395,3 +395,43 @@ def print_vram_auto_decision(decision, width: int, height: int, frames: int):
         f"[VRAM-AUTO] {state} | {width}x{height} {frames}f | {detected} | {decision['reason']}",
         flush=True,
     )
+
+
+def relayvsr_memory_plan(width: int, height: int, scale: int, total_gib: float, free_gib: float) -> dict:
+    """Performance-first RelayVSR INT8 planning, scaled to *currently free* RTX VRAM.
+
+    The first attempt prioritizes model residency and one spatial pass. Subsequent
+    profiles are tried only after a genuine CUDA allocation failure. These are
+    unbenchmarked initial heuristics, not guaranteed compatibility boundaries.
+    """
+    width, height = max(1, int(width)), max(1, int(height))
+    scale = int(scale)
+    if scale not in (2, 4):
+        raise ValueError('RelayVSR scale must be 2 or 4')
+    total_gib, free_gib = float(total_gib), float(free_gib)
+    if total_gib <= 0 or free_gib <= 0:
+        raise ValueError('CUDA GPU memory unavailable')
+    budget = min(total_gib, free_gib)
+    output_mpix = (width * scale) * (height * scale) / 1_000_000.0
+    if budget < 3:
+        raise RuntimeError(f'RelayVSR has only {budget:.2f} GiB available; close other GPU workloads.')
+
+    # Auto performance order: jump directly to a fast configuration, back off
+    # after a CUDA OOM. Avoid 3x3 unless smaller grids genuinely fail.
+    if budget >= 15:
+        chunk, grid, offload = 16, 1, False
+    elif budget >= 10:
+        chunk, grid, offload = 12, 1, True
+    elif budget >= 7:
+        chunk, grid, offload = 10, 1, True
+    else:
+        chunk, grid, offload = 8, 2, True
+
+    # Prevent runaway memory overcommit. Higher end cards are deliberately
+    # pushed harder, but a small workspace for desktop/CUDA is preserved.
+    reserve = max(0.65, min(1.25, total_gib * 0.045))
+    fraction = max(0.60, min(0.97, (total_gib - reserve) / total_gib))
+    return {'chunk_len': chunk, 'chunk_overlap': 2,
+            'grid_cols': grid, 'grid_rows': grid, 'wan_offload': offload,
+            'allocator_fraction': fraction, 'available_gib': budget,
+            'output_megapixels': output_mpix}

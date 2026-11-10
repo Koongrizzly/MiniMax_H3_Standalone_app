@@ -64,6 +64,30 @@ def save_prompt_llama_runner(runner):
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
 
+def nvidia_vsr_ready():
+    """Check the portable NVIDIA VSR installation, without importing its SDK."""
+    return (ROOT/'environments/maxine_vfx/Scripts/python.exe').is_file() and (ROOT/'models/nvidia_vsr/nvidia-vfx-python-samples/video_super_resolution.py').is_file()
+
+
+def relayvsr_installed_scales():
+    """Native ComfyUI INT8 checkpoints and Flash VAEs; avoid false positives from old bbaudio bundles."""
+    base = ROOT/'models/relayvsr/native'
+    models = {2: ('relayvsr_x2_lightx2v_int8_convrot.safetensors', 'relayvsr_flash_vae_x2_fp32.safetensors'),
+              4: ('relayvsr_x4_int8_convrot.safetensors', 'relayvsr_flash_vae_x4_fp32.safetensors')}
+    found = []
+    for scale, (wan, flash) in models.items():
+        if all(path.is_file() and path.stat().st_size > 50_000_000 for path in
+               (base/'diffusion_models'/wan, base/'vae'/flash)):
+            found.append(scale)
+    return found
+
+
+def relayvsr_ready():
+    comfy = ROOT/'runtime/relayvsr/native_comfy/comfy/ldm/wan/model_vsr.py'
+    py = ROOT/'environments/relayvsr/Scripts/python.exe'
+    return comfy.is_file() and py.is_file() and 4 in relayvsr_installed_scales()
+
+
 def media_state():
     overrides = paths()
     binroot = ROOT/'presets/bin'
@@ -88,9 +112,21 @@ def media_state():
         dict(key='prompt_llama', title='Prompt Builder — llama.cpp GGUF backend', ok=bool(llama), action='Install', note='Optional local GGUF backend. Uses Prompt Builder CUDA llama.cpp bundle under presets/bin/llama or your selected llama-server.exe; GGUF model is chosen in Prompt Builder'),
         dict(key='beat', title='BeatSyncFX environment', ok=bool(beat_env and (BEAT/'helpers/gui.py').is_file()), action='Install', note='Separate portable BeatSyncFX environment; does not modify GrizzlyMax Python'),
         dict(key='beat_whisper', title='Shared Faster-Whisper Medium', ok=beat_medium and bool(shared_python()), action='Install Medium', note='Shared GrizzlyMax environments/.whisper and models/whisper; BeatSyncFX uses this when embedded'),
+        dict(key='nvidia_vsr', title='NVIDIA VSR (Maxine)', ok=nvidia_vsr_ready(), action='Install', note='Existing NVIDIA VSR Python sample and isolated maxine_vfx environment. Proprietary NVIDIA SDK/model assets may still be required.'),
+        dict(key='relayvsr', title='RelayVSR (native ComfyUI INT8)', ok=relayvsr_ready(), action='Install', note='Isolated native ComfyUI backend and Comfy-Org INT8 ConvRot checkpoints. Installed models: '+(', '.join('X'+str(x) for x in relayvsr_installed_scales()) or 'none')+'. X4 INT8 supports X1, X2, X3 and X4 output; native X2 model not needed.'),
     ]
 
-def _cmd_for(key):
+def _cmd_for(key, action=None):
+    if key in ('nvidia_vsr', 'relayvsr'):
+        py = ROOT/'environments/.minimax_h3_int4/python.exe'
+        if not py.is_file(): py = ROOT/'environments/.minimax_h3_int4/Scripts/python.exe'
+        if not py.is_file(): return None, None
+        if key == 'nvidia_vsr':
+            script = ROOT/'presets/extra_env/nvidia_vsr_installer.py'
+            return ([str(py), str(script)], ROOT) if script.is_file() else (None, None)
+        script = ROOT/'presets/extra_env/relayvsr_installer.py'
+        model_choice = '4'  # X4 is the only model needed for X2 and X4 output.
+        return ([str(py), str(script), '--models', model_choice], ROOT) if script.is_file() else (None, None)
     if key == 'grizzly': return ['cmd.exe','/c',str(ROOT/'install.bat')], ROOT
     if key == 'beat': return ['cmd.exe','/c',str(BEAT/'setup_windows.bat')], BEAT
     if key == 'ffmpeg':
@@ -141,7 +177,15 @@ class PreflightDialog(QDialog):
             label=QLabel(('[OK] ' if record['ok'] else '[MISSING] ')+record['title']+'\n'+record['note'])
             label.setWordWrap(True);h.addWidget(label,1)
             select=QComboBox()
-            if record['ok']:
+            if record['key'] == 'relayvsr':
+                choices = ([('Installed X4 INT8 — no action', 'none'),
+                            ('Repair X4 INT8 (X2/X4 output)', 'relay_4')]
+                           if record['ok'] else
+                           [('Install X4 INT8 (X2/X4 output)', 'relay_4'), ('Skip', 'none')])
+            elif record['key'] == 'nvidia_vsr':
+                choices = ([('Installed — no action', 'none'), ('Repair / reinstall', 'repair')]
+                           if record['ok'] else [('Install', 'install'), ('Skip', 'none')])
+            elif record['ok']:
                 choices=[('Installed — no action', 'none'), ('Locate / change path', 'locate'), ('Repair / reinstall', 'repair')]
             else:
                 choices=[(record['action'], 'install'), ('Locate existing', 'locate'), ('Skip', 'none')]
@@ -184,7 +228,7 @@ class PreflightDialog(QDialog):
 
     def install_selected(self):
         chosen=[(r,s.currentData()) for r,s in self.controls.values()]
-        requested=[r['title'] for r, action in chosen if action in ('install', 'repair')]
+        requested=[r['title'] + (' — ' + action.replace('relay_', 'X').upper() if action.startswith('relay_') else '') for r, action in chosen if action in ('install', 'repair', 'relay_2', 'relay_4', 'relay_both')]
         if requested:
             prompt='Start the following selected installation actions?\n\n' + '\n'.join('• '+x for x in requested)
             if QMessageBox.question(self, 'Confirm installation actions', prompt, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
@@ -195,8 +239,8 @@ class PreflightDialog(QDialog):
             if choice == 'locate':
                 self.locate(key)
                 continue
-            if choice not in ('install', 'repair'): continue
-            command,cwd=_cmd_for(key)
+            if choice not in ('install', 'repair', 'relay_2', 'relay_4', 'relay_both'): continue
+            command,cwd=_cmd_for(key, choice)
             if not command:
                 QMessageBox.warning(self,'Installer unavailable',f'Installer for {record["title"]} cannot run yet. Install GrizzlyMax/BeatSyncFX core environment first, then validate again.')
                 continue
