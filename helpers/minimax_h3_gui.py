@@ -1352,17 +1352,21 @@ class MainWindow(QMainWindow):
         self.seed = QSpinBox(); self.seed.setRange(-1, 98_999_999); self.seed.setValue(-1); self.seed.setSpecialValueText("-1 (random)")
         form.addRow("Mode", self.mode)
         rr = QHBoxLayout(); rr.addWidget(self.res_class); rr.addWidget(self.widescreen_quality)
-        self.gen_vsr_toggle = QCheckBox("Upscale result with NVIDIA VSR")
+        self.gen_vsr_toggle = QCheckBox("Upscale result after generation")
+        self.gen_vsr_engine = QComboBox()
+        self.gen_vsr_engine.addItem("NVIDIA VSR", "nvidia_vsr")
+        self.gen_vsr_engine.addItem("RelayVSR", "relayvsr")
         self.gen_vsr_toggle.setToolTip("Can add detail and unblur pixels, but cannot magically fix footage that looked bad to start with.")
         self.gen_vsr_scale = QComboBox()
         for scale in (1, 2, 3): self.gen_vsr_scale.addItem(f"x{scale}", scale)
         self.gen_vsr_scale.setToolTip("NVIDIA VSR output multiplier. Optional unblur is controlled in Settings.")
         self.gen_vsr_scale.setEnabled(False)
         self.gen_vsr_toggle.toggled.connect(self.gen_vsr_scale.setEnabled)
+        self.gen_vsr_engine.currentIndexChanged.connect(self._generation_upscale_engine_changed)
         # The preview describes the final saved video, not only the H3 source.
         self.gen_vsr_toggle.toggled.connect(self._sync_resolution)
         self.gen_vsr_scale.currentIndexChanged.connect(self._sync_resolution)
-        rr.addWidget(self.gen_vsr_toggle); rr.addWidget(self.gen_vsr_scale)
+        rr.addWidget(self.gen_vsr_toggle); rr.addWidget(self.gen_vsr_engine); rr.addWidget(self.gen_vsr_scale)
         rr.addWidget(self.aspect); rr.addWidget(self.resolved); rr.addStretch(); form.addRow("Resolution", rr)
         form.addRow("Frames", self.frames); form.addRow("", self.experimental_long_duration); form.addRow("Steps", self.steps); form.addRow("Seed", self.seed)
         v.addWidget(basic)
@@ -2410,7 +2414,9 @@ class MainWindow(QMainWindow):
                 play=menu.addAction("Play clip")
                 load_beatsync=menu.addAction("Load in BeatSyncFX")
                 vsr_menu=menu.addMenu("Upscale with NVIDIA VSR")
-                vsr_actions={vsr_menu.addAction(f"VSR x{k}"):k for k in (1,2,3)}
+                vsr_actions={vsr_menu.addAction(f"VSR x{k}"):("nvidia_vsr",k) for k in (1,2,3)}
+                relay_menu=menu.addMenu("Upscale with RelayVSR")
+                vsr_actions.update({relay_menu.addAction(f"RelayVSR x{k}"):("relayvsr",k) for k in (1,2,3,4)})
                 loaded=(self.preview_path and Path(self.preview_path)==Path(job.get("output","")))
                 delete_disk=menu.addAction("Delete from disk + queue" + (" (currently loaded)" if loaded else ""))
             if job.get("state") in ("failed","cancelled"):
@@ -2433,7 +2439,7 @@ class MainWindow(QMainWindow):
                     self.timeline_widget.mark_assembly_failed("Removed from queue")
             self.queue_jobs=[j for j in self.queue_jobs if j.get("id")!=job.get("id")]; self._save_queue_state(); self._refresh_queue_views()
         elif section=="finished" and 'vsr_actions' in locals() and act in vsr_actions:
-            self._queue_vsr_finished_job(job, vsr_actions[act])
+            self._queue_vsr_finished_job(job, vsr_actions[act][1], vsr_actions[act][0])
         elif section=="finished" and 'play' in locals() and act==play: self._load_preview(job,autoplay=True)
         elif section=="finished" and 'load_beatsync' in locals() and act==load_beatsync: self._load_finished_job_in_beatsync(job)
         elif section=="finished" and 'delete_disk' in locals() and act==delete_disk: self._delete_job_output(job)
@@ -2654,7 +2660,15 @@ class MainWindow(QMainWindow):
     def _load_queue_state(self):
         if not QUEUE_FILE.is_file(): self._refresh_queue_views(); return
         try:
-            data=json.loads(QUEUE_FILE.read_text(encoding="utf-8")); self.queue_jobs=list(data.get("jobs",[])); self._next_job_number_value=max(1,int(data.get("next_job_number") or 1))
+            data=json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+                raise ValueError("Queue JSON has no valid jobs array; refusing to overwrite")
+            # Keep one known-good snapshot before automatic pruning/migration.
+            # Updates must never package either the queue or its backup.
+            backup_path=QUEUE_FILE.with_suffix(QUEUE_FILE.suffix+".bak")
+            import shutil
+            shutil.copy2(str(QUEUE_FILE), str(backup_path))
+            self.queue_jobs=list(data["jobs"]); self._next_job_number_value=max(1,int(data.get("next_job_number") or 1))
             # Migrate queue entries created before the inference launchers moved into helpers/.
             for j in self.queue_jobs:
                 args=j.get("args")
@@ -2666,7 +2680,7 @@ class MainWindow(QMainWindow):
                 if j.get("state")=="running": j["state"]="interrupted"; j["cancel_reason"]="Application closed while this job was running."
 
             # Keep restart history compact: all active/pending work is retained, while
-            # only the newest 20 terminal results are remembered. A terminal result
+            # only the newest 50 terminal results are remembered. A terminal result
             # referenced by an active/pending job is also retained so dependency chains
             # cannot be broken merely by restarting the GUI.
             terminal_states = {"finished", "failed", "cancelled"}
@@ -2694,15 +2708,18 @@ class MainWindow(QMainWindow):
 
             terminal_jobs = [j for j in self.queue_jobs if j.get("state") in terminal_states]
             terminal_jobs.sort(key=lambda j: float(j.get("finished_at") or j.get("created_at") or 0), reverse=True)
-            keep_terminal_ids = {j.get("id") for j in terminal_jobs[:20] if j.get("id")} | required_terminal_ids
+            keep_terminal_ids = {j.get("id") for j in terminal_jobs[:50] if j.get("id")} | required_terminal_ids
             self.queue_jobs = [
                 j for j in self.queue_jobs
                 if j.get("state") not in terminal_states or j.get("id") in keep_terminal_ids
             ]
             self._ensure_queue_job_numbers()
         except Exception as exc:
-            self.queue_jobs=[]
-            if hasattr(self,"log"): self.append_log(f"Queue load warning: {exc}\n")
+            # Never replace a damaged queue database with an empty queue on startup.
+            # The original file remains available for recovery.
+            if hasattr(self,"log"): self.append_log(f"Queue load warning (original preserved): {exc}\n")
+            self._refresh_queue_views()
+            return
         self._refresh_queue_views()
         self._save_queue_state()
 
@@ -3271,6 +3288,101 @@ class MainWindow(QMainWindow):
             return ""
         return str(out)
 
+    def _relay_config_path(self):
+        return ROOT / "presets" / "setsave" / "relayvsr.json"
+
+    def _relay_config(self):
+        try:
+            data = json.loads(self._relay_config_path().read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _relay_config_valid(self):
+        command = self._relay_config().get("command", [])
+        ok = (isinstance(command, list) and len(command) >= 2
+              and all(isinstance(x, str) and x for x in command)
+              and all(any(token in x for x in command) for token in ("{input}", "{output}", "{scale}")))
+        if hasattr(self, "relay_status"):
+            self.relay_status.setText("Configured (not runtime-tested)" if ok else "Not configured")
+        return ok
+
+    def _save_relay_command(self):
+        try:
+            cmd = json.loads(self.relay_command_edit.text().strip())
+            if not isinstance(cmd, list) or not all(isinstance(v, str) for v in cmd):
+                raise ValueError("Expected an array of argument strings")
+            path = self._relay_config_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"command": cmd}, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._relay_config_valid()
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "RelayVSR", f"Command must be a valid JSON array: {exc}")
+
+    def _relay_install_status(self):
+        py = ROOT / "environments" / "relayvsr" / "Scripts" / "python.exe"
+        inference = ROOT / "runtime" / "relayvsr" / "native_comfy" / "comfy" / "ldm" / "wan" / "model_vsr.py"
+        model_root = ROOT / "models" / "relayvsr" / "native"
+        models = []
+        for scale, wan, flash in ((4, "relayvsr_x4_int8_convrot.safetensors", "relayvsr_flash_vae_x4_fp32.safetensors"),):
+            if all(path.is_file() and path.stat().st_size > 50_000_000 for path in
+                   (model_root / "diffusion_models" / wan, model_root / "vae" / flash)):
+                models.append(f"x{scale} INT8")
+        ready = py.is_file() and inference.is_file() and bool(models)
+        if hasattr(self, "relay_status"):
+            self.relay_status.setText(("Installed: " + ", ".join(models) + " (GPU not yet tested)") if ready else "Native backend / models not installed")
+        return ready
+
+    def _relay_install(self):
+        if getattr(self, "_relay_install_proc", None) and self._relay_install_proc.state() != QProcess.ProcessState.NotRunning:
+            return
+        script = ROOT / "presets" / "extra_env" / "relayvsr_installer.py"
+        if not script.is_file():
+            QMessageBox.warning(self, "RelayVSR", f"Installer missing: {script}")
+            return
+        self._relay_install_proc = QProcess(self)
+        self._relay_install_proc.setWorkingDirectory(str(ROOT))
+        self._relay_install_proc.setProgram(str(PYTHON if PYTHON.is_file() else sys.executable))
+        self._relay_install_proc.setArguments(["-u", str(script), "--models", str(self.relay_model_choice.currentData())])
+        self._relay_install_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.relay_install_progress.setRange(0, 0)
+        self.relay_install_button.setEnabled(False)
+        self._relay_install_proc.readyReadStandardOutput.connect(self._relay_install_output)
+        self._relay_install_proc.finished.connect(self._relay_install_finished)
+        self._relay_install_proc.start()
+
+    def _relay_install_output(self):
+        txt = bytes(self._relay_install_proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not txt: return
+        self.append_log("[RelayVSR] " + txt)
+        log = ROOT / "logs" / "relayvsr_install.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as file: file.write(txt)
+        match = re.findall(r"STAGE (\d+)/5", txt)
+        if match:
+            self.relay_install_progress.setRange(0,5)
+            self.relay_install_progress.setValue(int(match[-1])-1)
+
+    def _relay_install_finished(self, code, status):
+        self._relay_install_output()
+        self.relay_install_button.setEnabled(True)
+        self.relay_install_progress.setRange(0,5)
+        self.relay_install_progress.setValue(5 if code == 0 else 0)
+        self.relay_command_edit.setText(json.dumps(self._relay_config().get("command", []), ensure_ascii=False))
+        self._relay_install_status()
+        if code != 0:
+            QMessageBox.warning(self, "RelayVSR", "Installation failed. See logs/relayvsr_install.log for details.")
+
+    def _relay_verify(self):
+        if not self._relay_install_status():
+            QMessageBox.warning(self, "RelayVSR", "Environment, backend or model files are missing. Install / Repair first.")
+            return
+        py = ROOT / "environments" / "relayvsr" / "Scripts" / "python.exe"
+        check = subprocess.run([str(py), str(ROOT / "runtime" / "relayvsr" / "native_inference.py"), "--verify-imports"],
+              capture_output=True, text=True, timeout=120)
+        message = (check.stdout + check.stderr).strip()
+        QMessageBox.information(self, "RelayVSR Verify" if check.returncode == 0 else "RelayVSR Verify failed", message[-2000:] or "No result")
+
     def _vsr_config_path(self):
         return ROOT / "presets" / "setsave" / "maxine_vsr.json"
 
@@ -3363,7 +3475,7 @@ class MainWindow(QMainWindow):
         if code != 0:
             QMessageBox.warning(self, "NVIDIA VSR", "Installation failed. See the Logs tab or logs/nvidia_vsr_install.log.")
 
-    def _queue_vsr_finished_job(self, source_job, scale):
+    def _queue_vsr_finished_job(self, source_job, scale, engine="nvidia_vsr"):
         source = Path(str(source_job.get("output") or ""))
         if not source.is_file():
             QMessageBox.warning(self, "NVIDIA VSR", "The finished video is missing.")
@@ -3378,13 +3490,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "NVIDIA VSR", f"Could not determine source resolution: {exc}")
             return False
         return self._enqueue_timeline_vsr({"source": str(source), "scale": scale,
-                                            "width": width, "height": height})
+                                            "width": width, "height": height, "engine": engine})
 
     def _enqueue_timeline_vsr(self, spec):
         source = Path(str(spec.get("source") or ""))
         scale = int(spec.get("scale") or 0)
-        if scale not in (1, 2, 3) or (not source.is_file() and not spec.get("vsr_after_job_id")): return False
-        if not self._vsr_install_status():
+        engine = str(spec.get("engine") or "nvidia_vsr")
+        if engine not in ("nvidia_vsr", "relayvsr"):
+            return False
+        allowed = (1, 2, 3, 4) if engine == "relayvsr" else (1, 2, 3)
+        if scale not in allowed or (not source.is_file() and not spec.get("vsr_after_job_id")):
+            return False
+        if engine == "relayvsr":
+            if not self._relay_install_status():
+                QMessageBox.information(self, "RelayVSR", "The X4 INT8 model and Flash VAE are required for X1, X2, X3 and X4 outputs. Install / Repair RelayVSR first.")
+                return False
+            if not self._relay_config_valid():
+                QMessageBox.information(self, "RelayVSR", "Install / Repair RelayVSR in Settings first (or configure a working custom runner command).")
+                return False
+        elif not self._vsr_install_status():
             QMessageBox.information(self, "NVIDIA VSR", "Install NVIDIA VSR from Settings before upscaling clips.")
             return False
         ffmpeg = ROOT / "presets" / "bin" / "ffmpeg.exe"
@@ -3392,9 +3516,9 @@ class MainWindow(QMainWindow):
         if not ffmpeg.is_file() or not ffprobe.is_file():
             QMessageBox.warning(self, "NVIDIA VSR", "FFmpeg and FFprobe must be installed in presets/bin.")
             return False
-        runner = ROOT / "runtime" / "nvidia_vsr" / "runner.py"
+        runner = ROOT / "runtime" / engine / "runner.py"
         if not runner.is_file(): return False
-        out_dir = ROOT / "output" / "nvidia_vsr"
+        out_dir = ROOT / "output" / engine
         out_dir.mkdir(parents=True, exist_ok=True)
         job_id = uuid.uuid4().hex
         outfile = out_dir / f"{source.stem}_vsr_x{scale}_{job_id[:8]}.mp4"
@@ -3402,16 +3526,20 @@ class MainWindow(QMainWindow):
         w, h = int(spec["width"]), int(spec["height"])
         unblur = self._vsr_unblur_enabled()
         args = [str(runner), "--input", str(source), "--output", str(outfile),
-                "--scale", str(scale), "--quality", "ULTRA", "--strength", str(strength),
-                "--ffmpeg", str(ffmpeg), "--ffprobe", str(ffprobe)]
-        if unblur:
-            args += ["--cleanup", "DEBLUR_ULTRA", "--cleanup-strength", "0.5"]
-        job = {"id": job_id, "job_number": self._take_next_job_number(), "job_type": "nvidia_vsr",
+                "--scale", str(scale), "--ffmpeg", str(ffmpeg), "--ffprobe", str(ffprobe)]
+        if engine == "relayvsr":
+            args += ["--config", str(self._relay_config_path())]
+        else:
+            args += ["--quality", "ULTRA", "--strength", str(strength)]
+            if unblur:
+                args += ["--cleanup", "DEBLUR_ULTRA", "--cleanup-strength", "0.5"]
+        job = {"id": job_id, "job_number": self._take_next_job_number(), "job_type": engine,
                "state": "pending", "created_at": time.time(), "started_at": None, "finished_at": None,
-               "elapsed": 0, "mode": -1, "mode_name": "NVIDIA VSR", "model_label": "NVIDIA VSR",
+               "elapsed": 0, "mode": -1, "mode_name": "RelayVSR" if engine == "relayvsr" else "NVIDIA VSR",
+               "model_label": "RelayVSR" if engine == "relayvsr" else "NVIDIA VSR",
                "output": str(outfile), "seed": "—", "actual_seed": None,
                "resolution": f"{w * scale}×{h * scale}", "frames": None, "steps": None,
-               "prompt": f"NVIDIA VSR x{scale}: {source.name}", "args": args,
+               "prompt": f"{'RelayVSR' if engine == 'relayvsr' else 'NVIDIA VSR'} x{scale}: {source.name}", "args": args,
                "queue_program": str(PYTHON if PYTHON.is_file() else sys.executable),
                "progress": None, "phase": "Waiting", "error": "", "cancel_reason": "", "settings": {},
                "log_tail": "", "continue_last_result": False, "manual_continue_video": "",
@@ -3423,7 +3551,7 @@ class MainWindow(QMainWindow):
         self.queue_jobs.append(job)
         self._save_queue_state()
         self._refresh_queue_views()
-        self.append_log(f"[NVIDIA VSR] Queued {source.name} → {outfile.name} at {strength} strength; unblur={'on' if unblur else 'off'}\n")
+        self.append_log(f"[{engine}] Queued {source.name} → {outfile.name} at x{scale}\n")
         self._start_next_pending()
         return True
 
@@ -5239,6 +5367,34 @@ class MainWindow(QMainWindow):
         v.addWidget(vsrg)
         self._vsr_install_status()
 
+        relay_group = QGroupBox("RelayVSR")
+        relay_form = QFormLayout(relay_group)
+        relay_info = QLabel("Slower than NVIDIA VSR, but can restore more detail.")
+        relay_form.addRow(relay_info)
+        self.relay_model_choice = QComboBox()
+        self.relay_model_choice.addItem("X4 INT8", "4")
+        self.relay_model_choice.setToolTip("One model supports X1, X2, X3 and X4 output.")
+        relay_form.addRow("Model", self.relay_model_choice)
+        self.relay_install_button = QPushButton("Install / Repair RelayVSR")
+        self.relay_install_button.clicked.connect(self._relay_install)
+        relay_form.addRow(self.relay_install_button)
+        self.relay_verify_button = QPushButton("Verify RelayVSR")
+        self.relay_verify_button.clicked.connect(self._relay_verify)
+        relay_form.addRow(self.relay_verify_button)
+        self.relay_install_progress = QProgressBar()
+        self.relay_install_progress.setRange(0, 5)
+        self.relay_install_progress.setValue(0)
+        relay_form.addRow(self.relay_install_progress)
+        self.relay_command_edit = QLineEdit()
+        self.relay_command_edit.setPlaceholderText('["C:/path/to/python.exe", "C:/path/to/inference.py", "--input", "{input}", "--output", "{output}", "--scale", "{scale}"]')
+        self.relay_command_edit.setText(json.dumps(self._relay_config().get("command", []), ensure_ascii=False))
+        self.relay_command_edit.editingFinished.connect(self._save_relay_command)
+        relay_form.addRow("Backend command (JSON)", self.relay_command_edit)
+        self.relay_status = QLabel()
+        relay_form.addRow("Configuration", self.relay_status)
+        self._relay_install_status()
+        v.addWidget(relay_group)
+
         tg = QGroupBox("Telegram remote control")
         tf = QFormLayout(tg)
         tnote = QLabel(
@@ -5762,6 +5918,18 @@ class MainWindow(QMainWindow):
             return WIDESCREEN_21_9_PRESETS[self.widescreen_quality.currentText()]
         return RESOLUTION_PRESETS[self.res_class.currentText()][aspect]
 
+    def _generation_upscale_engine_changed(self):
+        engine = self.gen_vsr_engine.currentData()
+        previous = self.gen_vsr_scale.currentData()
+        self.gen_vsr_scale.blockSignals(True)
+        self.gen_vsr_scale.clear()
+        for factor in ((1, 2, 3, 4) if engine == "relayvsr" else (1, 2, 3)):
+            self.gen_vsr_scale.addItem(f"x{factor}", factor)
+        idx = self.gen_vsr_scale.findData(previous)
+        self.gen_vsr_scale.setCurrentIndex(idx if idx >= 0 else 0)
+        self.gen_vsr_scale.blockSignals(False)
+        self._sync_resolution()
+
     def _sync_resolution(self):
         aspect = self.aspect.currentText()
         is_widescreen = aspect == "21:9"
@@ -5775,9 +5943,9 @@ class MainWindow(QMainWindow):
             final_w, final_h = w * scale, h * scale
             # Keep both dimensions visible: H3 still generates at the native
             # resolution; the separately queued VSR pass creates the final file.
-            self.resolved.setText(f"{generation_label}\nFinal (VSR x{scale}): {final_w} × {final_h}")
+            self.resolved.setText(f"{generation_label}\nFinal ({self.gen_vsr_engine.currentText()} x{scale}): {final_w} × {final_h}")
             self.resolved.setToolTip(
-                f"MiniMax H3 generates {w} × {h}. NVIDIA VSR x{scale} outputs "
+                f"MiniMax H3 generates {w} × {h}. {self.gen_vsr_engine.currentText()} x{scale} outputs "
                 f"{final_w} × {final_h} when the upscale job finishes."
             )
         else:
@@ -5974,6 +6142,18 @@ class MainWindow(QMainWindow):
             for raw in text.replace("\r", "\n").splitlines():
                 line = raw.strip()
                 if not line: continue
+                if line.startswith("RELAY_PROGRESS "):
+                    pm = re.match(r"RELAY_PROGRESS (.+?) \| (\d{1,3})% \| (\d+)\s*/\s*(\d+)", line)
+                    if pm:
+                        job["progress"] = int(pm.group(2))
+                        job["phase"] = pm.group(1)
+                        job["step_now"] = int(pm.group(3))
+                        job["step_total"] = int(pm.group(4))
+                    continue
+                if line.startswith("RELAY_STAGE "):
+                    job["phase"] = line[len("RELAY_STAGE "):][:80]
+                    job["progress"] = None
+                    continue
                 if job.get("job_type") == "beatsyncfx" and line.startswith("BEATSYNC_PROGRESS "):
                     try:
                         job["progress"] = max(0, min(100, int(line.split()[1])))
@@ -6016,11 +6196,15 @@ class MainWindow(QMainWindow):
             "Starting VAE", "Decoding video", "Video decode stage complete",
             "Decoding audio", "Audio decode stage complete", "Muxing ",
             "Saved ", "Glue results", "video-only fallback", "LoRA ", "VRAM Manager", "[VRAM-MGR]", "ERROR", "FAILED", "WARNING",
-            "Traceback", "Exception", "VALIDATION",
+            "Traceback", "Exception", "VALIDATION", "RELAY_PROGRESS", "RELAY_STAGE", "[RELAY-NATIVE]",
         )
         for raw in text.replace("\r", "\n").splitlines():
             line = raw.strip()
             if not line:
+                continue
+            # Native ComfyUI diagnostic stream is deliberately extended-only.
+            # Normal mode displays RELAY_STAGE / RELAY_PROGRESS instead.
+            if line.startswith("[RELAY_DETAIL]"):
                 continue
             low = line.lower()
             # tqdm/Comfy sampler progress, e.g. 40%|...| 6/15 [..]
@@ -6373,6 +6557,7 @@ class MainWindow(QMainWindow):
     def settings_dict(self):
         return {
             "generation_vsr_enabled": self.gen_vsr_toggle.isChecked(), "generation_vsr_scale": int(self.gen_vsr_scale.currentData() or 2),
+            "generation_vsr_engine": self.gen_vsr_engine.currentData(),
             "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "widescreen_quality": self.widescreen_quality.currentText(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
             "steps": self.steps.value(), "seed": self.seed.value(), "prompt": self.prompt.toPlainText(), "first": self.first.path(), "last": self.last.path(),
             "continue_video": "" if self.continue_last_result.isChecked() else self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 90),
@@ -6411,6 +6596,8 @@ class MainWindow(QMainWindow):
     def apply_settings(self, d):
         try:
             self.gen_vsr_toggle.setChecked(bool(d.get("generation_vsr_enabled", False)))
+            engine_idx = self.gen_vsr_engine.findData(d.get("generation_vsr_engine", "nvidia_vsr"))
+            self.gen_vsr_engine.setCurrentIndex(max(0, engine_idx))
             scale_idx = self.gen_vsr_scale.findData(int(d.get("generation_vsr_scale", 2)))
             self.gen_vsr_scale.setCurrentIndex(max(0, scale_idx))
             self.mode.setCurrentIndex(int(d.get("mode", 0))); self.aspect.setCurrentText(d.get("aspect", "16:9"))
@@ -7401,7 +7588,8 @@ exit /b %RC%
             scale = int(self.gen_vsr_scale.currentData() or 2)
             # The source is not generated yet; the queue waits for this exact job to finish.
             self._enqueue_timeline_vsr({"source": str(out), "scale": scale, "width": w,
-                                        "height": h, "vsr_after_job_id": job["id"]})
+                                        "height": h, "vsr_after_job_id": job["id"],
+                                        "engine": self.gen_vsr_engine.currentData()})
         self._start_next_pending()
 
     def _play_completed_result(self, job):
@@ -7433,7 +7621,7 @@ exit /b %RC%
             elif code in (0,3) and Path(job.get("output","")).is_file():
                 job["state"]="finished"; job["phase"]="Finished"
                 job["clip_duration"] = self._probe_clip_duration(job.get("output"), job.get("frames"))
-                if job.get("job_type") == "nvidia_vsr" and job.get("timeline_clip_id") and getattr(self, "timeline_widget", None) is not None:
+                if job.get("job_type") in ("nvidia_vsr", "relayvsr") and job.get("timeline_clip_id") and getattr(self, "timeline_widget", None) is not None:
                     if not self.timeline_widget.vsr_job_completed(job):
                         self.append_log("[NVIDIA VSR] Output ready, but original Timeline project/clip is no longer active. Output preserved in output/nvidia_vsr.\n")
                 if job.get("job_type") == "beatsyncfx" and job.get("timeline_clip_id"):

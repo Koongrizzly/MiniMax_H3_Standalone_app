@@ -5228,8 +5228,14 @@ class TimelineTab(QWidget):
                     if vsr_dimensions else "source resolution unknown")
             a = vsr_menu.addAction(f"VSR x{factor} — {dims}")
             a.setEnabled(bool(vsr_dimensions) and not locked)
-            vsr_actions[a] = factor
+            vsr_actions[a] = ("nvidia_vsr", factor)
         vsr_menu.setEnabled(bool(vsr_dimensions) and not locked)
+        relay_menu = menu.addMenu("Upscale clip with RelayVSR")
+        for factor in (1, 2, 3, 4):
+            dimensions = f"{vsr_dimensions[0] * factor} × {vsr_dimensions[1] * factor}" if vsr_dimensions else "unknown resolution"
+            action = relay_menu.addAction(f"RelayVSR x{factor} — {dimensions}")
+            action.setEnabled(bool(vsr_dimensions) and not locked)
+            vsr_actions[action] = ("relayvsr", factor)
         ref_presets = menu.addAction("Ref presets…")
 
         candidates_menu = menu.addMenu("Alternate candidates")
@@ -5306,7 +5312,7 @@ class TimelineTab(QWidget):
         elif chosen in resolution_actions:
             self._create_clip_at_resolution_by_id(clip_id, resolution_actions[chosen])
         elif chosen in vsr_actions:
-            self._queue_vsr_for_clip(clip_id, vsr_actions[chosen])
+            self._queue_vsr_for_clip(clip_id, vsr_actions[chosen][1], engine=vsr_actions[chosen][0])
         elif chosen is ref_presets:
             self._open_ref_presets()
         elif chosen is load_clip_action:
@@ -5367,16 +5373,17 @@ class TimelineTab(QWidget):
         ):
             submenu.setEnabled(count > 0)
             submenu.setToolTipsVisible(True)
-            for scale in (1, 2, 3):
-                action = submenu.addAction(f"VSR x{scale}  —  {count} clip(s)")
-                action.setToolTip("Jobs are queued from left to right in timeline order.")
-                actions[action] = (scope, scale)
+            for engine, factors, label in (("nvidia_vsr", (1, 2, 3), "NVIDIA VSR"), ("relayvsr", (1, 2, 3, 4), "RelayVSR")):
+                for scale in factors:
+                    action = submenu.addAction(f"{label} x{scale} — {count} clip(s)")
+                    action.setToolTip("Jobs are queued from left to right in timeline order.")
+                    actions[action] = (scope, scale, engine)
         picked = menu.exec(self.vsr_upscale_btn.mapToGlobal(self.vsr_upscale_btn.rect().bottomLeft()))
         if picked in actions:
-            scope, scale = actions[picked]
-            self._queue_vsr_batch(scope, scale)
+            scope, scale, engine = actions[picked]
+            self._queue_vsr_batch(scope, scale, engine)
 
-    def _queue_vsr_batch(self, scope, scale):
+    def _queue_vsr_batch(self, scope, scale, engine="nvidia_vsr"):
         """Submit a snapshot of eligible timeline clips, ordered from first to last."""
         selected = {str(value) for value in self.selected_clip_ids}
         clips = list(self._clips())
@@ -5392,7 +5399,7 @@ class TimelineTab(QWidget):
         submitted = 0
         failed = 0
         for clip in targets:
-            if self._queue_vsr_for_clip(str(clip.get("id")), scale, quiet=True):
+            if self._queue_vsr_for_clip(str(clip.get("id")), scale, quiet=True, engine=engine):
                 submitted += 1
             else:
                 failed += 1
@@ -5421,7 +5428,7 @@ class TimelineTab(QWidget):
         except Exception:
             return None
 
-    def _queue_vsr_for_clip(self, clip_id, factor, quiet=False):
+    def _queue_vsr_for_clip(self, clip_id, factor, quiet=False, engine="nvidia_vsr"):
         _, clip = self._clip_by_id(clip_id)
         if not clip or clip.get("locked"):
             return False
@@ -5435,7 +5442,7 @@ class TimelineTab(QWidget):
             "timeline_clip_id": str(clip_id),
             "timeline_project_id": str(self.project.get("project_id") or ""),
             "source": str(Path(source).resolve()), "scale": int(factor),
-            "width": dims[0], "height": dims[1],
+            "engine": engine, "width": dims[0], "height": dims[1],
         }))
 
     def vsr_job_completed(self, job):
@@ -5468,7 +5475,7 @@ class TimelineTab(QWidget):
             snapshot = {"candidate_id": uuid.uuid4().hex, "output": str(output),
                         "status": "finished", "queue_job_id": str(job.get("id") or ""),
                         "last_generation_info": {"output": str(output), "resolution": str(job.get("resolution") or ""),
-                                                  "upscale_engine": "nvidia_vsr", "source": queued_source,
+                                                  "upscale_engine": str(job.get("job_type") or "nvidia_vsr"), "source": queued_source,
                                                   "scale": int(job.get("vsr_scale") or 1)}}
             candidates.append(snapshot)
             self._refresh_all()
@@ -5479,7 +5486,7 @@ class TimelineTab(QWidget):
         clip["stale"] = False
         clip["last_generation_info"] = {
             "output": str(output), "resolution": str(job.get("resolution") or ""),
-            "upscale_engine": "nvidia_vsr", "source": str(job.get("vsr_source") or ""),
+            "upscale_engine": str(job.get("job_type") or "nvidia_vsr"), "source": str(job.get("vsr_source") or ""),
             "scale": int(job.get("vsr_scale") or 1), "strength": float(job.get("vsr_strength") or 0.75),
         }
         # Do not change trim_in/out, volume, audio/video fades, speed or transitions.
@@ -6996,7 +7003,7 @@ class TimelineTab(QWidget):
                 output = str(job.get("output") or "")
                 if output and clip.get("output") != output:
                     clip["output"] = output; changed = True
-                job_info = (clip.get("last_generation_info") if job.get("job_type") == "nvidia_vsr"
+                job_info = (clip.get("last_generation_info") if job.get("job_type") in ("nvidia_vsr", "relayvsr")
                             else self._generation_info_from_job(job))
                 if job_info and clip.get("last_generation_info") != job_info:
                     clip["last_generation_info"] = job_info; changed = True
