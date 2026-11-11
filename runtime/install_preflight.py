@@ -5,7 +5,6 @@ Keep application installs isolated; models are discovered rather than forcibly m
 from __future__ import annotations
 import json
 import subprocess
-import os
 from pathlib import Path
 from helpers.shared_whisper import shared_python, ct2_medium, cpp_medium
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
@@ -71,9 +70,10 @@ def nvidia_vsr_ready():
 
 
 def relayvsr_installed_scales():
-    """Shared-vendor RelayVSR INT8 X4 model and Flash VAE."""
+    """Native ComfyUI INT8 checkpoints and Flash VAEs; avoid false positives from old bbaudio bundles."""
     base = ROOT/'models/relayvsr/native'
-    models = {4: ('relayvsr_x4_int8_convrot.safetensors', 'relayvsr_flash_vae_x4_fp32.safetensors')}
+    models = {2: ('relayvsr_x2_lightx2v_int8_convrot.safetensors', 'relayvsr_flash_vae_x2_fp32.safetensors'),
+              4: ('relayvsr_x4_int8_convrot.safetensors', 'relayvsr_flash_vae_x4_fp32.safetensors')}
     found = []
     for scale, (wan, flash) in models.items():
         if all(path.is_file() and path.stat().st_size > 50_000_000 for path in
@@ -83,7 +83,7 @@ def relayvsr_installed_scales():
 
 
 def relayvsr_ready():
-    comfy = ROOT/'vendor/comfy/ldm/wan/model_vsr.py'
+    comfy = ROOT/'models/relayvsr/native/native_comfy/comfy/ldm/wan/model_vsr.py'
     py = ROOT/'environments/relayvsr/Scripts/python.exe'
     return comfy.is_file() and py.is_file() and 4 in relayvsr_installed_scales()
 
@@ -113,7 +113,7 @@ def media_state():
         dict(key='beat', title='BeatSyncFX environment', ok=bool(beat_env and (BEAT/'helpers/gui.py').is_file()), action='Install', note='Separate portable BeatSyncFX environment; does not modify GrizzlyMax Python'),
         dict(key='beat_whisper', title='Shared Faster-Whisper Medium', ok=beat_medium and bool(shared_python()), action='Install Medium', note='Shared GrizzlyMax environments/.whisper and models/whisper; BeatSyncFX uses this when embedded'),
         dict(key='nvidia_vsr', title='NVIDIA VSR (Maxine)', ok=nvidia_vsr_ready(), action='Install', note='Existing NVIDIA VSR Python sample and isolated maxine_vfx environment. Proprietary NVIDIA SDK/model assets may still be required.'),
-        dict(key='relayvsr', title='RelayVSR (native ComfyUI INT8)', ok=relayvsr_ready(), action='Install', note='Shared vendor/comfy backend and Comfy-Org INT8 ConvRot checkpoints. Installed models: '+(', '.join('X'+str(x) for x in relayvsr_installed_scales()) or 'none')+'. X4 INT8 supports X1, X2, X3 and X4 output; native X2 model not needed.'),
+        dict(key='relayvsr', title='RelayVSR (native ComfyUI INT8)', ok=relayvsr_ready(), action='Install', note='Isolated native ComfyUI backend and Comfy-Org INT8 ConvRot checkpoints. Installed models: '+(', '.join('X'+str(x) for x in relayvsr_installed_scales()) or 'none')+'. X4 INT8 supports X1, X2, X3 and X4 output; native X2 model not needed.'),
     ]
 
 def _cmd_for(key, action=None):
@@ -245,12 +245,7 @@ class PreflightDialog(QDialog):
                 QMessageBox.warning(self,'Installer unavailable',f'Installer for {record["title"]} cannot run yet. Install GrizzlyMax/BeatSyncFX core environment first, then validate again.')
                 continue
             try:
-                launch_env = os.environ.copy()
-                if key == 'relayvsr':
-                    # The installer writes a persistent diagnostic log and waits for Enter.
-                    launch_env['GRIZZLYMAX_VALIDATE_INSTALL'] = '1'
-                subprocess.Popen(command, cwd=str(cwd), env=launch_env,
-                                 creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0))
+                subprocess.Popen(command, cwd=str(cwd), creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0))
                 launched.append(record['title'])
             except OSError as exc: QMessageBox.warning(self,'Installer error',f'{record["title"]}: {exc}')
         self.refresh()
