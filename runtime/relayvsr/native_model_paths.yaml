@@ -1,4 +1,0 @@
-grizzlymax_relayvsr:
-  base_path: C:/MiniMax_H3_Standalone_app-main/models/relayvsr/native
-  diffusion_models: diffusion_models
-  vae: vae
