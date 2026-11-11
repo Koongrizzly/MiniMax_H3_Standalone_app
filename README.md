@@ -51,8 +51,15 @@ Main Features :
 
 ---
 
+- 11/11/2026
+  - added Relay VSR upscale
+
+---
+
 - 11//09/2026 : Refmods added
   - Grizzlymax now allows creating and using Refmods
+
+---
 
 - 10/31/2026 :
   BeatSyncFX (Slopcore creator)
