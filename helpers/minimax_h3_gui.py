@@ -32,6 +32,10 @@ except ImportError:
     from minimax_telegram_remote import GrizzlyTelegramRemote, load_config as load_telegram_config, save_config as save_telegram_config
 
 ROOT = Path(__file__).resolve().parents[1]
+# Runtime utilities live alongside helpers at the portable application root.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from runtime.minimax_batch_import import normalize_spec as _batch_normalize_spec
 PYTHON = ROOT / "environments" / ".minimax_h3_int4" / "python.exe"
 PRESET_DIR = ROOT / "presets" / "setsave"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
@@ -1059,6 +1063,215 @@ class SupportedCheckpointDialog(QDialog):
             self.accept()
 
 
+class BatchBuilderDialog(QDialog):
+    def __init__(self, parent, save_folder, queue_callback):
+        super().__init__(parent)
+        self.setWindowTitle('Create Ref2VA batch')
+        self.resize(1050, 760)
+        self.save_folder = Path(save_folder)
+        self.queue_callback = queue_callback
+        self.jobs = [{'name':'clip_001','prompt':''}]
+        self.current = 0
+        self._loading = False
+        root = QVBoxLayout(self)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget(); ll = QVBoxLayout(left)
+        ll.addWidget(QLabel('Clips'))
+        self.job_list = QListWidget(); self.job_list.setMinimumWidth(195)
+        ll.addWidget(self.job_list)
+        buttons = QHBoxLayout()
+        add = QPushButton('+ Add prompt'); add.clicked.connect(self.add_job)
+        remove = QPushButton('Remove'); remove.clicked.connect(self.remove_job)
+        buttons.addWidget(add); buttons.addWidget(remove); ll.addLayout(buttons)
+        ordering = QHBoxLayout()
+        up = QPushButton('Up'); down = QPushButton('Down')
+        up.clicked.connect(lambda: self.move_job(-1)); down.clicked.connect(lambda: self.move_job(1))
+        ordering.addWidget(up); ordering.addWidget(down); ll.addLayout(ordering)
+        split.addWidget(left)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        content = QWidget(); form = QFormLayout(content)
+        self.name = QLineEdit(); self.name.setPlaceholderText('Optional filename')
+        form.addRow('Clip name', self.name)
+        self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText('Enter the full generation prompt')
+        self.prompt.setMinimumHeight(175)
+        form.addRow('Prompt', self.prompt)
+        self.resolution = QComboBox()
+        self.resolution.addItems(['Use current', '384p', '448p', '576p', '704p', '768p', '896p', '1080p'])
+        form.addRow('Resolution', self.resolution)
+        self.frames = QSpinBox(); self.frames.setRange(0, 2385)
+        self.frames.setSpecialValueText('Use current'); self.frames.setSingleStep(17)
+        form.addRow('Frames', self.frames)
+        self.steps = QSpinBox(); self.steps.setRange(0, 100); self.steps.setSpecialValueText('Use current')
+        form.addRow('Steps', self.steps)
+        self.seed = QSpinBox(); self.seed.setRange(-2, 98_999_999)
+        self.seed.setSpecialValueText('Use current')
+        self.seed.setToolTip('-2 = inherit; -1 = random seed')
+        form.addRow('Seed', self.seed)
+        self.cfg = QLineEdit(); self.cfg.setPlaceholderText('Use current')
+        self.shift = QLineEdit(); self.shift.setPlaceholderText('Use current')
+        self.audio_shift = QLineEdit(); self.audio_shift.setPlaceholderText('Use current')
+        form.addRow('CFG',self.cfg); form.addRow('Shift',self.shift); form.addRow('Audio shift',self.audio_shift)
+        self.sampler = QLineEdit(); self.sampler.setPlaceholderText('Use current')
+        self.scheduler = QLineEdit(); self.scheduler.setPlaceholderText('Use current')
+        form.addRow('Sampler',self.sampler); form.addRow('Scheduler',self.scheduler)
+        self.paths = {}
+        for key, label, filter_str in (
+            ('ref_images','Reference images (ordered)','Images (*.png *.jpg *.jpeg *.webp *.bmp)'),
+            ('ref_videos','Reference videos (ordered)','Videos (*.mp4 *.mov *.mkv *.webm *.avi)'),
+            ('ref_audios','Reference audio (ordered)','Audio (*.wav *.mp3 *.flac *.ogg *.m4a)'),
+            ('refmods','RefMods (ordered)','RefMods (*.safetensors *.pt *.pth)')):
+            row = QWidget(); layout = QVBoxLayout(row); layout.setContentsMargins(0,0,0,0)
+            edit = QPlainTextEdit(); edit.setPlaceholderText('None — one path per line')
+            edit.setMaximumHeight(67)
+            browse = QPushButton('Add files...'); browse.clicked.connect(lambda _checked=False, k=key, f=filter_str: self.browse(k,f))
+            layout.addWidget(edit); layout.addWidget(browse)
+            form.addRow(label,row); self.paths[key] = edit
+        self.exact_audio = QCheckBox('Use reference audio as exact output source')
+        self.qwen_refmod = QCheckBox('Enable RefMod Qwen vision')
+        form.addRow('',self.exact_audio); form.addRow('',self.qwen_refmod)
+        self.extra = QPlainTextEdit(); self.extra.setMaximumHeight(80)
+        self.extra.setPlaceholderText('Optional additional JSON settings: {"loras": [], "audio_subjects": [0]}')
+        form.addRow('Advanced overrides (JSON)',self.extra)
+        scroll.setWidget(content); split.addWidget(scroll); split.setStretchFactor(1,3)
+        root.addWidget(split)
+        footer = QHBoxLayout()
+        save = QPushButton('Save JSON...'); save.clicked.connect(self.save_json)
+        queue = QPushButton('Add batch to queue'); queue.clicked.connect(self.queue_jobs)
+        close = QPushButton('Close'); close.clicked.connect(self.reject)
+        footer.addStretch(); footer.addWidget(save); footer.addWidget(queue); footer.addWidget(close)
+        root.addLayout(footer)
+        self.job_list.currentRowChanged.connect(self.change_job)
+        self._refresh_list(); self._load(0)
+
+    def browse(self, key, filt):
+        files, _ = QFileDialog.getOpenFileNames(self,'Add reference files',str(self.save_folder.parent.parent),filt)
+        if files:
+            edit=self.paths[key]
+            previous=edit.toPlainText().strip()
+            edit.setPlainText((previous+'\n' if previous else '')+'\n'.join(files))
+
+    def _collect(self):
+        spec = {'prompt':self.prompt.toPlainText().strip(), 'mode':'ref2va'}
+        if self.name.text().strip(): spec['name']=self.name.text().strip()
+        if self.resolution.currentIndex(): spec['resolution']=self.resolution.currentText()
+        if self.frames.value(): spec['frames']=self.frames.value()
+        if self.steps.value(): spec['steps']=self.steps.value()
+        if self.seed.value() != -2: spec['seed']=self.seed.value()
+        for key,widget in [('cfg',self.cfg),('shift',self.shift),('audio_shift',self.audio_shift)]:
+            if widget.text().strip(): spec[key]=float(widget.text().strip())
+        for key,widget in [('sampler',self.sampler),('scheduler',self.scheduler)]:
+            if widget.text().strip(): spec[key]=widget.text().strip()
+        for key,widget in self.paths.items():
+            paths=[p.strip().strip('"') for p in widget.toPlainText().splitlines() if p.strip()]
+            if paths: spec[key]=paths
+        if self.exact_audio.isChecked(): spec['lock_source_audio']=True
+        if self.qwen_refmod.isChecked(): spec['refmod_qwen_vision']=True
+        if self.extra.toPlainText().strip():
+            extra=json.loads(self.extra.toPlainText())
+            if not isinstance(extra,dict): raise ValueError('Advanced overrides must be a JSON object.')
+            overlap=set(extra)&set(spec)
+            if overlap: raise ValueError('Duplicate advanced setting: '+', '.join(sorted(overlap)))
+            spec.update(extra)
+        return spec
+
+    def _store(self):
+        if not self._loading and 0<=self.current<len(self.jobs):
+            self.jobs[self.current]=self._collect()
+
+    def _load(self, index):
+        self._loading=True
+        try:
+            spec=self.jobs[index]
+            self.name.setText(spec.get('name',''))
+            self.prompt.setPlainText(spec.get('prompt',''))
+            res=spec.get('resolution','Use current'); i=self.resolution.findText(str(res))
+            self.resolution.setCurrentIndex(max(0,i))
+            self.frames.setValue(int(spec.get('frames',0)))
+            self.steps.setValue(int(spec.get('steps',0)))
+            self.seed.setValue(int(spec.get('seed',-2)))
+            for k,w in [('cfg',self.cfg),('shift',self.shift),('audio_shift',self.audio_shift),
+                        ('sampler',self.sampler),('scheduler',self.scheduler)]:
+                w.setText(str(spec[k]) if k in spec else '')
+            for k,w in self.paths.items(): w.setPlainText('\n'.join(spec.get(k,[])))
+            self.exact_audio.setChecked(bool(spec.get('lock_source_audio',False)))
+            self.qwen_refmod.setChecked(bool(spec.get('refmod_qwen_vision',False)))
+            core={'prompt','mode','name','resolution','frames','steps','seed','cfg','shift','audio_shift',
+                  'sampler','scheduler','ref_images','ref_videos','ref_audios','refmods',
+                  'lock_source_audio','refmod_qwen_vision'}
+            extra={k:v for k,v in spec.items() if k not in core}
+            self.extra.setPlainText(json.dumps(extra,indent=2) if extra else '')
+            self.current=index; self.job_list.setCurrentRow(index)
+        finally: self._loading=False
+
+    def _refresh_list(self):
+        self.job_list.blockSignals(True); self.job_list.clear()
+        for index,job in enumerate(self.jobs,1):
+            self.job_list.addItem(f'{index:03d}  {job.get("name") or job.get("prompt", "")[:24] or "New prompt"}')
+        self.job_list.setCurrentRow(self.current)
+        self.job_list.blockSignals(False)
+
+    def change_job(self,index):
+        if self._loading or index<0 or index==self.current: return
+        try: self._store()
+        except Exception as e:
+            QMessageBox.warning(self,'Invalid setting',str(e)); self._refresh_list(); return
+        self._load(index); self._refresh_list()
+
+    def add_job(self):
+        try: self._store()
+        except Exception as e: QMessageBox.warning(self,'Invalid setting',str(e)); return
+        self.jobs.append({'name':f'clip_{len(self.jobs)+1:03d}','prompt':''})
+        self._load(len(self.jobs)-1); self._refresh_list(); self.prompt.setFocus()
+
+    def remove_job(self):
+        if len(self.jobs)==1:
+            QMessageBox.information(self,'Batch','At least one prompt is required.'); return
+        self.jobs.pop(self.current); self._load(min(self.current,len(self.jobs)-1)); self._refresh_list()
+
+    def move_job(self,direction):
+        try: self._store()
+        except Exception as e: QMessageBox.warning(self,'Invalid setting',str(e)); return
+        other=self.current+direction
+        if not 0<=other<len(self.jobs): return
+        self.jobs[self.current],self.jobs[other]=self.jobs[other],self.jobs[self.current]
+        self._load(other); self._refresh_list()
+
+    def _validated(self):
+        self._store()
+        result=[]
+        for index,spec in enumerate(self.jobs,1):
+            entry=dict(spec)
+            _batch_normalize_spec(entry,index)
+            if str(entry.get('mode','ref2va')).lower()!='ref2va':
+                raise ValueError(f'Job {index}: Create Batch only supports Ref2VA.')
+            result.append(entry)
+        return result
+
+    def save_json(self):
+        try: jobs=self._validated()
+        except Exception as e: QMessageBox.warning(self,'Batch validation',str(e)); return
+        self.save_folder.mkdir(parents=True,exist_ok=True)
+        filename,ok=QInputDialog.getText(self,'Save batch JSON','File name (presets/setsave):', text='ref2va_batch.json')
+        if not ok or not filename.strip(): return
+        filename=Path(filename.strip()).name
+        if not filename.lower().endswith('.json'): filename += '.json'
+        path=self.save_folder/filename
+        if path.exists() and QMessageBox.question(self,'Overwrite batch',f'Replace {filename}?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes: return
+        try:
+            path.write_text(json.dumps(jobs,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+            QMessageBox.information(self,'Batch saved',f'Saved {len(jobs)} prompts to:\n{path}')
+        except Exception as e: QMessageBox.warning(self,'Save failed',str(e))
+
+    def queue_jobs(self):
+        try: jobs=self._validated()
+        except Exception as e: QMessageBox.warning(self,'Batch validation',str(e)); return
+        # The callback applies the current GUI settings to all jobs and performs
+        # the normal native generator validation and queue submission.
+        if self.queue_callback(jobs): self.accept()
+
+
 class MainWindow(QMainWindow):
     update_check_finished = Signal(object)
     update_check_failed = Signal(object)
@@ -1379,6 +1592,10 @@ class MainWindow(QMainWindow):
         self.import_batch_button.setToolTip("Import prompts and optional per-clip settings into the regular generation queue.")
         self.import_batch_button.clicked.connect(self._import_generation_batch)
         batch_row.addWidget(self.import_batch_button)
+        self.create_batch_button = QPushButton("Create batch...")
+        self.create_batch_button.setToolTip("Build and save a Ref2VA batch or add it to the queue.")
+        self.create_batch_button.clicked.connect(self._create_generation_batch)
+        batch_row.addWidget(self.create_batch_button)
         batch_row.addStretch()
         pgl.addLayout(batch_row)
         pgl.addWidget(self.prompt); v.addWidget(pg)
@@ -5971,6 +6188,8 @@ class MainWindow(QMainWindow):
                        self.ref_images, self.ref_videos, self.ref_audios, self.lock_source_audio):
             widget.setVisible(i == 2)
         self.t2va_use_refmods.setVisible(i == 0)
+        self.import_batch_button.setVisible(i == 2)
+        self.create_batch_button.setVisible(i == 2)
         self._sync_continue_video_options()
 
     def _sync_continue_video_options(self):
@@ -7501,11 +7720,19 @@ exit /b %RC%
                 return
         raise ValueError(f"Resolution {width} x {height} is not an H3 preset.")
 
+    def _create_generation_batch(self):
+        if self.mode.currentIndex() != 2:
+            return
+        dialog = BatchBuilderDialog(self, PRESET_DIR, self._queue_created_generation_batch)
+        dialog.exec()
+
+    def _queue_created_generation_batch(self, specs):
+        return self._queue_generation_batch_specs(specs, ROOT)
+
     def _import_generation_batch(self):
-        try:
-            from .minimax_batch_import import parse_file
-        except ImportError:
-            from minimax_batch_import import parse_file
+        if self.mode.currentIndex() != 2:
+            return
+        from runtime.minimax_batch_import import parse_file
         selected, _ = QFileDialog.getOpenFileName(
             self, "Import generation batch", _dialog_start_dir("generation_batch", fallback=ROOT),
             "Batch files (*.txt *.json)")
@@ -7514,6 +7741,13 @@ exit /b %RC%
         _remember_dialog_folder("generation_batch", selected)
         try:
             specs = parse_file(selected)
+        except Exception as exc:
+            QMessageBox.warning(self, "Batch import failed", str(exc))
+            return
+        self._queue_generation_batch_specs(specs, Path(selected).parent)
+
+    def _queue_generation_batch_specs(self, specs, source_dir):
+        try:
             # Validate the *whole* file before adding any jobs. Every clip derives
             # from this one frozen snapshot, never from the previous batch clip.
             snapshot = copy.deepcopy(self.settings_dict())
@@ -7531,6 +7765,9 @@ exit /b %RC%
                     overrides["mode"] = int(overrides["mode"])
                     if overrides["mode"] not in (0, 1, 2):
                         raise ValueError(f"Job {index}: unsupported mode {spec['mode']}")
+                if int(overrides.get("mode", 2)) != 2:
+                    raise ValueError(f"Job {index}: batch generation currently supports Ref2VA only.")
+                overrides["mode"] = 2
                 settings.update(overrides)
                 # Every batch item is independent. Only non-reference generation
                 # settings inherit the frozen GUI snapshot. Never reuse stale
@@ -7549,7 +7786,6 @@ exit /b %RC%
                             "combine_frames_latent"):
                     settings[key] = bool(spec.get(key, False))
                 # Relative media paths are resolved beside the imported file.
-                source_dir = Path(selected).parent
                 for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
                     if key in spec:
                         settings[key] = [str((source_dir / p).resolve()) if not Path(p).is_absolute()
@@ -7621,8 +7857,10 @@ exit /b %RC%
                     f"Queued {added} of {len(prepared)} jobs. Import stopped after a job failed validation.")
             else:
                 self.status.setText(f"Imported {added} batch jobs")
+            return added == len(prepared)
         except Exception as exc:
             QMessageBox.warning(self, "Batch import failed", str(exc))
+            return False
 
     def generate(self):
         prompt=self.prompt.toPlainText().strip()
