@@ -361,7 +361,8 @@ class SystemHud(QLabel):
                 # Step counters belong only to the sampling stage. Once sampling
                 # finishes and the job moves on to VAE/audio decode, muxing, etc.,
                 # do not keep displaying the stale final "4/4" value.
-                if phase.lower() == "sampling" and step_now is not None and step_total:
+                if (phase.lower() in ("sampling", "upscaling")
+                        and step_now is not None and step_total):
                     detail += f" {step_now}/{step_total}"
                 if progress is not None:
                     detail += f" {int(progress)}%"
@@ -6142,17 +6143,23 @@ class MainWindow(QMainWindow):
             for raw in text.replace("\r", "\n").splitlines():
                 line = raw.strip()
                 if not line: continue
-                if line.startswith("RELAY_PROGRESS "):
-                    pm = re.match(r"RELAY_PROGRESS (.+?) \| (\d{1,3})% \| (\d+)\s*/\s*(\d+)", line)
+                if line.startswith("RELAY_TOTAL_PROGRESS "):
+                    pm = re.match(r"RELAY_TOTAL_PROGRESS (.+?) \| (\d{1,3})% \| (\d+)\s*/\s*(\d+)", line)
                     if pm:
                         job["progress"] = int(pm.group(2))
                         job["phase"] = pm.group(1)
                         job["step_now"] = int(pm.group(3))
                         job["step_total"] = int(pm.group(4))
                     continue
+                if line.startswith("RELAY_PROGRESS "):
+                    # Per-segment Wan/Flash counters still appear in the log,
+                    # but must never reset the whole-video HUD to 0%.
+                    continue
                 if line.startswith("RELAY_STAGE "):
-                    job["phase"] = line[len("RELAY_STAGE "):][:80]
-                    job["progress"] = None
+                    # Keep the aggregate job progress while backend stages change.
+                    if job.get("job_type") != "relayvsr":
+                        job["phase"] = line[len("RELAY_STAGE "):][:80]
+                        job["progress"] = None
                     continue
                 if job.get("job_type") == "beatsyncfx" and line.startswith("BEATSYNC_PROGRESS "):
                     try:
@@ -6161,7 +6168,8 @@ class MainWindow(QMainWindow):
                     except (ValueError, IndexError):
                         pass
                     continue
-                m = re.search(r"(?:^|\s)(\d{1,3})%\|", line)
+                m = (None if job.get("job_type") == "relayvsr" else
+                     re.search(r"(?:^|\s)(\d{1,3})%\|", line))
                 if m:
                     job["progress"] = max(0,min(100,int(m.group(1)))); job["phase"] = "Sampling"
                     sm = re.search(r"(?:^|\s)(\d+)\s*/\s*(\d+)(?:\s|\[|$)", line)
