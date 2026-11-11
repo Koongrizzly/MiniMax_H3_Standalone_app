@@ -1374,6 +1374,13 @@ class MainWindow(QMainWindow):
 
         pg = QGroupBox("Prompt"); pgl = QVBoxLayout(pg)
         self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText("Describe the full MiniMax H3 video, including sound/dialogue/music directions when wanted."); self.prompt.setMinimumHeight(150)
+        batch_row = QHBoxLayout()
+        self.import_batch_button = QPushButton("Import TXT / JSON batch...")
+        self.import_batch_button.setToolTip("Import prompts and optional per-clip settings into the regular generation queue.")
+        self.import_batch_button.clicked.connect(self._import_generation_batch)
+        batch_row.addWidget(self.import_batch_button)
+        batch_row.addStretch()
+        pgl.addLayout(batch_row)
         pgl.addWidget(self.prompt); v.addWidget(pg)
 
         self.fl_group = QGroupBox("FL2VA visual conditioning"); fl = QFormLayout(self.fl_group)
@@ -7454,6 +7461,168 @@ exit /b %RC%
                     "See MiniMax H3 log for the audio extractor error.")
         proc.finished.connect(finished)
         proc.start()
+
+    def _batch_resolution_settings(self, spec, settings):
+        """Map user-readable resolution labels and dimensions to native H3 GUI presets."""
+        resolution = spec.get("resolution", None)
+        width, height = spec.get("width"), spec.get("height")
+        if resolution is not None:
+            value = str(resolution).lower().replace(" ", "").replace("×", "x")
+            shortcuts = {"384p": (736, 384), "448p": (832, 448),
+                         "480p": (832, 448), "576p": (1024, 576),
+                         "704p": (1280, 704), "720p": (1280, 704),
+                         "768p": (1344, 768), "896p": (1600, 896),
+                         "1080p": (1920, 1088)}
+            if value in shortcuts:
+                width, height = shortcuts[value]
+            elif "x" in value:
+                a, b = value.split("x", 1)
+                width, height = int(a), int(b)
+            elif resolution in RESOLUTION_PRESETS:
+                settings["resolution"] = resolution
+                return
+            else:
+                raise ValueError(f"Unsupported resolution: {resolution}")
+        if width is None and height is None:
+            return
+        if width is None or height is None:
+            raise ValueError("Both width and height are required.")
+        width, height = int(width), int(height)
+        for name, dims in RESOLUTION_PRESETS.items():
+            for aspect, size in dims.items():
+                if size == (width, height):
+                    settings["resolution"] = name
+                    settings["aspect"] = aspect
+                    return
+        for name, size in WIDESCREEN_21_9_PRESETS.items():
+            if size == (width, height):
+                settings["aspect"] = "21:9"
+                settings["widescreen_quality"] = name
+                return
+        raise ValueError(f"Resolution {width} x {height} is not an H3 preset.")
+
+    def _import_generation_batch(self):
+        try:
+            from .minimax_batch_import import parse_file
+        except ImportError:
+            from minimax_batch_import import parse_file
+        selected, _ = QFileDialog.getOpenFileName(
+            self, "Import generation batch", _dialog_start_dir("generation_batch", fallback=ROOT),
+            "Batch files (*.txt *.json)")
+        if not selected:
+            return
+        _remember_dialog_folder("generation_batch", selected)
+        try:
+            specs = parse_file(selected)
+            # Validate the *whole* file before adding any jobs. Every clip derives
+            # from this one frozen snapshot, never from the previous batch clip.
+            snapshot = copy.deepcopy(self.settings_dict())
+            prepared = []
+            notes = []
+            for index, spec in enumerate(specs, 1):
+                settings = copy.deepcopy(snapshot)
+                overrides = {k:v for k,v in spec.items() if k not in (
+                    "name", "width", "height", "resolution", "audio_subject", "audio_subjects")}
+                if "mode" in overrides:
+                    raw = str(overrides["mode"]).lower()
+                    overrides["mode"] = ({"t2va": 0, "fl2va": 1, "ref2va": 2,
+                        "text to video": 0, "image to video": 1, "reference to video": 2}
+                        .get(raw, overrides["mode"]))
+                    overrides["mode"] = int(overrides["mode"])
+                    if overrides["mode"] not in (0, 1, 2):
+                        raise ValueError(f"Job {index}: unsupported mode {spec['mode']}")
+                settings.update(overrides)
+                # Every batch item is independent. Only non-reference generation
+                # settings inherit the frozen GUI snapshot. Never reuse stale
+                # images, video, audio, RefMods or their enable switches.
+                for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
+                    settings[key] = copy.deepcopy(spec.get(key, []))
+                settings["lock_source_audio"] = bool(spec.get("lock_source_audio", False))
+                settings["refmod_qwen_vision"] = bool(spec.get("refmod_qwen_vision", False))
+                settings["t2va_use_refmods"] = bool(spec.get("t2va_use_refmods", False))
+                # No lingering standalone first/last frames or continuation
+                # sources either; they must be explicitly requested per job.
+                for key in ("first", "last", "continue_video"):
+                    settings[key] = spec.get(key, "")
+                for key in ("continue_last_result", "glue_results",
+                            "continue_audio_memory", "latent_continuation",
+                            "combine_frames_latent"):
+                    settings[key] = bool(spec.get(key, False))
+                # Relative media paths are resolved beside the imported file.
+                source_dir = Path(selected).parent
+                for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
+                    if key in spec:
+                        settings[key] = [str((source_dir / p).resolve()) if not Path(p).is_absolute()
+                                         and not re.match(r"^[A-Za-z]:[\\/]", p) else p
+                                         for p in settings[key]]
+                self._batch_resolution_settings(spec, settings)
+                if "frames" in spec:
+                    requested = int(spec["frames"])
+                    if requested > NORMAL_FRAME_MAX and "experimental_long_duration" not in spec:
+                        settings["experimental_long_duration"] = True
+                    presets = (EXPERIMENTAL_FRAME_PRESETS if settings.get("experimental_long_duration")
+                               else FRAME_PRESETS)
+                    closest = min(presets, key=lambda n: (abs(n-requested), n))
+                    settings["frames"] = closest
+                    if closest != requested:
+                        notes.append(f"{index}: {requested} -> {closest} frames")
+                if "audio_subject" in spec:
+                    settings["audio_subjects"] = [int(spec["audio_subject"])]
+                elif "audio_subjects" in spec:
+                    settings["audio_subjects"] = [int(x) for x in spec["audio_subjects"]]
+                else:
+                    settings["audio_subjects"] = []
+                # Explicit ref/audio lists replace, rather than append to, the
+                # snapshot. Existing GUI settings are inherited only when omitted.
+                if settings.get("lock_source_audio") and not settings.get("ref_audios"):
+                    raise ValueError(f"Job {index}: exact audio is ON but Audio 1 is empty.")
+                for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
+                    for file in settings.get(key, []):
+                        if not Path(file).is_file():
+                            raise ValueError(f"Job {index}: missing {key} file:\n{file}")
+                if len(settings.get("ref_images", [])) > 9 or len(settings.get("ref_videos", [])) > 3 or len(settings.get("ref_audios", [])) > 3:
+                    raise ValueError(f"Job {index}: reference slot limit exceeded.")
+                if spec.get("name") and "output_name" not in spec:
+                    settings["output_name"] = str(spec["name"])
+                if not settings.get("prompt", "").strip():
+                    raise ValueError(f"Job {index}: empty prompt.")
+                prepared.append(settings)
+            summary = (f"Import {len(prepared)} generation jobs into the normal queue?\n\n"
+                       "Missing generation settings use the Generate tab values captured now.\n"
+                       "References, RefMods and exact-audio are cleared per job unless provided.")
+            if notes:
+                summary += "\n\nFrame normalization:\n" + "\n".join(notes[:10])
+                if len(notes) > 10:
+                    summary += f"\n... and {len(notes)-10} more"
+            if QMessageBox.question(self, "Import batch", summary,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+                return
+            added = 0
+            try:
+                for settings in prepared:
+                    # Reset to the frozen baseline between jobs, then apply this
+                    # clip's fully independent settings. Never mutate the job
+                    # dictionary to remove its audio subject metadata.
+                    self.apply_settings(snapshot)
+                    self.apply_settings(settings)
+                    self._timeline_ref_audio_subjects = list(settings.get("audio_subjects", []))
+                    before = len(self.queue_jobs)
+                    self.generate()  # existing native CLI/queue/RefMod/LoRA/VRAM path
+                    if len(self.queue_jobs) == before:
+                        break  # generation validation failed: never count it as queued
+                    added += 1
+            finally:
+                self._timeline_ref_audio_subjects = []
+                self.apply_settings(snapshot)
+                self.save_last()  # batch must not permanently change normal GUI settings
+            if added != len(prepared):
+                QMessageBox.warning(self, "Batch partially imported",
+                    f"Queued {added} of {len(prepared)} jobs. Import stopped after a job failed validation.")
+            else:
+                self.status.setText(f"Imported {added} batch jobs")
+        except Exception as exc:
+            QMessageBox.warning(self, "Batch import failed", str(exc))
 
     def generate(self):
         prompt=self.prompt.toPlainText().strip()
