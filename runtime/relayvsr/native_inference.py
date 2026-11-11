@@ -300,7 +300,7 @@ def graph_for_video(nodes,filename,scale):
         if resize_name not in nodes:
             raise RuntimeError('Native ComfyUI missing ImageScaleBy; cannot resize X4 restoration')
         resized=set_node(nodes,graph,resize_name,wire(nodes,resize_name,{
-            'images':decoded_images, 'upscale_method':'lanczos', 'scale_by':scale/4.0,
+            'image':decoded_images, 'upscale_method':'lanczos', 'scale_by':scale/4.0,
         }))
         decoded_images=[resized,index_of_output(nodes,resize_name,'IMAGE')]
 
