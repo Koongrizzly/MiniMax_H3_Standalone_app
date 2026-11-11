@@ -3322,7 +3322,7 @@ class MainWindow(QMainWindow):
 
     def _relay_install_status(self):
         py = ROOT / "environments" / "relayvsr" / "Scripts" / "python.exe"
-        inference = ROOT / "runtime" / "relayvsr" / "native_comfy" / "comfy" / "ldm" / "wan" / "model_vsr.py"
+        inference = ROOT / "models" / "relayvsr" / "native" / "native_comfy" / "comfy" / "ldm" / "wan" / "model_vsr.py"
         model_root = ROOT / "models" / "relayvsr" / "native"
         models = []
         for scale, wan, flash in ((4, "relayvsr_x4_int8_convrot.safetensors", "relayvsr_flash_vae_x4_fp32.safetensors"),):
