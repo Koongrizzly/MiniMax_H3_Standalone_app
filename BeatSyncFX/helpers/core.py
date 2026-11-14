@@ -97,7 +97,7 @@ def save_effects_template(path: str, project: dict) -> None:
     """
     dest = Path(path).resolve()
     dat = json.loads(json.dumps(project))
-    for key in ('video', 'audio', 'audio_envelopes_source', 'audio_envelopes'):
+    for key in ('video', 'audio', 'audio_envelopes_source', 'audio_envelopes', 'beat_analysis_source', 'beat_grid_manual', 'beat_confidence'):
         dat.pop(key, None)
     for key in ('width', 'height', 'duration'):
         dat.pop(key, None)
@@ -118,7 +118,7 @@ def load_effects_template(path: str, current_project: dict | None = None) -> dic
         raise ValueError('Not a BeatSync FX effects template. Use Load project for full project files.')
     base = json.loads(json.dumps(current_project)) if current_project else new_project()
     for key in ('lyrics_text', 'words', 'lyric_segments', 'events', 'media_layers', 'bpm', 't0'):
-        if key in dat:
+        if key in dat and not (key in ('bpm','t0') and (base.get('audio') or base.get('video'))):
             base[key] = dat[key]
     base['options'] = {**DEFAULT_OPTIONS, **base.get('options', {}), **dat.get('options', {})}
     # Audio envelope data belongs to the current audio. Never import it from a template.

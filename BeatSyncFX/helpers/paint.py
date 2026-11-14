@@ -11,7 +11,7 @@ from functools import lru_cache
 from collections import defaultdict
 
 from .lyric_visibility import active_words, visible_at
-from .audio_reactivity import reaction_transform, energy_at, spectrum_at
+from .audio_reactivity import reaction_transform, energy_at, spectrum_at, layer_reaction_values, screen_beat_pulse
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QImage, QTransform, QPolygonF
@@ -120,8 +120,7 @@ def _draw_beats(p: QPainter, w: int, h: int, t: float, project: dict, override=N
     if kind == 'Off' or kind in ('Horizontal Tearing', 'RGB Split', 'Frame Stutter',
                                  'Signal Dropout', 'Block Corruption', 'Impact Zoom'):
         return
-    strength, n = pulse(t, float(project.get('bpm', 120)), float(project.get('t0', 0)),
-                        float(o.get('beat_decay', .24)), int(o.get('beat_every', 1)))
+    strength, n, _ = screen_beat_pulse(project,t,o)
     if strength < 0.004:
         return
     alpha = strength * float(o.get('beat_intensity', 60)) / 100
@@ -398,7 +397,7 @@ def _draw_countdown(p, w, h, t, event, project):
               opacity=fade)
 
 
-def _draw_overlay(p, w, h, t, event):
+def _draw_overlay(p, w, h, t, event, project=None):
     """Image/GIF layer drawing through the same geometry and mask path as video."""
     start, end = float(event.get('start',0)),float(event.get('end',0))
     if not start <= t < end:
@@ -410,7 +409,7 @@ def _draw_overlay(p, w, h, t, event):
     # overlay_frame expects playback elapsed and applies its own speed.
     img = overlay_frame(str(event.get('text','')), source_t, 1.)
     if img is not None:
-        _draw_media_image(p,w,h,t,event,img)
+        _draw_media_image(p,w,h,t,event,img,project)
 
 
 # Visual effects are deterministic, transparent and clipped to event time boundaries.
@@ -1403,14 +1402,14 @@ def _paint_media_layers(p, width, height, t, project):
             img = provider.frame(index, layer, source_t) if provider else None
             if img is None:
                 continue
-            _draw_media_image(p, width, height, t, layer, img)
+            _draw_media_image(p, width, height, t, layer, img, project)
         else:
             # Reuse legacy animated image decoder and draw implementation.
             legacy = dict(layer, text=path)
-            _draw_overlay(p, width, height, t, legacy)
+            _draw_overlay(p, width, height, t, legacy, project)
 
 
-def _draw_media_image(p, w, h, t, layer, img):
+def _draw_media_image(p, w, h, t, layer, img, project=None):
     """Shared alpha, shape clipping and keyframe transform for all media types."""
     from .media_layers import geometry_at
     animated = geometry_at(layer,t)
@@ -1425,11 +1424,34 @@ def _draw_media_image(p, w, h, t, layer, img):
     x = w*float(animated.get('x',50))/100
     y = h*float(animated.get('y',50))/100
     shape = str(layer.get('mask','Rectangle'))
+    sx = sy = 1.0
+    rotation = float(animated.get('rotation',0))
+    flashes = []; glows = []; splits = []; shifts = []; ripple = 0.
+    for fx, v in layer_reaction_values(layer, project or {}, t):
+        if v <= 0: continue
+        kind = fx['kind']; tint = fx.get('color', '#22DDEE')
+        if kind == 'Bass Speaker':
+            sx *= 1+v*.60; sy *= 1+v*.60
+        elif kind == 'Beat Zoom': sx *= 1+v*.75; sy *= 1+v*.75
+        elif kind == 'Elastic Pulse': sx *= 1+v*.75; sy *= max(.15,1-v*.38)
+        elif kind == 'Horizontal Stretch': sx *= 1+v*.85
+        elif kind == 'Vertical Stretch': sy *= 1+v*.85
+        elif kind == 'Beat Bounce': y -= h*v*.10
+        elif kind == 'Bass Shake':
+            x += w*v*.045*math.sin(t*math.tau*13); y += h*v*.035*math.cos(t*math.tau*17)
+        elif kind == 'Reactive Rotation': rotation += 25*v*math.sin(t*math.tau*2)
+        elif kind == 'Reactive Opacity': alpha *= max(0.,1-v*.85)
+        elif kind == 'Beat Flash': flashes.append(v)
+        elif kind == 'Reactive Glow': glows.append((v,tint))
+        elif kind == 'RGB Split': splits.append(v)
+        elif kind == 'Color Shift': shifts.append((v,tint))
+        elif kind == 'Reactive Ripple': ripple += v
+    ww *= max(.05,min(4.,sx)); hh *= max(.05,min(4.,sy))
     p.save()
     p.setRenderHint(QPainter.RenderHint.Antialiasing,True)
     p.setOpacity(alpha)
     p.translate(x,y)
-    p.rotate(float(animated.get('rotation',0)))
+    p.rotate(rotation)
     rect = QRectF(-ww/2,-hh/2,ww,hh)
     if shape != 'Rectangle':
         clip = QPainterPath()
@@ -1443,7 +1465,42 @@ def _draw_media_image(p, w, h, t, layer, img):
         else:
             clip.addRect(rect)
         p.setClipPath(clip, Qt.ClipOperation.IntersectClip)
-    p.drawImage(rect,img)
+    # Tint copies preserve the actual source alpha. Effects never modify cached frames.
+    def tinted(hex_color):
+        result = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied).copy()
+        qp = QPainter(result)
+        qp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        qp.fillRect(result.rect(), QColor(hex_color)); qp.end()
+        return result
+    for v, tint in glows:
+        ghost = tinted(tint)
+        for spread in (1+.24*v, 1+.16*v, 1+.08*v):
+            p.setOpacity(clamp(alpha*v*.25))
+            p.drawImage(QRectF(-ww*spread/2,-hh*spread/2,ww*spread,hh*spread),ghost)
+    p.setOpacity(alpha)
+    if ripple > 0:
+        strips = min(40,max(1,img.height()))
+        for j in range(strips):
+            a=j/strips; b=(j+1)/strips
+            offset=ww*.12*min(2.,ripple)*math.sin(a*math.tau*2-t*math.tau*3)
+            p.drawImage(QRectF(-ww/2+offset,-hh/2+hh*a,ww,hh*(b-a)),img,
+                        QRectF(0,img.height()*a,img.width(),img.height()*(b-a)))
+    else:
+        p.drawImage(rect,img)
+    if splits:
+        import numpy as np
+        rgba = img.convertToFormat(QImage.Format.Format_RGBA8888)
+        pixels = np.frombuffer(rgba.constBits(), dtype=np.uint8).reshape(rgba.height(), rgba.bytesPerLine())[:, :rgba.width()*4].reshape(rgba.height(), rgba.width(), 4)
+        for v in splits:
+            for offset, channels in ((-1, (1,2)), (1, (0,))):
+                data = pixels.copy()
+                data[:,:,list(channels)] = 0
+                ghost = QImage(data.tobytes(), rgba.width(), rgba.height(), rgba.width()*4, QImage.Format.Format_RGBA8888).copy()
+                p.setOpacity(clamp(alpha*v*.85))
+                p.drawImage(rect.translated(offset*w*.025*v,0),ghost)
+    for v,tint in shifts + [(v,'#FFFFFF') for v in flashes]:
+        p.setOpacity(clamp(alpha*v*.9))
+        p.drawImage(rect,tinted(tint))
     p.restore()
 
 def paint_effects(p: QPainter, width: int, height: int, t: float, project: dict):
@@ -1466,7 +1523,10 @@ def paint_effects(p: QPainter, width: int, height: int, t: float, project: dict)
                         'beat_intensity': event.get('beat_intensity',60),
                         'beat_decay': event.get('beat_decay',.24),
                         'beat_color': event.get('color','#22DDEE'),
-                        'beat_palette': event.get('beat_palette','Solid')}
+                        'beat_palette': event.get('beat_palette','Solid'),
+                        'beat_trigger': event.get('beat_trigger'),
+                        'beat_chance': event.get('beat_chance',50), 'start':event.get('start',0),
+                        'style':event.get('style','')}
                 _draw_beats(p,width,height,t,project,opts)
         else:
             _draw_event(p, width, height, t, geometry_at(event,t), project)

@@ -1,8 +1,8 @@
 """Prepare source-specific audio envelopes before any render frames are drawn."""
 from pathlib import Path
 
-from .core import decode_mono
-from .audio_reactivity import extract_envelopes
+from .core import decode_mono, analyze_audio
+from .audio_reactivity import extract_envelopes, layer_reaction_mode
 
 
 def audio_signature(project):
@@ -17,10 +17,40 @@ def audio_signature(project):
         return None
 
 
+def needs_beat_grid(project):
+    if project.get('options',{}).get('beat_style','Off')!='Off':return True
+    if any((str(e.get('style','')).startswith('Beat: ') and e.get('beat_trigger')!='Continuous')
+           or e.get('style')=='Beat punch' for e in project.get('events',[])):return True
+    return any(fx.get('enabled',True) and (fx.get('source')=='Beat' or layer_reaction_mode(fx)=='Beat Punch')
+               for layer in project.get('media_layers',[]) for fx in layer.get('media_reactions',[]))
+
+
+def prepare_render_tempo(project,ffmpeg,status=None):
+    """Queue snapshots can be taken while GUI analysis is still pending.
+    Respect older projects' saved grids; resolve source-specific pending/new grids.
+    """
+    signature=audio_signature(project)
+    if signature is None or 'beat_analysis_source' not in project:return
+    if project.get('beat_analysis_source')==signature:return
+    if status:status('Detecting current soundtrack tempo before rendering...')
+    try:
+        result=analyze_audio(ffmpeg,signature['path'])
+    except Exception:
+        if needs_beat_grid(project):raise
+        return
+    if audio_signature(project)!=signature:raise ValueError('The audio source changed during tempo analysis.')
+    project['bpm']=result['bpm'];project['t0']=round(result['t0'],3)
+    project['beat_confidence']=result.get('confidence',0)
+    project['beat_analysis_source']=signature;project['beat_grid_manual']=False
+
+
 def needs_audio_analysis(project):
-    return any(e.get('style') in ('Equalizer 3-Band', 'Equalizer 12-Band', 'Beat Heart')
+    return any(e.get('style') in ('Equalizer 3-Band', 'Equalizer 12-Band', 'Equalizer LED', 'Equalizer Radial', 'Equalizer Mirror', 'Beat Heart')
                or e.get('audio_react', 'Off') != 'Off'
-               for e in project.get('events', []))
+               for e in project.get('events', [])) or any(
+                   fx.get('enabled', True) and fx.get('source', 'Bass') != 'Beat'
+                   for layer in project.get('media_layers', [])
+                   for fx in layer.get('media_reactions', []))
 
 
 def analysis_current(project, signature):
@@ -32,11 +62,12 @@ def analysis_current(project, signature):
 
 
 def prepare_render_audio(project, ffmpeg, status=None):
-    """Update only the audio cache; preserve BPM, beat offset, lyrics and cues.
+    """Update source-specific rhythm and frequency caches; preserve verified/manual grids, lyrics and cues.
 
     Runs in the render thread. Fail before creating an output if the required
     analysis cannot be produced, rather than silently exporting inactive effects.
     """
+    prepare_render_tempo(project,ffmpeg,status)
     if not needs_audio_analysis(project):
         return None
     signature = audio_signature(project)

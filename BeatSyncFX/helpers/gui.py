@@ -363,7 +363,7 @@ class Preview(QWidget):
             e=self.app.project['events'][idx]
             if not (float(e.get('start',0)) <= self.app.current_time() < float(e.get('end',0))):
                 continue
-            if e.get('style') in ('Countdown','Image / GIF'):
+            if e.get('style') in ('Countdown','Image / GIF') or str(e.get('style','')).startswith('Beat: '):
                 continue
             w,h,_,_,_=self._canvas()
             cx=w*float(e.get('x',50))/100; cy=h*float(e.get('y',50))/100
@@ -592,23 +592,29 @@ class Preview(QWidget):
             paint_effects(p, w, h, self.app.current_time(), project)
         finally:
             project.pop('_media_frame_provider', None)
-        if hasattr(self.app,'media_tab') and self.app.tabs.currentWidget()==self.app.media_tab:
+        if (hasattr(self.app,'media_tab') and self.app.tabs.currentWidget()==self.app.media_tab
+                and self.app.media_outline.isChecked()
+                and not (self.app.player and self.app.player.playbackState()==QMediaPlayer.PlaybackState.PlayingState)):
             row=self.app.media_table.currentRow()
             layers=project.get('media_layers',[])
             if 0<=row<len(layers):
                 layer=layers[row]
                 if float(layer.get('start',0))<=self.app.current_time()<float(layer.get('end',0)):
                     from PySide6.QtCore import QRectF
-                    cx=w*float(layer.get('x',50))/100
-                    cy=h*float(layer.get('y',50))/100
-                    ww=max(1,float(layer.get('size',300))*min(w/1280,h/720))
-                    hh=ww/max(.1,float(layer.get('source_ratio',16/9)))
-                    p.save();p.translate(cx,cy);p.rotate(float(layer.get('rotation',0)))
+                    from .media_layers import geometry_at
+                    geom=geometry_at(layer,self.app.current_time())
+                    cx=w*float(geom.get('x',50))/100
+                    cy=h*float(geom.get('y',50))/100
+                    ww=max(1,float(geom.get('size',300))*min(w/1280,h/720))
+                    ratio=self.app._media_ratio(layer)
+                    hh=ww/max(.01,ratio)
+                    if layer.get('mask')=='Circle':ww=hh=min(ww,hh)
+                    p.save();p.translate(cx,cy);p.rotate(float(geom.get('rotation',0)))
                     p.setPen(QColor('#36D4ED'));p.setBrush(Qt.BrushStyle.NoBrush)
                     p.drawRect(QRectF(-ww/2,-hh/2,ww,hh))
                     p.restore()
         idx=getattr(self,'selected',None)
-        if idx is not None and idx<len(project.get('events',[])) and float(project['events'][idx].get('start',0)) <= self.app.current_time() < float(project['events'][idx].get('end',0)):
+        if (not hasattr(self.app,'media_tab') or self.app.tabs.currentWidget()!=self.app.media_tab) and idx is not None and idx<len(project.get('events',[])) and not str(project['events'][idx].get('style','')).startswith('Beat: ') and float(project['events'][idx].get('start',0)) <= self.app.current_time() < float(project['events'][idx].get('end',0)):
             from .shape_keyframes import geometry_at
             e=geometry_at(project['events'][idx], self.app.current_time())
             cx=w*float(e.get('x',50))/100;cy=h*float(e.get('y',50))/100
@@ -852,6 +858,8 @@ class MainWindow(QMainWindow):
         seeks.addWidget(button('◀ Previous beat', lambda: self.jump_beat(-1)))
         seeks.addWidget(button('Next beat ▶', lambda: self.jump_beat(1)))
         seeks.addWidget(button('Set first beat here', self.set_first_beat))
+        self.bpm_status = button('BPM: —', self.show_beat_settings, 'Automatic tempo analysis; click to correct BPM or first beat.')
+        seeks.addWidget(self.bpm_status)
         seeks.addStretch()
         self.preview_note = QLabel('Preview plays the original footage; graphics are composited by the same Qt renderer used for export.')
         self.preview_note.setWordWrap(True)
@@ -866,6 +874,7 @@ class MainWindow(QMainWindow):
         self._build_events_tab()
         self._build_media_tab()
         self._build_export_tab()
+        self.tabs.currentChanged.connect(lambda _:self.preview.update())
 
         footer = QHBoxLayout(); whole.addLayout(footer)
         self.status = QLabel('No online services required')
@@ -884,8 +893,11 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence('Ctrl+S'), self, activated=self.save_project_dialog)
 
     def _build_sync_tab(self):
-        panel = QWidget(); layout = QVBoxLayout(panel)
-        beat = QGroupBox('Beat grid (editable after detection)'); layout.addWidget(beat)
+        self.beat_dialog = QDialog(self)
+        self.beat_dialog.setWindowTitle('Tempo / beat grid')
+        self.beat_dialog.resize(480, 260)
+        panel = self.beat_dialog; layout = QVBoxLayout(panel)
+        beat = QGroupBox('Beat grid'); layout.addWidget(beat)
         frm = QFormLayout(beat)
         self.bpm = spin_double(40, 260, 120, 2, .5)
         self.t0 = spin_double(0, 9999, 0, 3, .01)
@@ -893,15 +905,16 @@ class MainWindow(QMainWindow):
         frm.addRow('First beat (seconds)', self.t0)
         self.bpm.valueChanged.connect(lambda v: self.change_value('bpm', v))
         self.t0.valueChanged.connect(lambda v: self.change_value('t0', v))
-        frm.addRow(button('Analyze beats from audio (offline)', self.analyze))
+        frm.addRow(button('Re-detect tempo', self.analyze))
         frm.addRow(button('Import beatmap.json', self.import_beatmap))
-        tip = QLabel('Uses local FFmpeg + NumPy. Kick-based estimates can land on half/double tempo or shift on unusual rhythms. Adjust BPM and first beat by ear.')
+        tip = QLabel('Detected automatically. Correct half/double tempo or first beat here if needed.')
         tip.setWordWrap(True); layout.addWidget(tip)
         layout.addWidget(button('×2 BPM', lambda: self.bpm.setValue(min(260, self.bpm.value()*2))))
         layout.addWidget(button('÷2 BPM', lambda: self.bpm.setValue(max(40, self.bpm.value()/2))))
 
         group = QGroupBox('Timed beat effects — multiple effects, independent durations')
         layout.addWidget(group)
+        group.hide()  # Legacy widgets retained for project compatibility.
         style = QFormLayout(group)
         self.beat_style = fixed_combo(['Off', *BEAT_EFFECTS], 'Off')
         self.beat_every = spin_int(1, 16, 1)
@@ -938,16 +951,27 @@ class MainWindow(QMainWindow):
         style.addRow(self.beat_timed_table)
         self.legacy_beat_note=QLabel('')
         layout.addWidget(self.legacy_beat_note)
-        layout.addWidget(button('Disable old full-video beat effect',self.disable_legacy_beat))
+        self.legacy_beat_disable=button('Disable old full-video beat effect',self.disable_legacy_beat)
+        layout.addWidget(self.legacy_beat_disable);self.legacy_beat_disable.hide();self.legacy_beat_note.hide()
         note=QLabel('Beat effects share the song beat grid but each has its own Start/End and settings. '
                     'Video Distortion effects modify the footage itself; color/rainbow apply only to graphic overlays. '
                     'Frame Stutter freezes the video momentarily while music stays in sync. '
                     'Multiple effects can be layered.')
         note.setWordWrap(True)
-        layout.addWidget(note)
         self._beat_event_indices=[]
-        layout.addStretch()
-        self.tabs.addTab(scroll_pane(panel), 'Beat sync')
+        def accept_grid():
+            self.project['beat_analysis_source']=self._band_audio_signature()
+            self.project['beat_grid_manual']=True
+            self._update_bpm_status(); self.beat_dialog.accept()
+        layout.addWidget(button('Use current BPM / offset',accept_grid))
+        layout.addWidget(button('Close', self.beat_dialog.accept))
+
+    def show_beat_settings(self):
+        self.beat_dialog.exec()
+
+    def _update_bpm_status(self, suffix=''):
+        if hasattr(self, 'bpm_status'):
+            self.bpm_status.setText(f"BPM: {float(self.project.get('bpm',120)):.2f}" + suffix if self.project.get('video') or self.project.get('audio') else 'BPM: —')
 
     def disable_legacy_beat(self):
         self.project.setdefault('options',{})['beat_style']='Off'
@@ -972,6 +996,7 @@ class MainWindow(QMainWindow):
         if hasattr(self,'legacy_beat_note'):
             old=self.project.get('options',{}).get('beat_style','Off')
             self.legacy_beat_note.setText('Old project global beat effect still enabled: '+str(old) if old!='Off' else '')
+            self.legacy_beat_note.setVisible(old!='Off');self.legacy_beat_disable.setVisible(old!='Off')
         table=self.beat_timed_table
         previous=self._timed_beat_selected_index()
         self._beat_event_indices=[i for i,e in enumerate(self.project.get('events',[]))
@@ -1163,7 +1188,8 @@ class MainWindow(QMainWindow):
         # Browser-only organization: the underlying effect style strings stay unchanged.
         self.effect_style = fixed_combo(
             ['Text Overlay', 'Pop Open', 'Side Slam', 'Stamp', 'Slide in', 'Beat punch',
-             'Wobble', 'Glitch', 'Neon tag', *MOTION_STUDIO_STYLES], 'Echo Typography')
+             'Wobble', 'Glitch', 'Neon tag', *MOTION_STUDIO_STYLES,
+             *('Beat: '+name for name in BEAT_EFFECTS)], 'Echo Typography')
         self.effect_style.hide()  # Keep compatibility with all existing effect handlers.
         effect_header = QHBoxLayout(); layout.addLayout(effect_header)
         effect_header.addWidget(QLabel('Effect library:'))
@@ -1226,7 +1252,7 @@ class MainWindow(QMainWindow):
         actions = QHBoxLayout(); layout.addLayout(actions)
         actions.addWidget(button('Add countdown', self.add_countdown))
         # PNG/GIF/video overlays live in the dedicated Media Layers tab.
-        self.composite_edit_button = button('Edit selected effect', self.edit_composite_effect)
+        self.composite_edit_button = button('Edit selected effect', self.edit_composite_effect, 'Edit the selected effect, including screen glitch timing and intensity.')
         actions.addWidget(self.composite_edit_button)
         actions.addWidget(button('Delete selected', self.delete_event))
         self.typography_panel = QWidget(); layout.addWidget(self.typography_panel)
@@ -1305,7 +1331,6 @@ class MainWindow(QMainWindow):
         self.audio_smooth=spin_int(0,1000,120)
         audio_bar.addWidget(self.audio_smooth)
         audio_bar.addWidget(button('Apply reaction',self.apply_audio_reaction))
-        layout.addWidget(QLabel('Analyze music once, then set Bass / Midrange / Treble / Overall Energy per selected effect. Preview and export use saved analysis data.'))
         layout.addWidget(QLabel('Motion settings apply to selected timeline row(s); they never change Start/End timestamps.'))
         layout.addWidget(QLabel('Visual timeline: drag an effect to move it; drag its right edge to resize. Double-click table cells for exact values.'))
         self.effects_timeline=EffectsTimeline(self)
@@ -1337,7 +1362,7 @@ class MainWindow(QMainWindow):
           'Heartbeat', 'Kinetic Grid')),
         ('Visual & Glitch', '#D7A35A', ('Glitch', 'Particle Spray', 'Neon Rings',
           'Lightning Bolts', 'Glitch Blocks', 'Film Burn', 'Starfield Rush',
-          'Halftone Burst', 'Warning Stripes')),
+          'Halftone Burst', 'Warning Stripes', *('Beat: '+name for name in BEAT_EFFECTS))),
         ('Tracking & HUD', '#75AADB', ('Radar Sweep', 'Speedometer HUD', 'Warning Meter',
           'Scanning HUD', 'Linked Callout', 'Data Card', 'Analysis Panel / Counter',
           'Planar Overlay')),
@@ -1384,6 +1409,20 @@ class MainWindow(QMainWindow):
         'Animated Arrows': 'Moving direction arrows',
         'Arrow Impact': 'Arrow flies into a target',
         'Rotary Mechanism': 'Spinning mechanical graphic',
+        'Beat: Beat scanline': 'Screen scanline on the beat',
+        'Beat: Horizontal Tearing': 'Horizontal strips of footage shift sideways',
+        'Beat: RGB Split': 'Separate video color channels',
+        'Beat: Frame Stutter': 'Momentarily freeze the source video frame',
+        'Beat: Signal Dropout': 'Intermittent black and noisy signal strips',
+        'Beat: Block Corruption': 'Digital block corruption of the footage',
+        'Beat: Impact Zoom': 'Sudden full-frame zoom on the beat',
+        'Beat: Border pulse': 'Screen border pulses to the beat',
+        'Beat: Side bars': 'Beat-driven bars along screen edges',
+        'Beat: Circle kick': 'Circular pulse with the beat',
+        'Beat: Full-frame flash': 'Full screen color flash',
+        'Beat: Beat grid': 'Grid accents on the beat',
+        'Beat: Beat rays': 'Radial rays on the beat',
+        'Beat: Beat diamonds': 'Expanding diamond outlines on beats',
     }
 
     def _build_effect_browser(self):
@@ -1420,7 +1459,7 @@ class MainWindow(QMainWindow):
 
     def _effect_add_tree_item(self, parent, name, color):
         desc = self._EFFECT_DESCRIPTIONS.get(name, self._describe_other_effect(name))
-        item = QTreeWidgetItem([name, desc])
+        item = QTreeWidgetItem([name.removeprefix('Beat: '), desc])
         item.setData(0, Qt.ItemDataRole.UserRole, name)
         item.setToolTip(0, desc)
         item.setToolTip(1, desc)
@@ -1458,7 +1497,7 @@ class MainWindow(QMainWindow):
         name = current.data(0, Qt.ItemDataRole.UserRole)
         if name:
             self.effect_style.setCurrentText(name)
-            self.effect_hint.setText('%s — %s' % (name, current.text(1)))
+            self.effect_hint.setText('%s — %s' % (current.text(0), current.text(1)))
 
     def _effect_browser_add(self, item, column):
         name = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1474,7 +1513,7 @@ class MainWindow(QMainWindow):
             self.effect_tree.blockSignals(True)
             self.effect_tree.setCurrentItem(item)
             self.effect_tree.blockSignals(False)
-        self.effect_hint.setText('%s — %s' % (name, item.text(1)))
+        self.effect_hint.setText('%s — %s' % (item.text(0), item.text(1)))
 
     def _effect_category_changed(self, item):
         if self.effect_search.text().strip():
@@ -1535,6 +1574,10 @@ class MainWindow(QMainWindow):
 
     def change_value(self,key,value):
         self.project[key]=value
+        if key in ('bpm','t0') and not getattr(self,'_setting_detected_grid',False):
+            self.project['beat_analysis_source']=self._band_audio_signature()
+            self.project['beat_grid_manual']=True
+            self._update_bpm_status()
         self.preview.update()
 
     def change_option(self,key,value):
@@ -1569,6 +1612,7 @@ class MainWindow(QMainWindow):
         self.lyrics_editor.blockSignals(False)
         self.refresh_word_table(); self.refresh_event_table(); self.refresh_lyric_segments()
         self.path_label.setText(Path(p['video']).name if p.get('video') else 'No video selected')
+        self._update_bpm_status(' · unverified' if self._band_audio_signature() and p.get('beat_analysis_source')!=self._band_audio_signature() else '')
         self.preview.update()
 
     def current_time(self):
@@ -1618,6 +1662,7 @@ class MainWindow(QMainWindow):
     def play_state(self,state):
         playing=state==QMediaPlayer.PlaybackState.PlayingState
         self.play_button.setText('Ⅱ Pause' if playing else '▶ Play')
+        self.preview.update()
         if self.project.get('audio'):
             if playing:
                 self.music_player.setPosition(self.player.position())
@@ -1666,11 +1711,11 @@ class MainWindow(QMainWindow):
         if self.player:
             self.player.stop()
             self.player.setSource(QUrl.fromLocalFile(path))
-            if self.project.get('audio'):
-                self.audio_output.setMuted(True)
+            self.audio_output.setMuted(bool(self.project.get('audio')))
         self.path_label.setText(Path(path).name)
         self.set_time(0)
         self.preview.update()
+        self._ensure_audio_analysis()
         return True
 
     def open_video(self):
@@ -1691,6 +1736,7 @@ class MainWindow(QMainWindow):
                 self.music_player.setSource(QUrl.fromLocalFile(path))
                 self.audio_output.setMuted(True)
             self.status.setText(f'Replacement audio: {Path(path).name} (used for analysis and export)')
+            self._ensure_audio_analysis()
 
     def _update_beatsync_setup_label(self):
         """Only inspect our own environment; never use the GrizzlyMax Python installation."""
@@ -1755,6 +1801,7 @@ class MainWindow(QMainWindow):
             self.settings['ffmpeg']=newexe; save_settings(self.settings)
             self.ffmpeg_button.setText('Re-locate FFmpeg')
             self.status.setText('FFmpeg configured: '+newexe)
+            self._ensure_audio_analysis()
 
     def load_project_dialog(self):
         path,_=QFileDialog.getOpenFileName(self,'Load BeatSync FX project','', 'BeatSync FX JSON (*.json)')
@@ -1765,6 +1812,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.message(str(exc)); return
         self.project=p; self.project_file=path
+        # Preserve non-default legacy grids; analyze untouched default grids.
+        if 'beat_analysis_source' not in p and self._band_audio_signature():
+            if float(p.get('bpm',120))!=120 or float(p.get('t0',0))!=0:
+                p['beat_analysis_source']=self._band_audio_signature()
+                p['beat_grid_manual']=True
+            else:
+                p['beat_analysis_source']=None
         self._preview_media_provider.close()
         self._refresh_controls()
         if p.get('video'):
@@ -1772,6 +1826,7 @@ class MainWindow(QMainWindow):
         if p.get('audio') and self.player:
             self.music_player.setSource(QUrl.fromLocalFile(p['audio']))
             self.audio_output.setMuted(True)
+        self._ensure_audio_analysis()
         self.status.setText('Loaded project: '+Path(path).name)
 
     def load_template_dialog(self):
@@ -1785,6 +1840,7 @@ class MainWindow(QMainWindow):
             self.message('Cannot load effects template: '+str(exc)); return
         self.project=p
         self._preview_media_provider.close()
+        self._ensure_audio_analysis()
         # A template does not change the current full project's save destination.
         self._refresh_controls()
         self.status.setText('Applied effects template to current media: '+Path(path).name)
@@ -1816,17 +1872,55 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
 
+    def _ensure_audio_analysis(self):
+        signature=self._band_audio_signature()
+        if not signature or not self.ffmpeg:return
+        if self.project.get('beat_analysis_source')!=signature:
+            self.project['beat_analysis_source']=None
+            self.project['beat_grid_manual']=False
+            self.bpm_status.setText('BPM: analyzing…')
+            self._start_beat_analysis(signature)
+        else:
+            self._update_bpm_status()
+        if not self._audio_bands_current():
+            self.project.pop('audio_envelopes',None);self.project.pop('audio_envelopes_source',None)
+            self.analyze_bands()
+
     def analyze(self):
-        audio=self.project.get('audio') or self.project.get('video')
-        if not audio or not self.ffmpeg:
-            self.message('Open an audio or video file and select FFmpeg first.'); return
-        if self._worker and self._worker.isRunning():
-            self.message('An analysis is already running.'); return
-        self.status.setText('Analyzing rhythm locally...')
-        self._worker=BeatWorker(self.ffmpeg,audio)
-        self._worker.ready.connect(self.beats_ready)
-        self._worker.failed.connect(lambda e:self.message('Beat analysis failed:\n'+e))
-        self._worker.start()
+        signature=self._band_audio_signature()
+        if not signature or not self.ffmpeg:
+            self.message('Open an audio or video file and select FFmpeg first.');return
+        self.project.pop('beat_analysis_source',None)
+        self.project['beat_grid_manual']=False
+        self._start_beat_analysis(signature)
+        if not self._audio_bands_current():self.analyze_bands()
+
+    def _start_beat_analysis(self,signature):
+        if getattr(self,'_beat_worker',None) and self._beat_worker.isRunning():return
+        self.bpm_status.setText('BPM: analyzing…')
+        self.project['beat_analysis_source']=None
+        self.project['beat_grid_manual']=False
+        self._beat_job_signature=signature
+        self._beat_job_project=self.project
+        self._beat_worker=BeatWorker(self.ffmpeg,signature['path'])
+        self._beat_worker.ready.connect(self._auto_beats_ready)
+        self._beat_worker.failed.connect(self._auto_beats_failed)
+        self._beat_worker.finished.connect(self._beat_job_finished)
+        self._beat_worker.start()
+
+    def _auto_beats_ready(self,result):
+        if self._beat_job_signature!=self._band_audio_signature() or self._beat_job_project is not self.project:return
+        if self.project.get('beat_analysis_source')==self._beat_job_signature:return
+        self.beats_ready(result)
+
+    def _auto_beats_failed(self,error):
+        if self._beat_job_signature==self._band_audio_signature() and self._beat_job_project is self.project and self.project.get('beat_analysis_source')!=self._beat_job_signature:
+            self._update_bpm_status(' · unverified')
+            self.status.setText('Tempo detection failed. Click BPM to set tempo manually: '+error.splitlines()[0])
+
+    def _beat_job_finished(self):
+        if self._beat_job_signature!=self._band_audio_signature() or self._beat_job_project is not self.project:
+            QTimer.singleShot(0,self._ensure_audio_analysis)
 
     def import_beatmap(self):
         path,_=QFileDialog.getOpenFileName(self,'Import Slopcore beatmap.json','',
@@ -1835,12 +1929,22 @@ class MainWindow(QMainWindow):
         try:
             data=import_beatmap(path)
             self.bpm.setValue(data['bpm']);self.t0.setValue(data['t0'])
+            self.project['beat_analysis_source']=self._band_audio_signature();self.project['beat_grid_manual']=True
+            self._update_bpm_status()
             self.status.setText('Loaded beat grid from '+Path(path).name)
         except (OSError, ValueError, KeyError) as exc:
             self.message('Cannot import beatmap: '+str(exc))
 
     def beats_ready(self,result):
-        self.bpm.setValue(result['bpm']); self.t0.setValue(result['t0'])
+        self._setting_detected_grid=True
+        try:
+            self.bpm.setValue(result['bpm']); self.t0.setValue(result['t0'])
+        finally:
+            self._setting_detected_grid=False
+        self.project['beat_analysis_source']=self._band_audio_signature()
+        self.project['beat_grid_manual']=False
+        self.project['beat_confidence']=result.get('confidence',0)
+        self._update_bpm_status()
         self.status.setText(f"Detected {result['bpm']} BPM, first beat {result['t0']:.3f}s; rough grid match {result['confidence']:.2f}. Check by listening.")
 
     def on_lyrics_edit(self):
@@ -2653,6 +2757,40 @@ class MainWindow(QMainWindow):
         self.preview.selected=len(self.project['events'])-1
         self.preview.update()
 
+    def edit_screen_beat_effect(self, ev, idx):
+        dlg=QDialog(self); dlg.setWindowTitle('Edit '+ev['style'][6:])
+        form=QFormLayout(dlg)
+        start=spin_double(0,999999,float(ev.get('start',0)),3,.01)
+        end=spin_double(0,999999,float(ev.get('end',5)),3,.01)
+        trigger=fixed_combo(['Every beat','Random beats','Continuous'],ev.get('beat_trigger','Every beat'))
+        every=spin_int(1,16,int(ev.get('beat_every',1)))
+        chance=spin_int(0,100,int(ev.get('beat_chance',50)))
+        intensity=spin_int(0,100,int(ev.get('beat_intensity',60)))
+        decay=spin_int(30,1500,round(float(ev.get('beat_decay',.24))*1000),10)
+        color=ColorPickerField(ev.get('color','#22DDEE'))
+        palette=fixed_combo(['Solid','Rainbow'],ev.get('beat_palette','Solid'))
+        for label,control in [('Start (s)',start),('End (s)',end),('Trigger',trigger),('Every N beats',every),('Chance %',chance),('Intensity %',intensity),('Pulse (ms)',decay),('Color',color),('Color mode',palette)]:
+            form.addRow(label,control)
+        def mode_changed(*_):
+            every.setEnabled(trigger.currentText()!='Continuous')
+            chance.setEnabled(trigger.currentText()=='Random beats')
+            decay.setEnabled(trigger.currentText()!='Continuous')
+        trigger.currentTextChanged.connect(mode_changed); mode_changed()
+        if ev['style'][6:] in ('Horizontal Tearing','RGB Split','Frame Stutter','Signal Dropout','Block Corruption','Impact Zoom'):
+            color.setEnabled(False); palette.setEnabled(False)
+        if ev['style'][6:]=='Frame Stutter':
+            trigger.setToolTip('Continuous holds the frame at the start of the selected range.')
+        def apply():
+            finish=min(end.value(),float(self.project.get('duration') or end.value()))
+            if finish<=start.value():
+                QMessageBox.warning(dlg,'Invalid range','End must be after Start.'); return
+            ev.update(start=start.value(),end=finish,beat_trigger=trigger.currentText(),beat_every=every.value(),
+                      beat_chance=chance.value(),beat_intensity=intensity.value(),beat_decay=decay.value()/1000.,
+                      color=color.value_edit.text(),beat_palette=palette.currentText())
+            self.refresh_event_table();self.event_table.selectRow(idx);self.preview.update();dlg.accept()
+        row=QHBoxLayout();row.addWidget(button('Cancel',dlg.reject));row.addWidget(button('Apply',apply));form.addRow(row)
+        dlg.exec()
+
     def edit_composite_effect(self):
         rows=sorted({item.row() for item in self.event_table.selectedItems()})
         if not rows:
@@ -2662,6 +2800,8 @@ class MainWindow(QMainWindow):
         if idx>=len(self.project.get('events',[])):return
         ev=self.project['events'][idx]
         style=ev.get('style','')
+        if style.startswith('Beat: '):
+            self.edit_screen_beat_effect(ev, idx); return
         if style not in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout',
                          'Equalizer 3-Band','Equalizer 12-Band','Equalizer LED','Equalizer Radial','Equalizer Mirror'):
             QMessageBox.information(self,'Select an effect','This effect does not have specialized settings.')
@@ -2856,19 +2996,31 @@ class MainWindow(QMainWindow):
         is_text=style in ('Text Overlay','Pop Open','Side Slam','Stamp','Slide in',
                           'Beat punch','Wobble','Glitch','Neon tag','Echo Typography',
                           'Word Storm','Corner Label','Scrolling Ticker','Text Reveal','Scramble Title','Rolling Number','Speech Balloon / Callout')
-        self.composite_edit_button.setVisible(style in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout','Equalizer 3-Band','Equalizer 12-Band','Equalizer LED','Equalizer Radial','Equalizer Mirror'))
+        self.composite_edit_button.setVisible(style.startswith('Beat: ') or style in ('Linked Callout','Data Card','Analysis Panel / Counter','Text Reveal','Planar Overlay','Scramble Title','Rolling Number','Speech Balloon / Callout','Equalizer 3-Band','Equalizer 12-Band','Equalizer LED','Equalizer Radial','Equalizer Mirror'))
         self.typography_panel.setVisible(is_text)
         self.frame_panel.setVisible(is_frame)
         self.line_panel.setVisible(is_line)
-        self.motion_panel.setVisible(bool(event) and not (is_frame or is_line or style=='Data Card'))
-        self.audio_panel.setVisible(bool(event) and not (is_frame or is_line or style=='Data Card'))
+        self.motion_panel.setVisible(bool(event) and not (is_frame or is_line or style=='Data Card' or style.startswith('Beat: ')))
+        self.audio_panel.setVisible(bool(event) and not (is_frame or is_line or style=='Data Card' or style.startswith('Beat: ')))
 
     def add_selected_effect(self):
         """Create either a typography hit or procedural FX from the same picker."""
+        current = self.effect_tree.currentItem()
+        if current is None or current.isHidden() or not current.data(0, Qt.ItemDataRole.UserRole):
+            self.status.setText('Select a visible effect first.'); return
         style = self.effect_style.currentText()
         start = round(self.current_time(), 3)
-        if self.project['options'].get('snap_events', True):
+        if self.project['options'].get('snap_events', True) and self.project.get('beat_analysis_source')==self._band_audio_signature():
             start = round(snap_beat(start, self.project['bpm'], self.project['t0']), 3)
+        if style.startswith('Beat: '):
+            end = min(start+5., float(self.project.get('duration') or start+5.))
+            if end <= start: return
+            ev = dict(style=style, start=start, end=round(end,3), text='',
+                      color='#22DDEE', beat_every=1, beat_intensity=85, beat_decay=.10,
+                      beat_palette='Solid', beat_trigger='Every beat', beat_chance=50)
+            self.project.setdefault('events', []).append(ev)
+            self.refresh_event_table(); self.event_table.selectRow(len(self.project['events'])-1)
+            self.preview.update(); return
         is_motion = style in MOTION_STUDIO_STYLES
         default_text = {
             'Text Overlay': 'YOUR TEXT', 'Pop Open': 'POP!', 'Side Slam': 'SLAM!', 'Slide in': 'GO!',
@@ -2950,7 +3102,9 @@ class MainWindow(QMainWindow):
         self.add_selected_effect()
 
     def add_decorative_text(self):
+        self.effect_search.clear()
         self.effect_style.setCurrentText('Text Overlay')
+        self._sync_effect_browser_selection('Text Overlay')
         self.add_selected_effect()
 
     def apply_effect_typography(self):
@@ -2979,6 +3133,8 @@ class MainWindow(QMainWindow):
             self._update_properties_visibility()
             return
         ev = self.project['events'][rows[0]]
+        if str(ev.get('style','')).startswith('Beat: '):
+            self.preview.selected=None;self.preview.update()
         if ev.get('style') in self.preview.SHAPES:
             self.preview.selected = rows[0]
             start, end = float(ev.get('start',0)), float(ev.get('end',0))
@@ -3071,10 +3227,22 @@ class MainWindow(QMainWindow):
         self.status.setText('Analyzing bass, midrange, treble and energy offline...')
         self._bands_worker=MultibandWorker(self.ffmpeg,audio)
         signature = self._band_audio_signature()
-        self._bands_worker.ready.connect(
-            lambda result, signature=signature: self.bands_ready(result, signature))
-        self._bands_worker.failed.connect(lambda error:self.message('Audio analysis failed: '+error))
+        self._bands_job_signature=signature
+        self._bands_worker.ready.connect(self._auto_bands_ready)
+        self._bands_worker.failed.connect(self._auto_bands_failed)
+        self._bands_worker.finished.connect(self._bands_job_finished)
         self._bands_worker.start()
+
+    def _auto_bands_ready(self,result):
+        self.bands_ready(result,self._bands_job_signature)
+
+    def _auto_bands_failed(self,error):
+        if self._bands_job_signature==self._band_audio_signature():
+            self.status.setText('Audio band analysis failed: '+error.splitlines()[0])
+
+    def _bands_job_finished(self):
+        if self._bands_job_signature!=self._band_audio_signature() and not self._audio_bands_current():
+            QTimer.singleShot(0,self.analyze_bands)
 
     def bands_ready(self, result, signature=None):
         if signature is not None and signature != self._band_audio_signature():
@@ -3112,14 +3280,22 @@ class MainWindow(QMainWindow):
 
     def _build_media_tab(self):
         panel=QWidget(); layout=QVBoxLayout(panel)
-        desc=QLabel('PNG, GIF, WebP and video layers. Drag a clip on this timeline; drag its right edge to change its duration. All layers use the main video clock.')
-        desc.setWordWrap(True);layout.addWidget(desc)
         bar=QHBoxLayout();layout.addLayout(bar)
         bar.addWidget(button('Add PNG / GIF',lambda: self.add_media_files(images_only=True)))
         bar.addWidget(button('Add video clip',self.add_media_files))
         bar.addWidget(button('Remove layer',self.remove_media_layer))
         bar.addWidget(button('Move up',lambda:self.move_media_layer(-1)))
         bar.addWidget(button('Move down',lambda:self.move_media_layer(1)))
+        self.media_reactions_button = button('Music Reactive (0) — Edit layer effects', self.edit_media_reactions, 'Add and combine audio-driven effects on the selected media layer.')
+        self.media_reactions_button.setEnabled(False)
+        controls=QHBoxLayout(); controls.addWidget(self.media_reactions_button,1)
+        self.media_outline=QCheckBox('Selection outline'); self.media_outline.setChecked(bool(self.settings.get('media_selection_outline',True)))
+        self.media_outline.toggled.connect(self._save_media_outline); self.media_outline.toggled.connect(lambda _:self.preview.update()); controls.addWidget(self.media_outline)
+        layout.addLayout(controls)
+        self.media_reaction_panel=QWidget(); self.media_reaction_layout=QVBoxLayout(self.media_reaction_panel)
+        self.media_reaction_layout.setContentsMargins(0,0,0,0)
+        self.media_reaction_panel.hide();layout.addWidget(self.media_reaction_panel)
+        self._reaction_editor=None;self._reaction_layer=None
         self.media_timeline=MediaTimeline(self)
         layout.addWidget(self.media_timeline)
         self.media_table=QTableWidget(0,4)
@@ -3178,6 +3354,27 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.media_tab,'Media Layers')
         self.refresh_media_layers()
 
+    def _save_media_outline(self, enabled):
+        self.settings['media_selection_outline']=bool(enabled)
+        save_settings(self.settings)
+
+    def _media_ratio(self, layer):
+        if is_video(layer.get('path','')):
+            return max(.01,float(layer.get('source_ratio',16/9)))
+        from PIL import Image
+        path=str(layer.get('path',''))
+        cache=getattr(self,'_image_ratio_cache',{})
+        self._image_ratio_cache=cache
+        try:
+            stat=Path(path).stat();key=(path,stat.st_mtime_ns,stat.st_size)
+        except OSError:return max(.01,float(layer.get('source_ratio',16/9)))
+        if key not in cache:
+            try:
+                with Image.open(path) as im:
+                    cache[key]=im.width/max(1,im.height)
+            except (OSError,ValueError):return max(.01,float(layer.get('source_ratio',16/9)))
+        return cache[key]
+
     def add_media_files(self, checked=False, images_only=False):
         pattern=('Images (*.png *.gif *.webp *.jpg *.jpeg *.bmp)' if images_only else
                  'Media (*.png *.gif *.webp *.jpg *.jpeg *.bmp *.mp4 *.mov *.mkv *.webm *.avi *.m4v)')
@@ -3187,7 +3384,7 @@ class MainWindow(QMainWindow):
         for path in paths:
             video=is_video(path)
             duration=media_duration(self.ffprobe,path) if video else 0.
-            ratio=16/9
+            ratio=16/9 if video else self._media_ratio({'path':path})
             if video and self.ffprobe:
                 try:
                     import subprocess
@@ -3209,6 +3406,8 @@ class MainWindow(QMainWindow):
                    'fade_in':.28,'fade_out':.28}
             self.project.setdefault('media_layers',[]).append(layer)
         self.refresh_media_layers(select=len(self.project['media_layers'])-1)
+        if self.media_reaction_panel.isHidden():
+            self._show_media_reactions(self.project['media_layers'][-1])
         self.preview.update()
 
     def refresh_media_layers(self,select=None):
@@ -3237,8 +3436,16 @@ class MainWindow(QMainWindow):
         if not hasattr(self,'media_table'):return
         i=self.media_table.currentRow()
         layers=self.project.get('media_layers',[])
-        if i<0 or i>=len(layers):return
+        if i<0 or i>=len(layers):
+            self.media_reactions_button.setEnabled(False)
+            self.media_reactions_button.setText('Music Reactive (0) — Edit layer effects')
+            self.media_reaction_panel.hide()
+            return
         layer=layers[i]
+        if not self.media_reaction_panel.isHidden() and self._reaction_layer is not layer:
+            self._show_media_reactions(layer)
+        self.media_reactions_button.setEnabled(True)
+        self.media_reactions_button.setText(f"Music Reactive ({sum(bool(f.get('enabled',True)) for f in layer.get('media_reactions', []))}) — Edit layer effects")
         for name,key,default in [
             ('media_start','start',0),('media_end','end',3),('media_x','x',50),
             ('media_y','y',50),('media_width','size',300),('media_opacity','opacity',100),
@@ -3250,7 +3457,111 @@ class MainWindow(QMainWindow):
         self.media_freeze.setChecked(bool(layer.get('freeze',False)))
         self.media_freeze_at.setValue(float(layer.get('freeze_at',layer.get('trim',0))))
 
-        self.media_timeline.update()
+        self.media_timeline.update();self.preview.update()
+
+    def edit_media_reactions(self):
+        i=self.media_table.currentRow(); layers=self.project.get('media_layers',[])
+        if not 0<=i<len(layers):return
+        if not self.media_reaction_panel.isHidden():
+            self.media_reaction_panel.hide();return
+        self._show_media_reactions(layers[i])
+
+    def _show_media_reactions(self,layer):
+        from .audio_reactivity import LAYER_REACTIONS, LAYER_SOURCES, default_layer_reaction, layer_reaction_mode
+        if self._reaction_editor is not None:
+            self.media_reaction_layout.removeWidget(self._reaction_editor)
+            self._reaction_editor.hide();self._reaction_editor.deleteLater()
+        editor=QGroupBox('Music Reactive — '+str(layer.get('name','Layer')))
+        self._reaction_editor=editor;self._reaction_layer=layer
+        outer=QVBoxLayout(editor)
+        self.media_reaction_layout.addWidget(editor)
+        saved=copy.deepcopy(layer.get('media_reactions',[]))
+        # Keep original stack entries, including duplicate effect types, unless edited.
+        configs={kind:[fx for fx in saved if fx.get('kind')==kind] for kind in LAYER_REACTIONS}
+        checks={}; grid=QGridLayout();outer.addLayout(grid)
+        preset=fixed_combo(['Custom','Speaker','Dance','Slopcore','Subtle','Crazy'],'Custom')
+        presets=QHBoxLayout();presets.addWidget(QLabel('Preset'));presets.addWidget(preset,1);outer.insertLayout(0,presets)
+        strength=spin_int(0,300,int(layer.get('media_reaction_strength',100)),5)
+        strength.setToolTip('100% = normal effect strength; 300% = exaggerated. Applies to all enabled reactions.')
+        class StrengthSlider(QSlider):
+            def wheelEvent(self,event):event.ignore()
+        slider=StrengthSlider(Qt.Orientation.Horizontal);slider.setRange(0,300);slider.setValue(strength.value())
+        slider.valueChanged.connect(strength.setValue);strength.valueChanged.connect(slider.setValue)
+        row=QHBoxLayout();row.addWidget(QLabel('Strength %'));row.addWidget(slider,1);row.addWidget(strength);outer.addLayout(row)
+        updating=False
+        def publish(*_):
+            if updating or not any(item is layer for item in self.project.get('media_layers',[])):return
+            result=[]
+            ordered=[fx for fx in saved if fx.get('kind') not in configs or any(fx is v for v in configs[fx.get('kind')])]
+            for kind in LAYER_REACTIONS:
+                if checks[kind].isChecked() and not configs[kind]:configs[kind].append(default_layer_reaction(kind))
+                ordered.extend(fx for fx in configs[kind] if not any(fx is old for old in ordered))
+            for fx in ordered:
+                entry=dict(fx);kind=entry.get('kind')
+                if kind in checks:entry['enabled']=checks[kind].isChecked() and entry.get('enabled',True)
+                result.append(entry)
+            layer['media_reactions']=result
+            layer['media_reaction_strength']=strength.value()
+            self.media_reactions_button.setText(f"Music Reactive ({sum(bool(f.get('enabled',True)) for f in result)}) — Edit layer effects")
+            self.preview.update()
+        def toggle(kind,enabled):
+            if updating:return
+            if preset.currentText()!='Custom':
+                preset.blockSignals(True);preset.setCurrentText('Custom');preset.blockSignals(False)
+            if enabled:
+                if not configs[kind]:configs[kind].append(default_layer_reaction(kind))
+                for fx in configs[kind]:fx['enabled']=True
+            publish()
+        for n,kind in enumerate(LAYER_REACTIONS):
+            cb=QCheckBox(kind);cb.setChecked(any(f.get('enabled',True) for f in configs[kind]));checks[kind]=cb
+            grid.addWidget(cb,n//2,n%2);cb.toggled.connect(lambda enabled,k=kind:toggle(k,enabled))
+        strength.valueChanged.connect(publish)
+        combinations={'Speaker':['Bass Speaker','Reactive Glow'],'Dance':['Beat Bounce','Elastic Pulse'],
+                      'Slopcore':['Bass Shake','RGB Split','Beat Flash'],'Subtle':['Beat Zoom','Reactive Rotation'],
+                      'Crazy':['Horizontal Stretch','Vertical Stretch','Beat Bounce','Reactive Ripple']}
+        def apply_preset(name):
+            nonlocal updating
+            if name not in combinations:return
+            updating=True
+            try:
+                for kind,cb in checks.items():
+                    enabled=kind in combinations[name];cb.setChecked(enabled)
+                    if enabled:configs[kind]=[default_layer_reaction(kind)]
+                strength.setValue(50 if name=='Subtle' else 150 if name=='Crazy' else 100)
+            finally:updating=False
+            publish()
+        preset.currentTextChanged.connect(apply_preset)
+        def advanced():
+            adv=QDialog(self);adv.setWindowTitle('Advanced reaction settings');adv.resize(820,460)
+            layout=QVBoxLayout(adv)
+            table=QTableWidget(0,8);table.setHorizontalHeaderLabels(['Effect','Mode','Source','Intensity %','Sensitivity %','Smooth ms','Pulse ms','Color'])
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn);layout.addWidget(table)
+            rows=[]
+            for kind in LAYER_REACTIONS:
+                if not checks[kind].isChecked():continue
+                for fx in configs[kind] or [default_layer_reaction(kind)]:
+                    if not fx.get('enabled',True):continue
+                    r=table.rowCount();table.insertRow(r);table.setItem(r,0,QTableWidgetItem(kind))
+                    mode=fixed_combo(['Beat Punch','Continuous'],layer_reaction_mode(fx))
+                    source=fixed_combo(LAYER_SOURCES,fx.get('source','Bass'))
+                    intensity=spin_int(0,300,int(fx.get('intensity',35)))
+                    sensitivity=spin_int(0,300,int(fx.get('sensitivity',100)))
+                    smooth=spin_int(0,1000,round(float(fx.get('smooth',.06))*1000),10)
+                    pulse=spin_int(30,1000,round(float(fx.get('pulse',.10))*1000),10)
+                    color=ColorPickerField(fx.get('color','#22DDEE'))
+                    widgets=(mode,source,intensity,sensitivity,smooth,pulse,color)
+                    for col,widget in enumerate(widgets,1):table.setCellWidget(r,col,widget)
+                    rows.append((kind,fx,widgets))
+            layout.addWidget(button('Apply',adv.accept));layout.addWidget(button('Cancel',adv.reject))
+            if adv.exec()!=QDialog.DialogCode.Accepted:return
+            for kind,fx,(mode,source,intensity,sensitivity,smooth,pulse,color) in rows:
+                fx.update(mode=mode.currentText(),source=source.currentText(),intensity=intensity.value(),
+                          sensitivity=sensitivity.value(),smooth=smooth.value()/1000.,pulse=pulse.value()/1000.,color=color.value_edit.text())
+            publish()
+        row=QHBoxLayout();row.addWidget(button('Advanced settings',advanced));row.addWidget(button('Collapse',self.media_reaction_panel.hide));outer.addLayout(row)
+        self.media_reaction_panel.show()
+        self._ensure_audio_analysis()
 
     def apply_media_properties(self):
         i=self.media_table.currentRow()
@@ -3296,7 +3607,7 @@ class MainWindow(QMainWindow):
         layers=self.project.get('media_layers',[])
         if not 0 <= i < len(layers):return
         layer=layers[i]
-        ratio=max(.1,float(layer.get('source_ratio',16/9)))
+        ratio=self._media_ratio(layer)
         positions={
             'left':(25,50,640),'right':(75,50,640),
             'top':(50,25,640),'bottom':(50,75,640),
@@ -3392,7 +3703,7 @@ class MainWindow(QMainWindow):
             value=float(item.text()) if key in ('start','end','x','y','size') else item.text().strip()
             if key=='end' and value<=ev['start']:raise ValueError()
             if key=='start' and value>=ev['end']:raise ValueError()
-            if key=='style' and value not in ('Text Overlay','Stamp','Slide in','Side Slam','Pop Open','Beat punch','Wobble','Glitch','Neon tag','Countdown','Image / GIF',*MOTION_STUDIO_STYLES):
+            if key=='style' and value not in (*('Beat: '+name for name in BEAT_EFFECTS),'Text Overlay','Stamp','Slide in','Side Slam','Pop Open','Beat punch','Wobble','Glitch','Neon tag','Countdown','Image / GIF',*MOTION_STUDIO_STYLES):
                 raise ValueError()
             ev[key]=value
         except ValueError:
@@ -3403,6 +3714,11 @@ class MainWindow(QMainWindow):
     def export(self):
         if self._render and self._render.isRunning():
             return
+        if getattr(self,'_beat_worker',None) and self._beat_worker.isRunning():
+            self.status.setText('Tempo analysis running; render when BPM is ready.'); return
+        from .render_audio import needs_beat_grid
+        if needs_beat_grid(self.project) and self._band_audio_signature() and self.project.get('beat_analysis_source')!=self._band_audio_signature():
+            self.message('Tempo is not verified for this soundtrack. Click BPM and set or detect it before rendering beat effects.');return
         if not self.ffmpeg or not Path(self.ffmpeg).is_file():
             self.message('Choose the FFmpeg executable before rendering.');return
         if not self.project.get('video'):
@@ -3458,7 +3774,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self,'BeatSync FX',txt)
 
     def closeEvent(self,event):
-        if self._worker and self._worker.isRunning():
+        if any(w and w.isRunning() for w in (self._worker,getattr(self,'_beat_worker',None),getattr(self,'_bands_worker',None))):
             self.message('Audio analysis / transcription is still running. Close once it finishes.')
             event.ignore();return
         if self._render and self._render.isRunning():

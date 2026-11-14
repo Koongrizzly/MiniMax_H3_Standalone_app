@@ -7,32 +7,21 @@ from __future__ import annotations
 import math
 import numpy as np
 from PySide6.QtGui import QImage
+from .audio_reactivity import screen_beat_pulse
 
 VIDEO_EFFECTS = ('Horizontal Tearing', 'RGB Split', 'Frame Stutter',
                  'Signal Dropout', 'Block Corruption', 'Impact Zoom')
 
 def hits(project, t):
-    bpm = max(1., float(project.get('bpm',120)))
-    t0 = float(project.get('t0',0))
-    if t < t0: return []
-    period = 60.0 / bpm
     active = []
-    for i, event in enumerate(project.get('events', [])):
-        kind = str(event.get('style','')).removeprefix('Beat: ')
-        if kind not in VIDEO_EFFECTS or not float(event.get('start',0)) <= t < float(event.get('end',0)):
+    for i,event in enumerate(project.get('events', [])):
+        kind=str(event.get('style','')).removeprefix('Beat: ')
+        if kind not in VIDEO_EFFECTS or not float(event.get('start',0))<=t<float(event.get('end',0)):
             continue
-        # Beat numbers are anchored to the project-wide grid; effects can start mid-song.
-        beat = math.floor((t-t0) / period + 1e-8)
-        every = max(1,int(event.get('beat_every',1)))
-        if beat < 0 or beat % every: continue
-        beat_time = t0 + beat*period
-        if beat_time < float(event.get('start',0)) - 1e-8: continue
-        seconds = t - beat_time
-        length = max(.03,float(event.get('beat_decay',.24)))
-        if seconds < -1e-8 or seconds >= length: continue
-        level = max(0., min(1., float(event.get('beat_intensity',60))/100))
-        falloff = (1-seconds/length)**1.4
-        active.append((kind,level*falloff,beat,i,event,beat_time))
+        power,beat,beat_time=screen_beat_pulse(project,t,event)
+        if power<=0 or beat_time<float(event.get('start',0))-.001:continue
+        level=max(0.,min(1.,float(event.get('beat_intensity',60))/100))
+        active.append((kind,level*power,beat,i,event,beat_time))
     return active
 
 def needs_video(project):
@@ -101,7 +90,7 @@ def apply_video_effects(image:QImage, project:dict, t:float) -> QImage:
                     block=np.repeat(np.repeat(small,factor,axis=0),factor,axis=1)[:bh,:bw]
                 a[y:y+bh,x:x+bw]=block
         elif kind=='Impact Zoom':
-            factor=1.0+0.085*power
+            factor=1.0+(0.60 if event.get('beat_trigger') else 0.085)*power
             sh=max(2,int(h/factor));sw=max(2,int(w/factor))
             y=(h-sh)//2;x=(w-sw)//2
             # nearest-neighbour indices eliminate per-frame QPainter image allocation
