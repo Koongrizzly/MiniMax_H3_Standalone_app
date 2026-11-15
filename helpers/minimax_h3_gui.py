@@ -3,7 +3,7 @@ import json, os, sys, subprocess, time, socket, urllib.request, urllib.parse, re
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QTimer, QEvent, QUrl, QSizeF, Signal
+from PySide6.QtCore import Qt, QProcess, QTimer, QEvent, QUrl, QSizeF, Signal, QLockFile
 from PySide6.QtGui import QDesktopServices, QTextCursor, QPainter, QColor, QBrush, QPixmap, QIcon
 
 try:
@@ -1347,6 +1347,10 @@ class MainWindow(QMainWindow):
         self._init_telegram_remote()
         self._sync_resolution()
         self._sync_mode()
+        try:
+            self._init_codex_bridge()
+        except Exception as exc:
+            self.append_log(f"[Codex] Bridge startup failed: {exc}\n")
         QTimer.singleShot(300, lambda: self.validate_install(interactive=False))
         QTimer.singleShot(700, self._recover_interrupted_job)
         QTimer.singleShot(1000, self._ensure_ffmpeg_async)
@@ -3070,6 +3074,8 @@ class MainWindow(QMainWindow):
         return max(candidates, key=lambda j: float(j.get("created_at") or 0))
 
     def _start_next_pending(self):
+        if getattr(self, "_codex_defer_start", False):
+            return
         if self.proc and self.proc.state()!=QProcess.ProcessState.NotRunning: return
         if not ffmpeg_tools_ready():
             self._ensure_ffmpeg_async()
@@ -3728,18 +3734,18 @@ class MainWindow(QMainWindow):
             return False
         if engine == "relayvsr":
             if not self._relay_install_status():
-                QMessageBox.information(self, "RelayVSR", "The X4 INT8 model and Flash VAE are required for X1, X2, X3 and X4 outputs. Install / Repair RelayVSR first.")
+                self._generation_notice("information", "RelayVSR", "The X4 INT8 model and Flash VAE are required for X1, X2, X3 and X4 outputs. Install / Repair RelayVSR first.")
                 return False
             if not self._relay_config_valid():
-                QMessageBox.information(self, "RelayVSR", "Install / Repair RelayVSR in Settings first (or configure a working custom runner command).")
+                self._generation_notice("information", "RelayVSR", "Install / Repair RelayVSR in Settings first (or configure a working custom runner command).")
                 return False
         elif not self._vsr_install_status():
-            QMessageBox.information(self, "NVIDIA VSR", "Install NVIDIA VSR from Settings before upscaling clips.")
+            self._generation_notice("information", "NVIDIA VSR", "Install NVIDIA VSR from Settings before upscaling clips.")
             return False
         ffmpeg = ROOT / "presets" / "bin" / "ffmpeg.exe"
         ffprobe = ROOT / "presets" / "bin" / "ffprobe.exe"
         if not ffmpeg.is_file() or not ffprobe.is_file():
-            QMessageBox.warning(self, "NVIDIA VSR", "FFmpeg and FFprobe must be installed in presets/bin.")
+            self._generation_notice("warning", "NVIDIA VSR", "FFmpeg and FFprobe must be installed in presets/bin.")
             return False
         runner = ROOT / "runtime" / engine / "runner.py"
         if not runner.is_file(): return False
@@ -5962,7 +5968,7 @@ class MainWindow(QMainWindow):
 
         # Save the new global key while also mirroring the legacy key so an older
         # build can still understand the preference if the user rolls back.
-        if persist:
+        if persist and not getattr(self, "_codex_automation", False):
             try:
                 PRESET_DIR.mkdir(parents=True, exist_ok=True)
                 p = PRESET_DIR / "minimax_h3_gui_last.json"
@@ -5986,6 +5992,8 @@ class MainWindow(QMainWindow):
             else:
                 self.system_hud.timer.stop()
         # Persist immediately as well as through the normal last-settings save.
+        if getattr(self, "_codex_automation", False):
+            return
         try:
             PRESET_DIR.mkdir(parents=True, exist_ok=True)
             p = PRESET_DIR / "minimax_h3_gui_last.json"
@@ -6867,27 +6875,29 @@ class MainWindow(QMainWindow):
                 self.output_folder.edit.setText(d.get("output_folder", "")); self.output_name.setText(d.get("output_name", ""))
             self.extended_logging.setChecked(bool(d.get("extended_logging", False)))
             self.tile_debugging.setChecked(bool(d.get("tile_debugging", False)))
-            self.system_hud_toggle.setChecked(bool(d.get("system_hud", True)))
-            self._global_preview_width = max(360, int(d.get("preview_global_width", 520) or 520))
-            self.preview_in_main_toggle.setChecked(True)
-            self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
-            saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
-            self.font_size_slider.blockSignals(True)
-            self.font_size_slider.setValue(saved_font)
-            self.font_size_slider.blockSignals(False)
-            self._font_size_pt = saved_font
-            self._update_font_size_label(saved_font)
-            self._apply_style()
-            self._restore_tab_order(d.get("tab_order", []))
-            self.play_result_finished.setChecked(bool(d.get("play_result_finished", False)))
-            self.play_result_queue_player.setChecked(True)
-            self.play_result_queue_player.setVisible(False)
+            if not getattr(self, "_codex_automation", False):
+                self.system_hud_toggle.setChecked(bool(d.get("system_hud", True)))
+                self._global_preview_width = max(360, int(d.get("preview_global_width", 520) or 520))
+                self.preview_in_main_toggle.setChecked(True)
+                self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
+                saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
+                self.font_size_slider.blockSignals(True)
+                self.font_size_slider.setValue(saved_font)
+                self.font_size_slider.blockSignals(False)
+                self._font_size_pt = saved_font
+                self._update_font_size_label(saved_font)
+                self._apply_style()
+                self._restore_tab_order(d.get("tab_order", []))
+                self.play_result_finished.setChecked(bool(d.get("play_result_finished", False)))
+                self.play_result_queue_player.setChecked(True)
+                self.play_result_queue_player.setVisible(False)
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
             self.sol_attention_enabled.setChecked(bool(d.get("sol_attention_enabled", False)))
             self.sla_attention_enabled.setChecked(bool(d.get("sla_attention_enabled", False)))
-            self._set_system_hud_visible(self.system_hud_toggle.isChecked())
-            self._set_preview_in_main_tab(True)
+            if not getattr(self, "_codex_automation", False):
+                self._set_system_hud_visible(self.system_hud_toggle.isChecked())
+                self._set_preview_in_main_tab(True)
             self.vram_manager_enabled.setChecked(bool(d.get("vram_manager_enabled", True)))
             self.vram_manager_auto_bypass.setChecked(bool(d.get("vram_manager_auto_bypass", True)))
             engine = str(d.get("vram_residency_engine", "static")).lower()
@@ -6915,6 +6925,8 @@ class MainWindow(QMainWindow):
                 item = saved_loras[i] if i < len(saved_loras) and isinstance(saved_loras[i], dict) else {}
                 row.edit.setText(str(item.get("path", ""))); strength.setValue(float(item.get("strength", 1.0)))
         except Exception as e:
+            if getattr(self, "_codex_automation", False):
+                raise
             self.append_log(f"Preset warning: {e}\n")
         self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
         self._sync_resolution(); self._sync_mode()
@@ -7014,6 +7026,8 @@ class MainWindow(QMainWindow):
         return found
 
     def save_last(self):
+        if getattr(self, "_codex_automation", False):
+            return
         PRESET_DIR.mkdir(parents=True, exist_ok=True)
         data = self.settings_dict()
         data["tab_order"] = self._current_tab_order()
@@ -7692,6 +7706,13 @@ exit /b %RC%
                          "704p": (1280, 704), "720p": (1280, 704),
                          "768p": (1344, 768), "896p": (1600, 896),
                          "1080p": (1920, 1088)}
+            if resolution in RESOLUTION_PRESETS and width is None and height is None:
+                settings["resolution"] = resolution
+                return
+            if resolution in WIDESCREEN_21_9_PRESETS and width is None and height is None:
+                settings["aspect"] = "21:9"
+                settings["widescreen_quality"] = resolution
+                return
             if value in shortcuts:
                 width, height = shortcuts[value]
             elif "x" in value:
@@ -7746,83 +7767,308 @@ exit /b %RC%
             return
         self._queue_generation_batch_specs(specs, Path(selected).parent)
 
+    def _generation_notice(self, level, title, message):
+        if getattr(self, "_codex_automation", False):
+            raise ValueError(f"{title}: {message}")
+        return getattr(QMessageBox, level)(self, title, message)
+
+    def _init_codex_bridge(self):
+        from runtime.codex_bridge import MAILBOX, atomic_json
+        MAILBOX.mkdir(parents=True, exist_ok=True)
+        self._codex_lock = QLockFile(str(MAILBOX / "owner.lock"))
+        self._codex_lock.setStaleLockTime(0)
+        if not self._codex_lock.tryLock(0):
+            self.append_log("[Codex] Another GrizzlyMax instance owns the automation bridge.\n")
+            return
+        self._codex_session = uuid.uuid4().hex
+        self._codex_active = None
+        self._codex_heartbeat = 0
+        self._codex_timer = QTimer(self)
+        self._codex_timer.setInterval(150)
+        self._codex_timer.timeout.connect(self._codex_tick)
+        self._codex_timer.start()
+        atomic_json(MAILBOX / "session.json", {"id":self._codex_session, "heartbeat":time.time(), "pid":os.getpid()})
+
+    @staticmethod
+    def _codex_job_summary(job):
+        keys = ("id", "job_number", "job_type", "state", "phase", "output", "mode_name",
+                "resolution", "frames", "steps", "seed", "actual_seed", "progress", "error", "continue_from_job_id", "vsr_after_job_id")
+        return {key:job.get(key) for key in keys}
+
+    def _codex_reply(self, request_id, result):
+        from runtime.codex_bridge import atomic_json, receipt
+        atomic_json(receipt(request_id), {"request_id":request_id, **result})
+
+    def _codex_finish_batch(self, error=None):
+        state = self._codex_active
+        self._codex_active = None
+        self._codex_defer_start = False
+        jobs = [{**self._codex_job_summary(j), "settings":j.get("settings", {})} for j in self.queue_jobs if j.get("id") in state["ids"]]
+        # Native queue saving catches disk errors; verify the receipt against disk.
+        try:
+            persisted = json.loads(QUEUE_FILE.read_text(encoding="utf-8")) if jobs else {"jobs":[]}
+            ids = {j.get("id") for j in persisted["jobs"]}
+            if not set(state["ids"]).issubset(ids) or len(jobs) != len(state["ids"]):
+                raise RuntimeError("Some accepted jobs are not in the persisted queue.")
+        except Exception as exc:
+            error = (str(error) + "; " if error else "") + f"Queue persistence verification failed: {exc}"
+        self._codex_reply(state["id"], {"ok":not bool(error), "requested":len(state["prepared"]),
+            "queued_generation_jobs":state["index"], "jobs":jobs, "notes":state["notes"],
+            "error":str(error) if error else None})
+        self.status.setText(f"Codex: queued {state['index']} of {len(state['prepared'])} generation jobs")
+        if not self._closing:
+            self._start_next_pending()
+
+    def _codex_batch_step(self):
+        state = self._codex_active
+        if state["index"] >= len(state["prepared"]):
+            self._codex_finish_batch(); return
+        settings = state["prepared"][state["index"]]
+        current = copy.deepcopy(self.settings_dict())
+        before = {j.get("id") for j in self.queue_jobs}
+        error = None
+        prior_subjects = getattr(self, "_timeline_ref_audio_subjects", [])
+        prior_forced = getattr(self, "_timeline_forced_continue_from_job_id", None)
+        self._codex_automation = True
+        self._codex_skip_unload = state["index"] > 0
+        try:
+            self.apply_settings(settings)
+            self._timeline_ref_audio_subjects = list(settings.get("audio_subjects", []))
+            # Continue from the preceding generation in this batch, never an intervening VSR job.
+            if settings.get("continue_last_result") and state.get("last_generation_id"):
+                self._timeline_forced_continue_from_job_id = state["last_generation_id"]
+            self.generate()
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            new = [j for j in self.queue_jobs if j.get("id") not in before]
+            state["ids"].extend(j["id"] for j in new)
+            generation = next((j for j in new if j.get("mode") in (0,1,2) and not j.get("job_type")), None)
+            if generation:
+                state["index"] += 1
+                state["last_generation_id"] = generation["id"]
+            self._timeline_ref_audio_subjects = prior_subjects
+            self._timeline_forced_continue_from_job_id = prior_forced
+            try:
+                self.apply_settings(current)
+            finally:
+                self._codex_automation = False
+                self._codex_skip_unload = False
+        if error or not generation:
+            self._codex_finish_batch(f"Job {state['index'] if generation else state['index']+1}: {error or 'No generation job was queued.'}")
+        elif state["index"] >= len(state["prepared"]):
+            self._codex_finish_batch()
+
+    def _codex_tick(self):
+        from runtime.codex_bridge import MAILBOX, atomic_json, read_json, receipt
+        if self._closing:
+            return
+        now = time.time()
+        if now - self._codex_heartbeat > 2:
+            try:
+                atomic_json(MAILBOX / "session.json", {"id":self._codex_session,"heartbeat":now,"pid":os.getpid()})
+                self._codex_heartbeat = now
+            except OSError as exc:
+                self.append_log(f"[Codex] Heartbeat write failed: {exc}\n")
+                self._codex_heartbeat = now
+        # Do not run automation inside a nested Qt modal event loop.
+        if QApplication.activeModalWidget() is not None or getattr(self, "_codex_busy", False):
+            return
+        self._codex_busy = True
+        request_id = None
+        try:
+            if self._codex_active is not None:
+                self._codex_batch_step(); return
+            requests = MAILBOX / "requests"
+            requests.mkdir(exist_ok=True)
+            for path in sorted(requests.glob("*.json"), key=lambda p:p.stat().st_mtime):
+                request_id = uuid.UUID(path.stem).hex
+                # Claim first. A crash after claim has an unknown outcome; never replay it.
+                claimed = MAILBOX / "claimed" / path.name
+                claimed.parent.mkdir(exist_ok=True)
+                if claimed.exists() or receipt(request_id).exists():
+                    path.unlink(missing_ok=True); continue
+                os.replace(path, claimed)
+                request = read_json(claimed)
+                if request.get("id") != request_id or request.get("session") != self._codex_session:
+                    self._codex_reply(request_id, {"ok":False,"error":"Expired or invalid bridge session; request was not executed."}); return
+                action = request.get("action")
+                if action == "status":
+                    self._codex_reply(request_id, {"ok":True,"jobs":[self._codex_job_summary(j) for j in self.queue_jobs]})
+                elif action == "settings":
+                    self._codex_reply(request_id, {"ok":True,"settings":self.settings_dict()})
+                elif action in ("validate-batch", "enqueue-batch"):
+                    specs = request["specs"]
+                    if not isinstance(specs, list) or not specs:
+                        raise ValueError("Batch must contain at least one job.")
+                    for index, spec in enumerate(specs, 1):
+                        _batch_normalize_spec(spec, index)
+                    _, prepared, notes = self._prepare_generation_batch(specs, Path(request["source_dir"]), allow_all_modes=True)
+                    if action == "validate-batch":
+                        self._codex_reply(request_id, {"ok":True,"requested":len(prepared),"notes":notes,"prepared":prepared,"validation":"Preflight only; native generation checks run on enqueue."})
+                    else:
+                        self._codex_active = {"id":request_id,"prepared":prepared,"notes":notes,"index":0,"ids":[]}
+                        self._codex_defer_start = True
+                elif action == "upscale":
+                    source = Path(request["source"])
+                    if not source.is_file():
+                        raise ValueError(f"Source video not found: {source}")
+                    probe = subprocess.run([str(ffmpeg_tool_path("ffprobe.exe")), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(source)], capture_output=True, text=True, timeout=15, check=True)
+                    stream = json.loads(probe.stdout)["streams"][0]
+                    before = {j.get("id") for j in self.queue_jobs}
+                    self._codex_automation = True
+                    try:
+                        if not self._enqueue_timeline_vsr({"source":str(source),"scale":request["scale"],"engine":request["engine"],"width":stream["width"],"height":stream["height"]}):
+                            raise ValueError("Upscale request rejected; check engine and scale.")
+                    finally:
+                        self._codex_automation = False
+                    jobs = [self._codex_job_summary(j) for j in self.queue_jobs if j.get("id") not in before]
+                    persisted = {j.get("id") for j in json.loads(QUEUE_FILE.read_text(encoding="utf-8"))["jobs"]}
+                    ok = bool(jobs) and all(j["id"] in persisted for j in jobs)
+                    self._codex_reply(request_id, {"ok":ok,"jobs":jobs,"error":None if ok else "Queue persistence could not be verified."})
+                else:
+                    raise ValueError(f"Unknown bridge action: {action}")
+                return
+        except Exception as exc:
+            if self._codex_active is not None:
+                self._codex_finish_batch(exc)
+            elif request_id:
+                self._codex_reply(request_id, {"ok":False,"error":str(exc)})
+            else:
+                self.append_log(f"[Codex] {exc}\n")
+        finally:
+            self._codex_busy = False
+
+    def _prepare_generation_batch(self, specs, source_dir, snapshot=None, allow_all_modes=False):
+        # Validate the *whole* file before adding any jobs. Every clip derives
+        # from this one frozen snapshot, never from the previous batch clip.
+        snapshot = copy.deepcopy(self.settings_dict()) if snapshot is None else copy.deepcopy(snapshot)
+        prepared = []
+        notes = []
+        for index, spec in enumerate(specs, 1):
+            if allow_all_modes:
+                for field, value in spec.items():
+                    if isinstance(snapshot.get(field), bool) and not isinstance(value, bool):
+                        raise ValueError(f"Job {index}: {field} must be true or false (JSON boolean).")
+            settings = copy.deepcopy(snapshot)
+            overrides = {k:v for k,v in spec.items() if k not in (
+                "name", "width", "height", "resolution", "audio_subject", "audio_subjects")}
+            if "mode" in overrides:
+                raw = str(overrides["mode"]).lower()
+                overrides["mode"] = ({"t2va": 0, "fl2va": 1, "ref2va": 2,
+                    "text to video": 0, "image to video": 1, "reference to video": 2}
+                    .get(raw, overrides["mode"]))
+                overrides["mode"] = int(overrides["mode"])
+                if overrides["mode"] not in (0, 1, 2):
+                    raise ValueError(f"Job {index}: unsupported mode {spec['mode']}")
+            if not allow_all_modes and int(overrides.get("mode", 2)) != 2:
+                raise ValueError(f"Job {index}: batch generation currently supports Ref2VA only.")
+            overrides.setdefault("mode", 2)
+            settings.update(overrides)
+            # Every batch item is independent. Only non-reference generation
+            # settings inherit the frozen GUI snapshot. Never reuse stale
+            # images, video, audio, RefMods or their enable switches.
+            for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
+                settings[key] = copy.deepcopy(spec.get(key, []))
+            settings["lock_source_audio"] = bool(spec.get("lock_source_audio", False))
+            settings["refmod_qwen_vision"] = bool(spec.get("refmod_qwen_vision", False))
+            settings["t2va_use_refmods"] = bool(spec.get("t2va_use_refmods", False))
+            # No lingering standalone first/last frames or continuation
+            # sources either; they must be explicitly requested per job.
+            for key in ("first", "last", "continue_video"):
+                settings[key] = spec.get(key, "")
+            for key in ("continue_last_result", "glue_results",
+                        "continue_audio_memory", "latent_continuation",
+                        "combine_frames_latent"):
+                settings[key] = bool(spec.get(key, False))
+            # Relative media paths are resolved beside the imported file.
+            for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
+                if key in spec:
+                    settings[key] = [str((source_dir / p).resolve()) if not Path(p).is_absolute()
+                                     and not re.match(r"^[A-Za-z]:[\\/]", p) else p
+                                     for p in settings[key]]
+            for key in ("first", "last", "continue_video", "hybrid_model", "output_folder", "fl2va_model", "ref2va_model", "text_encoder_model", "video_vae_model", "audio_vae_model"):
+                if spec.get(key):
+                    path = Path(str(spec[key]))
+                    settings[key] = str((source_dir / path).resolve()) if not path.is_absolute() else str(path)
+            if "loras" in spec:
+                if not isinstance(spec["loras"], list):
+                    raise ValueError(f"Job {index}: loras must be a list.")
+                for lora in settings["loras"]:
+                    path = Path(lora["path"])
+                    lora["path"] = str((source_dir / path).resolve()) if not path.is_absolute() else str(path)
+            self._batch_resolution_settings(spec, settings)
+            if "frames" in spec:
+                requested = int(spec["frames"])
+                if requested > NORMAL_FRAME_MAX and "experimental_long_duration" not in spec:
+                    settings["experimental_long_duration"] = True
+                presets = (EXPERIMENTAL_FRAME_PRESETS if settings.get("experimental_long_duration")
+                           else FRAME_PRESETS)
+                closest = min(presets, key=lambda n: (abs(n-requested), n))
+                settings["frames"] = closest
+                if closest != requested:
+                    notes.append(f"{index}: {requested} -> {closest} frames")
+            if "audio_subject" in spec:
+                settings["audio_subjects"] = [int(spec["audio_subject"])]
+            elif "audio_subjects" in spec:
+                settings["audio_subjects"] = [int(x) for x in spec["audio_subjects"]]
+            else:
+                settings["audio_subjects"] = []
+            # Explicit ref/audio lists replace, rather than append to, the
+            # snapshot. Existing GUI settings are inherited only when omitted.
+            if settings.get("lock_source_audio") and not settings.get("ref_audios"):
+                raise ValueError(f"Job {index}: exact audio is ON but Audio 1 is empty.")
+            for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
+                for file in settings.get(key, []):
+                    if not Path(file).is_file():
+                        raise ValueError(f"Job {index}: missing {key} file:\n{file}")
+            if len(settings.get("ref_images", [])) > 9 or len(settings.get("ref_videos", [])) > 3 or len(settings.get("ref_audios", [])) > 3:
+                raise ValueError(f"Job {index}: reference slot limit exceeded.")
+            if spec.get("name") and "output_name" not in spec:
+                settings["output_name"] = str(spec["name"])
+            if not settings.get("prompt", "").strip():
+                raise ValueError(f"Job {index}: empty prompt.")
+            if allow_all_modes:
+                if len(settings.get("refmods", [])) > 8:
+                    raise ValueError(f"Job {index}: at most 8 RefMods are supported.")
+                if len(settings.get("loras", [])) > len(self.lora_rows):
+                    raise ValueError(f"Job {index}: LoRA slot limit exceeded.")
+                for lora in settings.get("loras", []):
+                    if lora.get("path") and float(lora.get("strength", 1)) != 0 and not Path(lora["path"]).is_file():
+                        raise ValueError(f"Job {index}: missing LoRA: {lora['path']}")
+                for field, widget in (("steps", self.steps), ("seed", self.seed), ("cfg", self.cfg),
+                                      ("shift", self.shift), ("audio_shift", self.audio_shift)):
+                    if field in spec and not widget.minimum() <= float(settings[field]) <= widget.maximum():
+                        raise ValueError(f"Job {index}: {field} out of range ({widget.minimum()}–{widget.maximum()}).")
+                for field, options in (("sampler", SAMPLERS), ("scheduler", SCHEDULERS), ("aspect", ("16:9", "9:16", "1:1", "21:9")),
+                                       ("ref_size", ("match", "max")), ("generation_vsr_engine", ("nvidia_vsr", "relayvsr")),
+                                       ("widescreen_quality", WIDESCREEN_21_9_PRESETS)):
+                    if field in spec and settings[field] not in options:
+                        raise ValueError(f"Job {index}: unsupported {field}: {settings[field]}")
+                if "generation_vsr_scale" in spec and int(settings["generation_vsr_scale"]) not in ((1,2,3,4) if settings.get("generation_vsr_engine") == "relayvsr" else (1,2,3)):
+                    raise ValueError(f"Job {index}: unsupported upscale scale for selected engine.")
+                if settings.get("continue_video") and settings.get("continue_last_result"):
+                    raise ValueError(f"Job {index}: choose either a manual continuation video or Continue last result.")
+                mode = settings["mode"]
+                for key in ("first", "last", "continue_video"):
+                    if settings.get(key) and not Path(settings[key]).is_file():
+                        raise ValueError(f"Job {index}: missing {key}: {settings[key]}")
+                refs = any(settings.get(k) for k in ("ref_images", "ref_videos", "ref_audios"))
+                mods = bool(settings.get("refmods"))
+                if mode == 2 and (not (refs or mods) or (refs and mods)):
+                    raise ValueError(f"Job {index}: Ref2VA requires ordinary references or RefMods, not both.")
+                if mode == 0 and settings.get("t2va_use_refmods") and not mods:
+                    raise ValueError(f"Job {index}: T2VA RefMods enabled but none supplied.")
+                if mode == 1 and not any(settings.get(k) for k in ("first", "last", "continue_video", "continue_last_result")):
+                    raise ValueError(f"Job {index}: FL2VA requires visual input or continuation.")
+                if mode == 1 and settings.get("first") and (settings.get("continue_video") or settings.get("continue_last_result")):
+                    raise ValueError(f"Job {index}: first frame conflicts with continuation.")
+            prepared.append(settings)
+        return snapshot, prepared, notes
+
     def _queue_generation_batch_specs(self, specs, source_dir):
         try:
-            # Validate the *whole* file before adding any jobs. Every clip derives
-            # from this one frozen snapshot, never from the previous batch clip.
-            snapshot = copy.deepcopy(self.settings_dict())
-            prepared = []
-            notes = []
-            for index, spec in enumerate(specs, 1):
-                settings = copy.deepcopy(snapshot)
-                overrides = {k:v for k,v in spec.items() if k not in (
-                    "name", "width", "height", "resolution", "audio_subject", "audio_subjects")}
-                if "mode" in overrides:
-                    raw = str(overrides["mode"]).lower()
-                    overrides["mode"] = ({"t2va": 0, "fl2va": 1, "ref2va": 2,
-                        "text to video": 0, "image to video": 1, "reference to video": 2}
-                        .get(raw, overrides["mode"]))
-                    overrides["mode"] = int(overrides["mode"])
-                    if overrides["mode"] not in (0, 1, 2):
-                        raise ValueError(f"Job {index}: unsupported mode {spec['mode']}")
-                if int(overrides.get("mode", 2)) != 2:
-                    raise ValueError(f"Job {index}: batch generation currently supports Ref2VA only.")
-                overrides["mode"] = 2
-                settings.update(overrides)
-                # Every batch item is independent. Only non-reference generation
-                # settings inherit the frozen GUI snapshot. Never reuse stale
-                # images, video, audio, RefMods or their enable switches.
-                for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
-                    settings[key] = copy.deepcopy(spec.get(key, []))
-                settings["lock_source_audio"] = bool(spec.get("lock_source_audio", False))
-                settings["refmod_qwen_vision"] = bool(spec.get("refmod_qwen_vision", False))
-                settings["t2va_use_refmods"] = bool(spec.get("t2va_use_refmods", False))
-                # No lingering standalone first/last frames or continuation
-                # sources either; they must be explicitly requested per job.
-                for key in ("first", "last", "continue_video"):
-                    settings[key] = spec.get(key, "")
-                for key in ("continue_last_result", "glue_results",
-                            "continue_audio_memory", "latent_continuation",
-                            "combine_frames_latent"):
-                    settings[key] = bool(spec.get(key, False))
-                # Relative media paths are resolved beside the imported file.
-                for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
-                    if key in spec:
-                        settings[key] = [str((source_dir / p).resolve()) if not Path(p).is_absolute()
-                                         and not re.match(r"^[A-Za-z]:[\\/]", p) else p
-                                         for p in settings[key]]
-                self._batch_resolution_settings(spec, settings)
-                if "frames" in spec:
-                    requested = int(spec["frames"])
-                    if requested > NORMAL_FRAME_MAX and "experimental_long_duration" not in spec:
-                        settings["experimental_long_duration"] = True
-                    presets = (EXPERIMENTAL_FRAME_PRESETS if settings.get("experimental_long_duration")
-                               else FRAME_PRESETS)
-                    closest = min(presets, key=lambda n: (abs(n-requested), n))
-                    settings["frames"] = closest
-                    if closest != requested:
-                        notes.append(f"{index}: {requested} -> {closest} frames")
-                if "audio_subject" in spec:
-                    settings["audio_subjects"] = [int(spec["audio_subject"])]
-                elif "audio_subjects" in spec:
-                    settings["audio_subjects"] = [int(x) for x in spec["audio_subjects"]]
-                else:
-                    settings["audio_subjects"] = []
-                # Explicit ref/audio lists replace, rather than append to, the
-                # snapshot. Existing GUI settings are inherited only when omitted.
-                if settings.get("lock_source_audio") and not settings.get("ref_audios"):
-                    raise ValueError(f"Job {index}: exact audio is ON but Audio 1 is empty.")
-                for key in ("ref_images", "ref_videos", "ref_audios", "refmods"):
-                    for file in settings.get(key, []):
-                        if not Path(file).is_file():
-                            raise ValueError(f"Job {index}: missing {key} file:\n{file}")
-                if len(settings.get("ref_images", [])) > 9 or len(settings.get("ref_videos", [])) > 3 or len(settings.get("ref_audios", [])) > 3:
-                    raise ValueError(f"Job {index}: reference slot limit exceeded.")
-                if spec.get("name") and "output_name" not in spec:
-                    settings["output_name"] = str(spec["name"])
-                if not settings.get("prompt", "").strip():
-                    raise ValueError(f"Job {index}: empty prompt.")
-                prepared.append(settings)
+            snapshot, prepared, notes = self._prepare_generation_batch(specs, source_dir)
             summary = (f"Import {len(prepared)} generation jobs into the normal queue?\n\n"
                        "Missing generation settings use the Generate tab values captured now.\n"
                        "References, RefMods and exact-audio are cleared per job unless provided.")
@@ -7864,22 +8110,23 @@ exit /b %RC%
 
     def generate(self):
         prompt=self.prompt.toPlainText().strip()
-        if not prompt: QMessageBox.warning(self,"Prompt required","Enter a prompt before adding the job to the queue."); return
-        if not PYTHON.is_file(): QMessageBox.critical(self,"Environment missing",f"Missing {PYTHON}"); return
+        if not prompt: self._generation_notice("warning", "Prompt required","Enter a prompt before adding the job to the queue."); return
+        if not PYTHON.is_file(): self._generation_notice("critical", "Environment missing",f"Missing {PYTHON}"); return
         mode=self.mode.currentIndex(); w,h=self._current_resolution(); frames=self._frame_count()
         long_mode = self.experimental_long_duration.isChecked()
         max_frames = EXPERIMENTAL_FRAME_MAX if long_mode else NORMAL_FRAME_MAX
         if frames > max_frames:
-            QMessageBox.critical(self, "Invalid frames", f"Maximum frame count for the selected mode is {max_frames} ({max_frames / 24.0:.2f} seconds at 24 FPS)."); return
+            self._generation_notice("critical", "Invalid frames", f"Maximum frame count for the selected mode is {max_frames} ({max_frames / 24.0:.2f} seconds at 24 FPS)."); return
         # Generation always gets first claim on VRAM. If the integrated Prompt Builder
         # currently has a local LLM loaded, unload it exactly like its Settings button.
-        self._unload_prompt_builder_llm_for_generation()
+        if not getattr(self, "_codex_skip_unload", False):
+            self._unload_prompt_builder_llm_for_generation()
         t2va_refmod_test = bool(mode == 0 and self.t2va_use_refmods.isChecked())
         script="helpers/generate_ref.py" if (mode == 2 or t2va_refmod_test) else "helpers/generate.py"
         for row, strength in self.lora_rows:
             lp = row.path()
             if lp and float(strength.value()) != 0.0 and not Path(lp).is_file():
-                QMessageBox.critical(self, "LoRA missing", f"Selected LoRA file was not found:\n{lp}"); return
+                self._generation_notice("critical", "LoRA missing", f"Selected LoRA file was not found:\n{lp}"); return
         args=[script,"--width",str(w),"--height",str(h),"--frames",str(frames),"--steps",str(self.steps.value()),"--cfg",str(self.cfg.value()),"--shift",str(self.shift.value()),"--audio-shift",str(self.audio_shift.value()),"--seed",str(self.seed.value()),"--sampler",self.sampler.currentText(),"--scheduler",self.scheduler.currentText(),"--prompt",prompt]
         if long_mode:
             args += ["--experimental-long-duration"]
@@ -7894,37 +8141,37 @@ exit /b %RC%
             # Previously this silently became False unless Continue last was ON.
             continue_audio_memory=bool((continue_last or manual_continue_video) and self.continue_audio_memory.isChecked())
             if (manual_continue_video or continue_last) and self.first.path():
-                QMessageBox.warning(self,"Conflicting FL2VA inputs","Continue Video already supplies the first-frame boundary. Clear the separate First frame."); return
+                self._generation_notice("warning", "Conflicting FL2VA inputs","Continue Video already supplies the first-frame boundary. Clear the separate First frame."); return
             if self.first.path(): args += ["--first-frame",self.first.path()]
             if self.last.path(): args += ["--last-frame",self.last.path()]
             if manual_continue_video and not Path(manual_continue_video).is_file():
-                QMessageBox.warning(self,"Video missing","The selected Continue video file does not exist."); return
+                self._generation_notice("warning", "Video missing","The selected Continue video file does not exist."); return
             if continue_last:
                 forced_id=getattr(self, "_timeline_forced_continue_from_job_id", None)
                 previous=(self._job_by_id(forced_id) if forced_id else self._latest_non_cancelled_queue_job())
                 if previous is None:
-                    QMessageBox.warning(self,"No previous queue job","Continue last result needs an earlier non-cancelled queue job to continue from. Add or finish a source job first."); return
+                    self._generation_notice("warning", "No previous queue job","Continue last result needs an earlier non-cancelled queue job to continue from. Add or finish a source job first."); return
                 if previous.get("state")=="failed":
-                    QMessageBox.warning(self,"Previous job failed","The latest non-cancelled queue job failed and continuation stops there. Remove the failed job or run a new successful source job first."); return
+                    self._generation_notice("warning", "Previous job failed","The latest non-cancelled queue job failed and continuation stops there. Remove the failed job or run a new successful source job first."); return
                 if previous.get("state")=="finished" and not Path(previous.get("output","")).is_file():
-                    QMessageBox.warning(self,"Previous output missing","The latest non-cancelled queue job is finished but its output file is missing."); return
+                    self._generation_notice("warning", "Previous output missing","The latest non-cancelled queue job is finished but its output file is missing."); return
                 continue_from_job_id=previous.get("id")
                 continue_from_job_number=previous.get("job_number")
             if glue_results and not (manual_continue_video or continue_last):
-                QMessageBox.warning(self,"Glue source required","Glue results requires either a selected Continue video or Continue last result."); return
+                self._generation_notice("warning", "Glue source required","Glue results requires either a selected Continue video or Continue last result."); return
             if not self.first.path() and not self.last.path() and not manual_continue_video and not continue_last:
-                QMessageBox.warning(self,"Visual input required","Choose a first frame, last frame, Continue video, or Continue last result for FL2VA."); return
+                self._generation_notice("warning", "Visual input required","Choose a first frame, last frame, Continue video, or Continue last result for FL2VA."); return
         elif mode == 0 and t2va_refmod_test:
             # Keep pure T2VA unchanged unless the user opted into RefMod testing.
             # Reuse the validated Ref2VA conditioning worker: this is text-prompt
             # generation with saved refs, not a new native T2VA sampling path.
             mods = self.refmods.paths()
             if not mods:
-                QMessageBox.warning(self, "T2VA RefMods required", "Select at least one saved RefMod or disable the T2VA RefMod test option.")
+                self._generation_notice("warning", "T2VA RefMods required", "Select at least one saved RefMod or disable the T2VA RefMod test option.")
                 return
             for modpath in mods:
                 if not Path(modpath).is_file():
-                    QMessageBox.warning(self, "RefMod missing", f"Cannot find the selected RefMod:\n{modpath}")
+                    self._generation_notice("warning", "RefMod missing", f"Cannot find the selected RefMod:\n{modpath}")
                     return
                 args += ["--refmod", modpath]
             if self.refmod_qwen_vision.isChecked():
@@ -7933,12 +8180,12 @@ exit /b %RC%
         elif mode==2:
             refs=self.ref_images.paths()+self.ref_videos.paths()+self.ref_audios.paths()+self.refmods.paths()
             if self.refmods.paths() and (self.ref_images.paths() or self.ref_videos.paths() or self.ref_audios.paths()):
-                QMessageBox.warning(self, "RefMod test mode", "For the first experimental RefMod integration, clear ordinary image/video/audio references. Mixing them changes Qwen reference numbering and is not validated yet.")
+                self._generation_notice("warning", "RefMod test mode", "For the first experimental RefMod integration, clear ordinary image/video/audio references. Mixing them changes Qwen reference numbering and is not validated yet.")
                 return
-            if not refs: QMessageBox.warning(self,"Reference required","Add at least one Ref2VA reference."); return
+            if not refs: self._generation_notice("warning", "Reference required","Add at least one Ref2VA reference."); return
             for modpath in self.refmods.paths():
                 if not Path(modpath).is_file():
-                    QMessageBox.warning(self, "RefMod missing", f"Cannot find the selected RefMod:\n{modpath}")
+                    self._generation_notice("warning", "RefMod missing", f"Cannot find the selected RefMod:\n{modpath}")
                     return
                 args += ["--refmod", modpath]
             if self.refmods.paths() and self.refmod_qwen_vision.isChecked():
@@ -7955,7 +8202,7 @@ exit /b %RC%
                     args += ["--ref-audio-subject", str(subject_n)]
             if self.lock_source_audio.isChecked():
                 if not ref_audios:
-                    QMessageBox.warning(self, "Source audio required", "Use Audio 1 as exact source / output needs at least one standalone audio file in Audio slot 1.")
+                    self._generation_notice("warning", "Source audio required", "Use Audio 1 as exact source / output needs at least one standalone audio file in Audio slot 1.")
                     return
                 args += ["--lock-source-audio-index", "1"]
         # RefMod T2VA uses the Ref2VA-conditioned diffusion checkpoint/worker.
@@ -7975,7 +8222,7 @@ exit /b %RC%
         tile_size = int(self.vram_video_vae_tile_size.value())
         tile_overlap = int(self.vram_video_vae_tile_overlap.value())
         if tile_overlap >= tile_size:
-            QMessageBox.warning(self, "Invalid VAE tiling", "Video VAE tile overlap must be smaller than the tile size.")
+            self._generation_notice("warning", "Invalid VAE tiling", "Video VAE tile overlap must be smaller than the tile size.")
             return
         args += ["--video-vae-tile-size", str(tile_size), "--video-vae-tile-overlap", str(tile_overlap)]
         if self.extended_logging.isChecked(): args += ["--extended-logging"]
@@ -7991,7 +8238,7 @@ exit /b %RC%
         if self.use_hybrid_model.isChecked():
             resolved_hybrid = self._resolve_hybrid_model_path(populate=True)
             if resolved_hybrid is None:
-                QMessageBox.critical(self, "Hybrid model missing", "Use hybrid model is enabled, but no compatible hybrid .safetensors checkpoint was found in the selected path or MiniMax model folders."); return
+                self._generation_notice("critical", "Hybrid model missing", "Use hybrid model is enabled, but no compatible hybrid .safetensors checkpoint was found in the selected path or MiniMax model folders."); return
             model_path = str(resolved_hybrid)
             model_label = f"Hybrid: {resolved_hybrid.name}"
         else:
@@ -8365,6 +8612,17 @@ exit /b %RC%
 
     def closeEvent(self, e):
         self._closing = True
+        if hasattr(self, "_codex_timer"):
+            self._codex_timer.stop()
+            try:
+                if self._codex_active is not None:
+                    self._codex_finish_batch("Application closed during batch submission.")
+                from runtime.codex_bridge import MAILBOX
+                (MAILBOX / "session.json").unlink(missing_ok=True)
+            except Exception as exc:
+                self.append_log(f"[Codex] Shutdown warning: {exc}\n")
+            finally:
+                self._codex_lock.unlock()
         try:
             if self.telegram_remote is not None:
                 self.telegram_remote.stop()
