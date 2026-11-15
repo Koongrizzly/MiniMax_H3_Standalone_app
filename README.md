@@ -27,6 +27,8 @@ Main Features :
 
 - Timeline Director
 
+- Minimax Image / edit
+
 - Music video clip creator
 
 - Text and effects overlay creation (beatsyncFX)
@@ -52,16 +54,39 @@ Main Features :
 ---
 
 - 11/15/2026
-  - added better support for agents
-    - 🤖 Agent-Ready Video Production
-    - GrizzlyMax includes built-in AI agent tooling and comprehensive AGENTS.md instructions,
+
+  - MiniMax H3 Image Generation & Editing
+    - Fully integrated local text-to-image and image editing.
+    - Native high-resolution image generation up to 16 MP and beyond.
+    - Support for up to 16 reference images.
+    - Adjustable resolution, sampling steps and seed.
+    - Enhanced fine details with adjustable influence.
+    - Smart reference framing to reduce unwanted cropping.
+    - Support for multiple quantized diffusion checkpoints.
+    - Optimized CUDA acceleration for faster generation on consumer GPUs.
+    - Low VRAM mode for GPUs with limited memory.
+    - dedicated agent instructions included in the assets folder.
+
+      - Performance example — RTX 3090 24 GB:
+      - 2048 × 2048 text-to-image: approximately 12 seconds.
+      - 4096 × 4096 text-to-image: approximately 41 seconds.
+      - 16 MP image editing: approximately 44 seconds.
+
+    - All image generation and editing runs locally, without cloud services or API costs.
+    - Performance varies depending on hardware, checkpoints and generation settings.
+  
+  - 🤖 Agent-Ready Video Production
+    - GrizzlyMax now includes built-in AI agent tooling and comprehensive AGENTS.md instructions,
     - enabling compatible AI agents to generate videos, configure generation parameters, submit batches,
     - monitor queues, upscale clips and assist with complete music video production workflows.
     - No additional AI agent server is required for the local queue bridge.
+
   - added a batch tool to allow multiple prompts at once
+
   - cleanup of beatsyncFX app :
     -  new tab with timeline for video/png/gif layers
-    -  all effects (50+) ordered in 1 place, made a little more user friendly
+    -  all effects (50+) ordered in 1 place, no more confusing separate beatsync tab
+
   - bugfixes
 
 ---
