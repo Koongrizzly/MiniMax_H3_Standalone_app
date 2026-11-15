@@ -51,6 +51,16 @@ Main Features :
 
 ---
 
+- 11/15/2026
+  - added better support for agents
+  - added a batch tool to allow multiple prompts at once
+  - cleanup of beatsyncFX app :
+    -  new tab with timeline for video/png/gif layers
+    -  all effects (50+) ordered in 1 place, made a little more user friendly
+  - bugfixes
+
+---
+
 - 11/11/2026
   - added Relay VSR upscale
 
