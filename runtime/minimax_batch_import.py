@@ -19,7 +19,7 @@ _SUPPORTED = {
     'first','last','continue_video','continue_last_result','continue_context_frames',
     'glue_results','continue_audio_memory','latent_continuation','combine_frames_latent',
     'refmod_qwen_vision','t2va_use_refmods','generation_vsr_enabled','generation_vsr_scale',
-    'generation_vsr_engine', 'vram_manager_auto_bypass','vram_residency_engine',
+    'generation_vsr_engine', 'widescreen_quality', 'fl2va_model', 'ref2va_model', 'text_encoder_model', 'video_vae_model', 'audio_vae_model', 'vram_manager_auto_bypass','vram_residency_engine',
     'vram_runtime_free_gb','vram_text_headroom_gb','vram_diffusion_headroom_gb',
     'vram_offload_chunk_mb','vram_max_resident_weights_gb','vram_residency_fill',
     'vram_residency_target_free_gb','vram_residency_warmup_blocks',
