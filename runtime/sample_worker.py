@@ -64,11 +64,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_6_ULTRA_CLIP_PRESSURE_20261003A"
+        expected = "V11_7_VIDEO_REF_ADMISSION_20261115A"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.6 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.7 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     torch.set_grad_enabled(False)
     if len(ns.lora) != len(ns.lora_strength): raise ValueError('Each --lora needs one matching --lora-strength')
     if len(ns.lora) > 3: raise ValueError('Maximum 3 LoRAs are supported')

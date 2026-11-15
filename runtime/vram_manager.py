@@ -8,8 +8,8 @@ import torch
 _GIB = 1024 ** 3
 _MIB = 1024 ** 2
 
-VRAM_MANAGER_SIGNATURE = "V11_6_ULTRA_CLIP_PRESSURE_20261003A"
-VRAM_MANAGER_VERSION = "V11.6"
+VRAM_MANAGER_SIGNATURE = "V11_7_VIDEO_REF_ADMISSION_20261115A"
+VRAM_MANAGER_VERSION = "V11.7"
 
 
 @dataclass
@@ -105,6 +105,8 @@ class VRAMManager:
         self._ultra_admission_logged = False
         # Additional activation runway only for >=2 visual RefMods.
         self._multi_refmod_target_bytes = 0
+        self._video_ref_load_bytes = 0
+        self._video_ref_block_bytes = 0
 
     @staticmethod
     def _gb(n: int) -> str:
@@ -145,6 +147,30 @@ class VRAMManager:
             force=True,
         )
 
+    def arm_video_reference_diffusion(self, video_count: int, visual_tokens: int):
+        """Reserve packed-reference activation workspace without reducing inputs.
+
+        V11.7: initial runway and per-block runway are separate: live packed
+        tensors persist between blocks, so demanding the initial runway again
+        at every boundary can unnecessarily evict the whole transformer.
+        """
+        if video_count < 1 or not self.is_stage_managed("diffusion"):
+            return
+        free, total = self._cuda_free()
+        if total is None:
+            return
+        # Empirical starting policy for the observed 19.53 GiB hybrid. Scale
+        # with actual patchified reference latents, not source file duration.
+        extra = max(0, int(visual_tokens) - 16000) / 16000
+        load_gb = min(14.0, 9.0 + 2.0 * (video_count - 1) + 1.0 * extra)
+        block_gb = min(8.0, 5.0 + 0.75 * (video_count - 1) + 0.5 * extra)
+        self._video_ref_load_bytes = min(int(total * 0.70), int(load_gb * _GIB))
+        self._video_ref_block_bytes = min(int(total * 0.45), int(block_gb * _GIB))
+        self._set_comfy_reserve(self.load_headroom_bytes())
+        self._log(f"V11.7 video-reference diffusion admission | videos={video_count} | "
+                  f"visual reference tokens={visual_tokens} | initial runway={self._gb(self._video_ref_load_bytes)} | "
+                  f"block runway={self._gb(self._video_ref_block_bytes)} | residency refill suspended | full references preserved", force=True)
+
     def load_headroom_bytes(self) -> int:
         if self.stage == "diffusion":
             gb = self.cfg.diffusion_load_headroom_gb
@@ -152,7 +178,7 @@ class VRAMManager:
             gb = self.cfg.vae_load_headroom_gb
         else:
             gb = self.cfg.text_load_headroom_gb
-        return max(self.runtime_floor_bytes(), int(float(gb) * _GIB), int(self._multi_refmod_target_bytes) if self.stage == "diffusion" else 0)
+        return max(self.runtime_floor_bytes(), int(float(gb) * _GIB), max(self._multi_refmod_target_bytes, self._video_ref_load_bytes) if self.stage == "diffusion" else 0)
 
     @staticmethod
     def _normalize_stage(stage: str) -> str:
@@ -179,6 +205,8 @@ class VRAMManager:
     def set_stage(self, stage: str):
         self.stage = self._normalize_stage(stage)
         if self.stage != "diffusion":
+            self._video_ref_load_bytes = 0
+            self._video_ref_block_bytes = 0
             self._multi_refmod_target_bytes = 0
             self._extreme_diffusion_pressure = False
             self._ultra_diffusion_pressure = False
@@ -437,8 +465,8 @@ class VRAMManager:
                 return manager._orig_load_models_gpu(models, *args, **kwargs)
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
-            if manager.stage == "diffusion" and manager._multi_refmod_target_bytes:
-                reserve = max(reserve, manager._multi_refmod_target_bytes)
+            if manager.stage == "diffusion":
+                reserve = max(reserve, manager._multi_refmod_target_bytes, manager._video_ref_load_bytes)
             # V11.6: while Qwen conditioning admission is armed, keep the large
             # activation runway visible to *every* Comfy load call.  encode() calls
             # CLIP.load_model(tokens) again, so dropping back to the 0.5 GiB runtime
@@ -562,10 +590,16 @@ class VRAMManager:
                 # footprint is still unknown. Residency fill begins only after warm-up.
                 if manager.stage == "text" and manager._text_conditioning_target_bytes > 0:
                     manager._set_comfy_reserve(int(manager._text_conditioning_target_bytes))
+                elif manager.stage == "diffusion" and manager._video_ref_load_bytes:
+                    manager.trim_cuda_cache(reason="video-reference admission", force=True)
+                    manager.enforce_loaded(reason="video-reference initial admission", target_free=manager._video_ref_load_bytes)
+                    manager.log_residency("after video-reference admission", force=True)
+                    manager._set_comfy_reserve(reserve)
                 else:
                     manager._set_comfy_reserve(manager.runtime_floor_bytes())
             else:
-                manager.enforce_loaded(reason=f"{manager.stage} reload")
+                target = max(manager.runtime_floor_bytes(), manager._video_ref_block_bytes) if manager.stage == "diffusion" and manager._video_ref_load_bytes else None
+                manager.enforce_loaded(reason=f"{manager.stage} reload", target_free=target)
             return out
 
         self.mm.load_models_gpu = managed_load_models_gpu
@@ -665,7 +699,7 @@ class VRAMManager:
         MiniMax weights that immediately forced a reload inside the first DiT block
         and could surface as cudaErrorIllegalAddress rather than a clean OOM.
         """
-        if self.stage != "diffusion" or not self._extreme_diffusion_pressure:
+        if self.stage != "diffusion" or not (self._extreme_diffusion_pressure or self._video_ref_load_bytes):
             return 0
         try:
             size = int(patcher.model_size())
@@ -732,13 +766,13 @@ class VRAMManager:
 
         need = min(need, loaded)
         try:
-            if self.stage == "diffusion" and self._extreme_diffusion_pressure:
+            if self.stage == "diffusion" and (self._extreme_diffusion_pressure or self._video_ref_load_bytes):
                 # Serialize outstanding CUDA work before ModelPatcher mutates W4A8
                 # residency. This is intentionally slower than async streaming but
                 # avoids racing quantized weight copies with in-flight kernels.
                 torch.cuda.synchronize()
             freed = int(patcher.partially_unload(patcher.offload_device, need) or 0)
-            if self.stage == "diffusion" and self._extreme_diffusion_pressure:
+            if self.stage == "diffusion" and (self._extreme_diffusion_pressure or self._video_ref_load_bytes):
                 torch.cuda.synchronize()
         except Exception as exc:
             self._log(f"offload skipped ({reason}): {exc}", force=True)
@@ -766,7 +800,7 @@ class VRAMManager:
         return total_freed
 
     def fill_residency(self, reason: str = "diffusion residency fill") -> int:
-        if not self.cfg.residency_fill_enabled or self.stage != "diffusion" or not torch.cuda.is_available():
+        if self._video_ref_load_bytes or not self.cfg.residency_fill_enabled or self.stage != "diffusion" or not torch.cuda.is_available():
             return 0
         free,_=self._cuda_free()
         if free is None:
@@ -838,11 +872,16 @@ class VRAMManager:
                 force=True,
             )
             self._ultra_admission_logged = True
-        interval = max(1, int(self.cfg.block_check_interval))
+        interval = 1 if self.stage == "diffusion" and self._video_ref_load_bytes else max(1, int(self.cfg.block_check_interval))
         if self._block_calls % interval == 0:
             target = self.runtime_floor_bytes()
             if self.stage == "diffusion" and self._sampling_target_free_bytes > 0:
                 target = max(target, int(self._sampling_target_free_bytes))
+            if self.stage == "diffusion" and self._video_ref_block_bytes:
+                target = max(target, self._video_ref_block_bytes)
+                free, _ = self._cuda_free()
+                if free is not None and free < target:
+                    self.trim_cuda_cache(reason="video-reference block admission", force=True)
             self.enforce_loaded(reason=reason, target_free=target)
             # V7: do not empty the CUDA cache at normal DiT boundaries. The
             # allocator ceiling is the spill guard; cached workspaces are kept

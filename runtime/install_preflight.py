@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from helpers.shared_whisper import shared_python, ct2_medium, cpp_medium
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QComboBox, QFileDialog, QMessageBox, QScrollArea, QWidget)
+    QPushButton, QComboBox, QFileDialog, QMessageBox, QScrollArea, QWidget, QFormLayout, QDialogButtonBox)
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / 'presets' / 'setsave' / 'install_preflight_paths.json'
@@ -88,7 +88,7 @@ def relayvsr_ready():
     return comfy.is_file() and py.is_file() and 4 in relayvsr_installed_scales()
 
 
-def media_state():
+def media_state(owner=None):
     overrides = paths()
     binroot = ROOT/'presets/bin'
     ffroot = Path(overrides.get('ffmpeg', str(binroot)))
@@ -106,6 +106,7 @@ def media_state():
     llama = prompt_llama_runner()
     whisper_shared_ok = cpp_ok or music_ok
     return [
+        dict(key='h3_image', title='MiniMax H3 Image', ok=image_ready(owner), action='Install / configure', note='Image engine, diffusion, text encoder and Image VAE'),
         dict(key='grizzly', title='GrizzlyMax environment', ok=(ROOT/'environments/.minimax_h3_int4/python.exe').is_file() or (ROOT/'environments/.minimax_h3_int4/Scripts/python.exe').is_file(), action='Install', note='GrizzlyMax root install.bat; existing models are preserved'),
         dict(key='ffmpeg', title='FFmpeg bundle', ok=ff_ok, action='Download', note='Needs ffmpeg.exe, ffprobe.exe and ffplay.exe in presets/bin'),
         dict(key='shared_cpp_whisper', title='Shared Whisper.cpp — Prompt Builder + Music Clip Creator', ok=whisper_shared_ok, action='Install', note='One shared whisper-cli.exe install for both tools; supports GGML/GGUF-compatible models and uses the existing Music Clip Creator whisper.cpp runtime when available'),
@@ -149,6 +150,84 @@ def _cmd_for(key, action=None):
         return None, None
     return None, None
 
+def image_ready(owner=None):
+    try:
+        from helpers.h3_image_gui import read_settings, embedded_settings, DEFAULT
+        from runtime.h3_image.engine import installed_models
+        from runtime.h3_image.queue_worker import shared_encoder
+        d=embedded_settings(read_settings()); groups=installed_models()
+        if not all(Path(DEFAULT[k]).is_file() for k in ('backend_python','backend_main')): return False
+        for k in ('diffusion','vae'):
+            desired=d.get(k) or ''
+            if desired and not Path(desired).is_file() and not any(Path(p).name == Path(desired).name for p in groups[k]): return False
+            if not desired and not groups[k]: return False
+        if d.get('reuse_h3_encoder',True):
+            shared_encoder(owner.text_encoder_model.path() if hasattr(owner, 'text_encoder_model') else ''); return True
+        desired=d.get('encoder') or ''
+        return bool(Path(desired).is_file() or (not desired and groups['encoder']) or (desired and any(Path(p).name==Path(desired).name for p in groups['encoder'])))
+    except Exception: return False
+
+
+def configure_image(parent):
+    from helpers.h3_image_gui import read_settings, embedded_settings, write_settings, DEFAULT
+    d=embedded_settings(read_settings()); dialog=QDialog(parent); dialog.setWindowTitle('MiniMax H3 Image installation')
+    from runtime.h3_image.engine import installed_models
+    groups=installed_models()
+    layout=QVBoxLayout(dialog); form=QFormLayout(); layout.addLayout(form)
+    selections={}
+    options={
+        'backend':[('Install / repair backend','install'),('Skip','none')],
+        'diffusion':[('Download W4A8','w4a8'),('Download INT8','int8'),('Select my own','locate'),('Skip','none')],
+        'encoder':[('Use MiniMax H3 text encoder (recommended)','reuse'),('Download NVFP4','nvfp4'),('Download INT8','int8'),('Select my own','locate'),('Skip','none')],
+        'vae':[('Download Image VAE','download'),('Select my own','locate'),('Skip','none')],
+    }
+    for key,items in options.items():
+        combo=QComboBox(); selections[key]=combo
+        for label,value in items: combo.addItem(label,value)
+        if key=='backend' and all(Path(DEFAULT[k]).is_file() for k in ('backend_python','backend_main')): combo.setCurrentIndex(combo.findData('none'))
+        if key in ('diffusion','vae') and (Path(d.get(key) or '').is_file() or groups[key]): combo.setCurrentIndex(combo.findData('none'))
+        if key=='encoder' and not d.get('reuse_h3_encoder',True) and Path(d.get(key) or '').is_file(): combo.setCurrentIndex(combo.findData('none'))
+        form.addRow({'backend':'Environment','diffusion':'Diffusion','encoder':'Text encoder','vae':'Image VAE'}[key],combo)
+    buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
+    if dialog.exec()!=QDialog.Accepted: return
+    choices={k:v.currentData() for k,v in selections.items()}
+    owner=parent.parent()
+    if choices['backend']=='install' and any(j.get('job_type')=='h3_image' and j.get('state')=='running' for j in getattr(owner,'queue_jobs',[])):
+        QMessageBox.warning(parent,'Image backend in use','Finish or cancel the running image job before repairing its backend.'); return
+    for key in ('diffusion','encoder','vae'):
+        if choices[key]=='locate':
+            path,_=QFileDialog.getOpenFileName(parent,'Select '+key+' checkpoint',str(ROOT/'models'),'Safetensors (*.safetensors)')
+            if not path: return
+            d[key]=path
+    if choices['encoder']!='none': d['reuse_h3_encoder']=choices['encoder']=='reuse'
+    if choices['encoder']=='reuse':
+        try:
+            from runtime.h3_image.queue_worker import shared_encoder
+            owner=parent.parent()
+            shared_encoder(owner.text_encoder_model.path() if hasattr(owner,'text_encoder_model') else '')
+        except Exception as exc:
+            QMessageBox.warning(parent,'Shared text encoder',str(exc)+'\nInstall the H3 video text encoder before generating images.')
+    # Explicit downloads set the selected path, so a previous checkpoint cannot silently win.
+    files={'w4a8':'diffusion_models/minimax_h3_image_pruned_w4a8.safetensors','int8':'diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors','nvfp4':'text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors'}
+    base=ROOT/'models/minimax_h3_image'
+    if choices['diffusion'] in ('w4a8','int8'): d['diffusion']=str(base/files[choices['diffusion']])
+    if choices['encoder'] in ('nvfp4','int8'): d['encoder']=str(base/(files['nvfp4'] if choices['encoder']=='nvfp4' else 'text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors'))
+    if choices['vae']=='download': d['vae']=str(base/'vae/minimax_h3_image_vae_fp16.safetensors')
+    for key in ('backend_python','backend_main','backend_url'): d[key]=DEFAULT[key]
+    write_settings(d)
+    args=['--no-auto-vae']
+    if choices['backend']=='install': args+=['--backend']
+    if choices['diffusion'] in ('w4a8','int8'): args+=['--models',choices['diffusion']]
+    if choices['encoder'] in ('nvfp4','int8'): args+=['--encoder',choices['encoder']]
+    if choices['vae']=='download': args+=['--vae']
+    if len(args)>1:
+        script=ROOT/'presets/install_h3_image.bat'
+        if not script.is_file(): QMessageBox.warning(parent,'Installer missing',str(script)); return
+        try: subprocess.Popen(['cmd.exe','/d','/c','call',str(script),*args],cwd=str(ROOT),creationflags=getattr(subprocess,'CREATE_NEW_CONSOLE',0))
+        except OSError as exc: QMessageBox.warning(parent,'Installer error',str(exc))
+        else: QMessageBox.information(parent,'Installer launched','Check the installation window, then Recheck. Refresh checkpoints in Images Settings when finished.')
+
+
 class PreflightDialog(QDialog):
     def __init__(self,parent=None):
         super().__init__(parent)
@@ -172,12 +251,14 @@ class PreflightDialog(QDialog):
             item=self.rows.takeAt(0); w=item.widget()
             if w: w.deleteLater()
         self.controls={}
-        for record in media_state():
+        for record in media_state(self.parent()):
             line=QWidget();h=QHBoxLayout(line);h.setContentsMargins(2,4,2,4)
             label=QLabel(('[OK] ' if record['ok'] else '[MISSING] ')+record['title']+'\n'+record['note'])
             label.setWordWrap(True);h.addWidget(label,1)
             select=QComboBox()
-            if record['key'] == 'relayvsr':
+            if record['key'] == 'h3_image':
+                choices=[('Skip / no action', 'none'), ('Install / configure', 'image_setup')]
+            elif record['key'] == 'relayvsr':
                 choices = ([('Installed X4 INT8 — no action', 'none'),
                             ('Repair X4 INT8 (X2/X4 output)', 'relay_4')]
                            if record['ok'] else
@@ -236,6 +317,9 @@ class PreflightDialog(QDialog):
         launched=[]
         for record,choice in chosen:
             key=record['key']
+            if choice == 'image_setup':
+                configure_image(self)
+                continue
             if choice == 'locate':
                 self.locate(key)
                 continue

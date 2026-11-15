@@ -259,6 +259,12 @@ def decide_vram_stages(
     else:
         total, free, name = gpu
 
+    diffusion_required = estimate_native_sampling_vram_gib(width, height, frames, mode)
+    # Coarse preflight only. The worker subsequently uses actual latent tokens.
+    if str(mode).lower() == "ref2va" and ref_video_count > 0:
+        model_delta = 8.0 if _is_hybrid_checkpoint(diffusion_model_path) else 0.0
+        reference_ratio = max(1, reference_frames) * max(32, width) * max(32, height) / (736.0 * 384.0 * 124.0)
+        diffusion_required += model_delta + 2.0 + 3.0 * ref_video_count * reference_ratio + 0.25 * ref_image_count
     stages = {
         "reference": _stage_decision(
             estimate_reference_encode_vram_gib(
@@ -287,7 +293,7 @@ def decide_vram_stages(
             needed=True,
         ),
         "diffusion": _stage_decision(
-            estimate_native_sampling_vram_gib(width, height, frames, mode),
+            diffusion_required,
             usable,
             "diffusion",
             needed=True,
@@ -310,6 +316,9 @@ def decide_vram_stages(
         total_gib=total,
         diffusion_model_path=diffusion_model_path,
     )
+    if str(mode).lower() == "ref2va" and ref_video_count > 0 and (total is None or total <= 32.0):
+        stages["diffusion"]["use_manager"] = True
+        stages["diffusion"]["reason"] = "video references on <=32 GiB GPU: managed diffusion with packed-token admission"
     return {
         "gpu_name": name,
         "total_gib": total,

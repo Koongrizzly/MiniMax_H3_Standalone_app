@@ -208,11 +208,11 @@ def main():
     ap.add_argument('--vram-keep-text-encoder', action='store_true')
     ns=ap.parse_args()
     if ns.vram_manager:
-        expected = "V11_6_ULTRA_CLIP_PRESSURE_20261003A"
+        expected = "V11_7_VIDEO_REF_ADMISSION_20261115A"
         actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
         if actual != expected:
             raise RuntimeError(f"VRAM Manager worker mismatch: expected {expected}, got {actual!r} from {getattr(_vram_manager_module, '__file__', 'unknown')}")
-        print(f"[VRAM-MGR] V11.6 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
+        print(f"[VRAM-MGR] V11.7 worker runtime verified: {getattr(_vram_manager_module, '__file__', 'unknown')}", flush=True)
     if ns.t2va_refmods:
         if not ns.refmod or ns.ref_image or ns.ref_video or ns.ref_audio:
             raise ValueError('T2VA RefMod mode requires saved RefMods only')
@@ -420,6 +420,7 @@ def main():
             torch.zeros_like(locked_source_audio),
         ))
         print(f'Locked source audio ACTIVE | target audio latent={tuple(locked_source_audio.shape)} | denoise mask=0 | video denoise mask=1', flush=True)
+    video_reference_count = len(video_data)
     del avae,video_data; _flush_models()
     if ns.extended_logging: log_mem('after Ref2VA audio reference encode / VAE flush', sync=True)
     if manager is not None: manager.set_stage('text')
@@ -478,6 +479,12 @@ def main():
         log_mem('after text encoder conditioning')
         if torch.cuda.is_available(): print(f'[PEAK] text encoder CUDA peak allocated={_fmt_bytes(torch.cuda.max_memory_allocated())} reserved={_fmt_bytes(torch.cuda.max_memory_reserved())}', flush=True)
     if qwen_patch is not None: qwen_patch[0].TransformerBlock.forward=qwen_patch[1]
+    # Same 2x2 spatial patchification as RefMod.token_count. Count actual
+    # encoded references, including their temporal extent, before deleting blocks.
+    visual_reference_tokens = sum(
+        max(1, int(b.get('latent_t', 1))) * (int(b.get('latent_h', 0)) // 2) * (int(b.get('latent_w', 0)) // 2)
+        for b in ref_blocks if b.get('kind') in ('image', 'video', 'video_audio')
+    )
     positive=node_helpers.conditioning_set_values(positive,{'minimax_refs':ref_blocks}); negative=zero_conditioning(positive)
     del ref_items,ref_blocks
     if ns.vram_keep_text_encoder:
@@ -491,6 +498,8 @@ def main():
         # attention activation pressure not captured by Comfy's native hint.
         if visual_refmod_count >= 2:
             manager.arm_multi_refmod_diffusion(visual_refmod_count, visual_refmod_tokens)
+        if video_reference_count:
+            manager.arm_video_reference_diffusion(video_reference_count, visual_reference_tokens)
     if ns.extended_logging: _log_checkpoint('Ref2VA diffusion checkpoint', ns.diffusion); log_mem('before diffusion model load'); torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
     print('Loading W4A8 Ref2VA diffusion model...',flush=True)
     model=comfy.sd.load_diffusion_model(ns.diffusion)
