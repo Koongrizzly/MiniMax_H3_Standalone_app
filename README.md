@@ -53,6 +53,11 @@ Main Features :
 
 - 11/15/2026
   - added better support for agents
+    - 🤖 Agent-Ready Video Production
+    - GrizzlyMax includes built-in AI agent tooling and comprehensive AGENTS.md instructions,
+    - enabling compatible AI agents to generate videos, configure generation parameters, submit batches,
+    - monitor queues, upscale clips and assist with complete music video production workflows.
+    - No additional AI agent server is required for the local queue bridge.
   - added a batch tool to allow multiple prompts at once
   - cleanup of beatsyncFX app :
     -  new tab with timeline for video/png/gif layers
