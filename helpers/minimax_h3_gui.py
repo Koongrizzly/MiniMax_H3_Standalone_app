@@ -3,7 +3,7 @@ import json, os, sys, subprocess, time, socket, urllib.request, urllib.parse, re
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QTimer, QEvent, QUrl, QSizeF, Signal, QLockFile
+from PySide6.QtCore import Qt, QProcess, QTimer, QEvent, QUrl, QSizeF, Signal, QLockFile, QProcessEnvironment
 from PySide6.QtGui import QDesktopServices, QTextCursor, QPainter, QColor, QBrush, QPixmap, QIcon
 
 try:
@@ -1515,6 +1515,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.workspace_scroll, 1)
 
         self._build_generation_tab()
+        self._build_images_tab()
         self._build_prompt_builder_tab()
         self._build_queue_tab()
         self._build_music_clip_tab()
@@ -1549,6 +1550,36 @@ class MainWindow(QMainWindow):
             for w in self.findChildren(cls):
                 w.installEventFilter(self.wheel_filter)
                 w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _build_images_tab(self):
+        try:
+            from helpers.h3_image_gui import GUI
+            self.image_widget = GUI(self)
+            page = self.image_widget
+        except Exception as exc:
+            self.image_widget = None
+            page = QWidget(); lay = QVBoxLayout(page)
+            message = QLabel("Images unavailable: " + str(exc)); message.setWordWrap(True)
+            lay.addWidget(message); lay.addStretch(1)
+        self.image_page = page
+        index = self.tabs.addTab(page, "Images")
+        self.tabs.tabBar().setTabData(index, "images")
+
+    def _images_is_active(self):
+        return getattr(self, "image_page", None) is self.tabs.currentWidget()
+
+    def _enqueue_image_job(self):
+        try:
+            from runtime.h3_image.queue_worker import make_job
+            job = make_job(self.image_widget.gather(), self.image_widget.selected_models())
+            job["job_number"] = self._take_next_job_number()
+        except Exception as exc:
+            QMessageBox.warning(self, "Images", str(exc)); return
+        self.queue_jobs.append(job)
+        self._save_queue_state(); self._refresh_queue_views()
+        self.status.setText("Image job added to queue")
+        self.append_log("Image queued: " + job["output"] + "\n")
+        self._start_next_pending()
 
     def _build_generation_tab(self):
         body = QWidget(); v = QVBoxLayout(body); v.setContentsMargins(8, 8, 8, 8); v.setSpacing(10)
@@ -2516,9 +2547,9 @@ class MainWindow(QMainWindow):
                 elif state=="pending":
                     counts["pending"]+=1
                     pending_status = j.get("phase") or "Waiting"
-                    if self._ffmpeg_setup_proc and self._ffmpeg_setup_proc.state() != QProcess.ProcessState.NotRunning:
+                    if j.get("job_type") != "h3_image" and self._ffmpeg_setup_proc and self._ffmpeg_setup_proc.state() != QProcess.ProcessState.NotRunning:
                         pending_status = "Waiting for FFmpeg setup…"
-                    elif self._ffmpeg_setup_failed and not ffmpeg_tools_ready():
+                    elif j.get("job_type") != "h3_image" and self._ffmpeg_setup_failed and not ffmpeg_tools_ready():
                         pending_status = "FFmpeg setup failed"
                     item=QTreeWidgetItem([job_label,self._fmt_clock(j.get("created_at")),pending_status,res,duration,seed,dependency,source,out,model]); item.setData(0,Qt.ItemDataRole.UserRole,j["id"]); self.pending_tree.addTopLevelItem(item)
                     self._apply_queue_dependency_tooltips(item,j,6,7)
@@ -2526,7 +2557,7 @@ class MainWindow(QMainWindow):
                     counts["finished"]+=1
                     status="Finished" if state=="finished" else ("Cancelled" if state=="cancelled" else "Failed")
                     clip_duration = j.get("clip_duration")
-                    if clip_duration is None and state == "finished":
+                    if clip_duration is None and state == "finished" and j.get("job_type") != "h3_image":
                         clip_duration = self._probe_clip_duration(j.get("output"), j.get("frames"))
                         if clip_duration is not None:
                             j["clip_duration"] = clip_duration
@@ -2640,12 +2671,13 @@ class MainWindow(QMainWindow):
             delete=menu.addAction("Delete pending job")
         else:
             if job.get("state")=="finished" and Path(job.get("output","")).is_file():
-                play=menu.addAction("Play clip")
-                load_beatsync=menu.addAction("Load in BeatSyncFX")
-                vsr_menu=menu.addMenu("Upscale with NVIDIA VSR")
-                vsr_actions={vsr_menu.addAction(f"VSR x{k}"):("nvidia_vsr",k) for k in (1,2,3)}
-                relay_menu=menu.addMenu("Upscale with RelayVSR")
-                vsr_actions.update({relay_menu.addAction(f"RelayVSR x{k}"):("relayvsr",k) for k in (1,2,3,4)})
+                play=menu.addAction("Preview image" if job.get("job_type") == "h3_image" else "Play clip")
+                if job.get("job_type") != "h3_image":
+                    load_beatsync=menu.addAction("Load in BeatSyncFX")
+                    vsr_menu=menu.addMenu("Upscale with NVIDIA VSR")
+                    vsr_actions={vsr_menu.addAction(f"VSR x{k}"):("nvidia_vsr",k) for k in (1,2,3)}
+                    relay_menu=menu.addMenu("Upscale with RelayVSR")
+                    vsr_actions.update({relay_menu.addAction(f"RelayVSR x{k}"):("relayvsr",k) for k in (1,2,3,4)})
                 loaded=(self.preview_path and Path(self.preview_path)==Path(job.get("output","")))
                 delete_disk=menu.addAction("Delete from disk + queue" + (" (currently loaded)" if loaded else ""))
             if job.get("state") in ("failed","cancelled"):
@@ -2697,7 +2729,33 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         if not path.is_file(): QMessageBox.warning(self,"Preview","Output file is no longer on disk."); return
+        is_image = path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+        pix = QPixmap(str(path)) if is_image and self.media_player is not None else None
+        if pix is not None and pix.isNull():
+            QMessageBox.warning(self, "Preview", "Unable to load " + path.name); return
         self.preview_path=str(path)
+        if self.media_player is not None:
+            self.media_player.stop()
+            if getattr(self, "preview_image_item", None) is not None:
+                self.preview_scene.removeItem(self.preview_image_item)
+                self.preview_image_item = None
+            if is_image and self.video_item.scene() is self.preview_scene:
+                self.preview_scene.removeItem(self.video_item)
+            elif not is_image and self.video_item.scene() is None:
+                self.preview_scene.addItem(self.video_item)
+            for control in (self.preview_play, self.preview_stop, self.preview_repeat, self.preview_slider):
+                control.setEnabled(not is_image)
+            if is_image:
+                self.media_player.setSource(QUrl())
+                self.preview_image_item = self.preview_scene.addPixmap(pix)
+                self.preview_scene.setSceneRect(self.preview_image_item.boundingRect())
+                self.preview_label.setText(path.name)
+                self.preview_time.setText("Image")
+                self.preview_view.reset_view()
+                return
+            self.preview_scene.setSceneRect(self.video_item.boundingRect())
+        elif is_image:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))); return
         try:
             start_ms=max(0,int(round(float(trim_in or 0.0)*1000.0)))
         except Exception:
@@ -2749,6 +2807,11 @@ class MainWindow(QMainWindow):
         self.media_player.setPosition(target)
 
     def _open_preview_fullscreen(self):
+        if getattr(self, "preview_image_item", None) is not None:
+            dialog = ImagePreviewDialog("Image preview", self)
+            dialog.set_image(self.preview_path)
+            dialog.toggle_fullscreen()
+            dialog.exec(); return
         if not self.media_player or not self.preview_path:
             QMessageBox.information(self, "Preview", "Load a video in the preview first.")
             return
@@ -2767,12 +2830,14 @@ class MainWindow(QMainWindow):
                 self.media_player.setPosition(start)
             self.media_player.play()
     def _preview_duration_changed(self,d):
+        if getattr(self, "preview_image_item", None) is not None: return
         start,end=self._preview_bounds()
         self.preview_slider.setRange(0,max(0,end-start))
         if self.media_player and int(self.media_player.position()) < start:
             self.media_player.setPosition(start)
         self._preview_position_changed(self.media_player.position() if self.media_player else 0)
     def _preview_position_changed(self,p):
+        if getattr(self, "preview_image_item", None) is not None: return
         if not self.media_player: return
         start,end=self._preview_bounds()
         p=int(p)
@@ -2792,6 +2857,7 @@ class MainWindow(QMainWindow):
             sec=max(0,int(ms)//1000); return f"{sec//60:02d}:{sec%60:02d}"
         self.preview_time.setText(f"{fmt(relative)} / {fmt(max(0,end-start))}")
     def _preview_media_status(self,status):
+        if getattr(self, "preview_image_item", None) is not None: return
         if self.media_player and status==QMediaPlayer.MediaStatus.EndOfMedia and self.preview_repeat.isChecked():
             start,_end=self._preview_bounds(); self.media_player.setPosition(start); self.media_player.play()
 
@@ -2799,6 +2865,12 @@ class MainWindow(QMainWindow):
         path=Path(job.get("output",""))
         if self.preview_path and Path(self.preview_path)==path and self.media_player:
             self.media_player.stop(); self.media_player.setSource(QUrl()); self.preview_path=""; self.preview_label.setText("Preview unloaded.")
+            if getattr(self, "preview_image_item", None) is not None:
+                self.preview_scene.removeItem(self.preview_image_item); self.preview_image_item = None
+                if self.video_item.scene() is None: self.preview_scene.addItem(self.video_item)
+                self.preview_scene.setSceneRect(self.video_item.boundingRect())
+                for control in (self.preview_play, self.preview_stop, self.preview_repeat, self.preview_slider): control.setEnabled(True)
+                self.preview_view.reset_view()
         try:
             if path.is_file():
                 path.unlink()
@@ -3077,9 +3149,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_codex_defer_start", False):
             return
         if self.proc and self.proc.state()!=QProcess.ProcessState.NotRunning: return
-        if not ffmpeg_tools_ready():
-            self._ensure_ffmpeg_async()
-            return
+        
         # Chained jobs are dependency-driven, not folder-driven. A pending job that
         # references another queued job is runnable only after that exact job finishes.
         # This also survives a requeue operation that temporarily changes list order.
@@ -3102,7 +3172,11 @@ class MainWindow(QMainWindow):
         if queue_changed:
             self._save_queue_state(); self._refresh_queue_views()
         if not job:
-            self.current_job_id=None; self.gen.setEnabled(True); self.cancel.setEnabled(False); return
+            self.current_job_id=None; self._sync_main_generate_button(); self.cancel.setEnabled(False); return
+        if job.get("job_type") != "h3_image" and not ffmpeg_tools_ready():
+            self._ensure_ffmpeg_async(); return
+        if job.get("job_type") == "h3_image":
+            self._unload_prompt_builder_llm_for_generation()
         run_args=list(job.get("args",[]))
         continue_source=""
         if job.get("continue_last_result"):
@@ -3174,6 +3248,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "system_hud"):
             self.system_hud.refresh()
         self.proc=QProcess(self); self.proc.setWorkingDirectory(str(ROOT))
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        if job.get("job_type") == "h3_image":
+            env.remove("PYTHONPATH")
+            env.insert("PYTHONNOUSERSITE", "1")
+            env.insert("PYTHONUTF8", "1")
+        self.proc.setProcessEnvironment(env)
         queue_program = str(job.get("queue_program") or "").strip()
         self.proc.setProgram(queue_program if queue_program else str(PYTHON))
         self.proc.setArguments(run_args); self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -3190,7 +3271,7 @@ class MainWindow(QMainWindow):
             self.proc.errorOccurred.connect(_on_assembly_error)
             self._assembly_trace(f"QPROCESS CONFIGURED job={trace_job_number} exe={self.proc.program()!r} args={len(run_args)} workdir={str(ROOT)!r}")
         self._start_job_log_file(job)
-        self.cancel.setEnabled(True); self.gen.setEnabled(True)
+        self.cancel.setEnabled(True); self._sync_main_generate_button()
         if job.get("job_type") == "timeline_assembly":
             job["phase"] = "Assembling timeline"
             if getattr(self, "timeline_widget", None) is not None:
@@ -3203,6 +3284,12 @@ class MainWindow(QMainWindow):
         self._save_queue_state(); self._refresh_queue_views()
         if job.get("job_type") == "timeline_assembly":
             self._assembly_trace(f"QPROCESS START CALL job={job.get('job_number')}")
+        def launch_error(error):
+            if error == QProcess.ProcessError.FailedToStart and self.current_job_id == job["id"]:
+                self.append_log("ERROR: " + self.proc.errorString() + "\n")
+                job["log_tail"] = self.proc.errorString()
+                self._finished(1, QProcess.ExitStatus.CrashExit)
+        if job.get("job_type") == "h3_image": self.proc.errorOccurred.connect(launch_error)
         self.proc.start()
 
     def _stop_running_job(self, action):
@@ -5405,7 +5492,11 @@ class MainWindow(QMainWindow):
         is_beatsync = self._beatsync_is_active()
         if hasattr(self, "gen"):
             self.gen.setEnabled(True)
-            if is_beatsync:
+            if self._images_is_active():
+                self.gen.setText("Edit image" if self.image_widget is not None and self.image_widget.mode.currentText() == "Edit" else "Generate image")
+                self.gen.setEnabled(self.image_widget is not None)
+                self.gen.setToolTip("Add an image job to the shared queue.")
+            elif is_beatsync:
                 self.gen.setText("Render video")
                 self.gen.setToolTip("Add a snapshot of the BeatSyncFX effects project to the GrizzlyMax render queue.")
             elif is_music:
@@ -5421,6 +5512,9 @@ class MainWindow(QMainWindow):
                 self.gen.setToolTip("Add the current MiniMax generation job to the queue.")
 
     def _main_generate_action(self):
+        if self._images_is_active():
+            if self.image_widget is not None: self.image_widget.generate()
+            return
         if self._beatsync_is_active():
             self._queue_beatsync_render()
             return
@@ -6254,6 +6348,8 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def open_output_folder(self):
+        if self._images_is_active() and self.image_widget is not None:
+            self.image_widget.open_output(); return
         p = self.current_output_dir(); p.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
 
@@ -6339,6 +6435,15 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _start_job_log_file(self, job):
+        self._log_clock_start = time.monotonic()
+        self._log_pending_line = ""
+        self._log_pending_time = 0.0
+        self._log_phase = "Worker startup / setup"
+        self._log_phase_start = 0.0
+        self._log_phase_totals = {}
+        self._log_sampling_start = None
+        self._log_sampling_announced = None
+        self._log_last_output = None
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             stamp=time.strftime('%Y%m%d_%H%M%S')
@@ -6346,6 +6451,8 @@ class MainWindow(QMainWindow):
             job['log_file']=str(path)
             self._active_log_file=path
             header = f"=== QUEUE START ===\nOutput: {job.get('output')}\n\n{self._queue_job_debug_summary(job)}\n\n"
+            header += f"Local start: {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+            header += "Elapsed timestamps measure queue-side output receipt (monotonic clock); stage times are approximate.\n\n"
             path.write_text(header, encoding='utf-8')
             return path
         except Exception as exc:
@@ -6353,14 +6460,118 @@ class MainWindow(QMainWindow):
             self.append_log(f"Log file warning: {exc}\n")
             return None
 
-    def _write_job_log_file(self, text):
-        path=getattr(self, '_active_log_file', None)
-        if not path or not text:
+    @staticmethod
+    def _log_elapsed_stamp(seconds):
+        ms = max(0, int(seconds * 1000))
+        minutes, rest = divmod(ms, 60000)
+        secs, millis = divmod(rest, 1000)
+        return f"[{minutes:02d}:{secs:02d}.{millis:03d}]"
+
+    def _log_set_phase(self, phase, elapsed):
+        if phase == self._log_phase:
+            return
+        previous = self._log_phase
+        totals = self._log_phase_totals
+        totals[previous] = totals.get(previous, 0.0) + max(0.0, elapsed - self._log_phase_start)
+        self._log_phase = phase
+        self._log_phase_start = elapsed
+
+    def _log_observe_line(self, line, elapsed):
+        # Match existing worker milestones; never modify the raw stream used by the HUD.
+        low = line.strip().lower()
+        if not low:
+            return
+        if re.match(r"^0%\|", low) and self._log_sampling_announced is not None:
+            if self._log_sampling_start is None:
+                self._log_sampling_start = elapsed
+                self._log_set_phase("Sampling", elapsed)
+            return
+        if low.startswith("image_stage "):
+            phase = low[len("image_stage "):].strip()
+            self._log_set_phase("Image: " + phase, elapsed)
+        elif low.startswith("loading video vae and encoding"):
+            self._log_set_phase("Reference video VAE load / visual encoding", elapsed)
+        elif low.startswith("loading audio vae and encoding"):
+            self._log_set_phase("Reference audio VAE load / encoding", elapsed)
+        elif low.startswith("loading") and ("text encoder" in low or "qwen" in low):
+            self._log_set_phase("Text encoder loading", elapsed)
+        elif low.startswith("encoding") and ("prompt" in low or "conditioning" in low):
+            self._log_set_phase("Text / reference conditioning", elapsed)
+        elif low.startswith("loading") and "diffusion" in low:
+            self._log_set_phase("Diffusion loading / setup", elapsed)
+        elif low.startswith("loading lora"):
+            self._log_set_phase("LoRA loading / setup", elapsed)
+        elif low.startswith("sampling ") and "steps" in low and not low.startswith("sampling process"):
+            if self._log_sampling_announced is None:
+                self._log_sampling_announced = elapsed
+            self._log_set_phase("Sampler preparation", elapsed)
+        elif "sampling stage complete" in low or low.startswith("sampling process exited"):
+            self._log_set_phase("Post-sampling / VAE setup", elapsed)
+        elif low.startswith("loading video vae"):
+            self._log_set_phase("Video VAE loading", elapsed)
+        elif low.startswith("decoding video"):
+            self._log_set_phase("Video VAE decoding", elapsed)
+        elif low.startswith("video decode stage complete"):
+            self._log_set_phase("Post-video decode / setup", elapsed)
+        elif low.startswith("loading audio vae"):
+            self._log_set_phase("Audio VAE loading", elapsed)
+        elif low.startswith("decoding audio") or low.startswith("decoding actual minimax generated audio"):
+            self._log_set_phase("Audio VAE decoding", elapsed)
+        elif low.startswith("audio decode stage complete"):
+            self._log_set_phase("Post-audio decode / setup", elapsed)
+        elif low.startswith("muxing"):
+            self._log_set_phase("Muxing / output", elapsed)
+        elif low.startswith("glue results"):
+            self._log_set_phase("Continuation assembly", elapsed)
+        elif low.startswith(("saved with audio:", "saved full video-only fallback:", "saved video-only fallback:", "saved:")):
+            self._log_set_phase("Cleanup / process exit", elapsed)
+
+    def _write_job_log_file(self, text, *, final=False):
+        path = getattr(self, '_active_log_file', None)
+        if not path:
             return
         try:
-            with Path(path).open('a', encoding='utf-8', errors='replace') as f:
-                f.write(text)
+            elapsed = time.monotonic() - self._log_clock_start
+            output = []
+            # QProcess chunks can split a line. Preserve it and its first receipt time.
+            # Treat tqdm carriage returns as line boundaries in the saved log only.
+            if text:
+                self._log_last_output = elapsed
+                parts = re.split(r"[\r\n]", text)
+                for i, part in enumerate(parts):
+                    if not self._log_pending_line and part:
+                        self._log_pending_time = elapsed
+                    self._log_pending_line += part
+                    if i < len(parts) - 1:
+                        if self._log_pending_line:
+                            line = self._log_pending_line
+                            t = self._log_pending_time
+                            self._log_observe_line(line, t)
+                            output.append(f"{self._log_elapsed_stamp(t)} {line}\n")
+                        self._log_pending_line = ""
+            if final:
+                if self._log_pending_line:
+                    line = self._log_pending_line
+                    t = self._log_pending_time
+                    self._log_observe_line(line, t)
+                    output.append(f"{self._log_elapsed_stamp(t)} {line}\n")
+                    self._log_pending_line = ""
+                phase = self._log_phase
+                self._log_phase_totals[phase] = self._log_phase_totals.get(phase, 0.0) + max(0.0, elapsed - self._log_phase_start)
+                output.append("\n=== PERFORMANCE SUMMARY (queue-observed) ===\n")
+                if self._log_sampling_start is not None:
+                    output.append(f"Time to first sampler progress: {self._log_sampling_start:.3f}s\n")
+                if self._log_sampling_announced is not None:
+                    output.append(f"Time to sampling announcement: {self._log_sampling_announced:.3f}s\n")
+                for name, duration in self._log_phase_totals.items():
+                    output.append(f"{name:<44} {duration:9.3f}s\n")
+                output.append(f"{'Total job time (logger)':<44} {elapsed:9.3f}s\n")
+                output.append("Stage durations are intervals between observed worker messages; unreported work is included in the preceding stage.\n")
+            if output:
+                with Path(path).open('a', encoding='utf-8', errors='replace') as f:
+                    f.writelines(output)
         except Exception:
+            # Logging must never interrupt inference or queue processing.
             pass
 
     def append_log(self, text):
@@ -6373,10 +6584,16 @@ class MainWindow(QMainWindow):
         self._write_job_log_file(text)
         job = self._job_by_id(self.current_job_id) if self.current_job_id else None
         if job:
+            if job.get("job_type") == "h3_image" and getattr(self, "image_widget", None) is not None:
+                self.image_widget.logs.appendPlainText(text.rstrip())
             job["log_tail"] = (job.get("log_tail", "") + text)[-24000:]
             for raw in text.replace("\r", "\n").splitlines():
                 line = raw.strip()
                 if not line: continue
+                if job.get("job_type") == "h3_image" and line.startswith("IMAGE_STAGE "):
+                    job["phase"] = line[len("IMAGE_STAGE "):][:80]
+                    job["progress"] = None
+                    continue
                 if line.startswith("RELAY_TOTAL_PROGRESS "):
                     pm = re.match(r"RELAY_TOTAL_PROGRESS (.+?) \| (\d{1,3})% \| (\d+)\s*/\s*(\d+)", line)
                     if pm:
@@ -7448,8 +7665,12 @@ exit /b %RC%
         if interactive:
             try:
                 from runtime.install_preflight import PreflightDialog
+                if self.image_widget is not None:
+                    self.image_widget.save_timer.stop()
+                    self.image_widget.save()
                 dialog = PreflightDialog(self)
                 dialog.exec()
+                if self.image_widget is not None: self.image_widget.reload_install_settings()
             except Exception as exc:
                 QMessageBox.warning(self, 'Installation preflight', f'Unable to scan optional components: {exc}')
         self._validate_minimax_models()
@@ -8270,6 +8491,7 @@ exit /b %RC%
         if diagnostic_job and diagnostic_job.get("job_type") == "timeline_assembly":
             self._assembly_trace(f"QPROCESS FINISHED job={diagnostic_job.get('job_number')} exit_code={code} status={status}")
         self._process_output()
+        self._write_job_log_file("", final=True)
         if self._closing:
             self.proc=None; return
         job=self._job_by_id(self.current_job_id) if self.current_job_id else None; now=time.time()
@@ -8282,7 +8504,7 @@ exit /b %RC%
                 job["state"]="cancelled"; job["error"]=job.get("cancel_reason") or "Cancelled by user."
             elif code in (0,3) and Path(job.get("output","")).is_file():
                 job["state"]="finished"; job["phase"]="Finished"
-                job["clip_duration"] = self._probe_clip_duration(job.get("output"), job.get("frames"))
+                job["clip_duration"] = None if job.get("job_type") == "h3_image" else self._probe_clip_duration(job.get("output"), job.get("frames"))
                 if job.get("job_type") in ("nvidia_vsr", "relayvsr") and job.get("timeline_clip_id") and getattr(self, "timeline_widget", None) is not None:
                     if not self.timeline_widget.vsr_job_completed(job):
                         self.append_log("[NVIDIA VSR] Output ready, but original Timeline project/clip is no longer active. Output preserved in output/nvidia_vsr.\n")
@@ -8295,7 +8517,7 @@ exit /b %RC%
                         self.timeline_widget.mark_assembly_finished(job.get("output"))
                     self.status.setText(f"Timeline assembly finished: {Path(job.get('output','')).name}")
                     self.append_log(f"=== TIMELINE ASSEMBLY FINISHED ===\n{job.get('output')}\n")
-                if self.play_result_finished.isChecked():
+                if self.play_result_finished.isChecked() or job.get("job_type") == "h3_image":
                     play_finished_job = job
                 if job.get("telegram_chat_id") and hasattr(self, "telegram_send_results") and self.telegram_send_results.isChecked():
                     if self.telegram_remote is not None:
@@ -8325,9 +8547,18 @@ exit /b %RC%
                 self.timeline_widget.mark_assembly_queued(job.get("output"), job.get("id"))
             if job.get("state") == "cancelled" and getattr(self, "timeline_widget", None) is not None:
                 self.timeline_widget.mark_assembly_failed("Cancelled")
+        if job and job.get("job_type") == "h3_image":
+            jid = str(job.get("id") or "")
+            if re.fullmatch(r"[0-9a-f]{32}", jid):
+                shutil.rmtree(Path(job["output"]).parent / (".h3_image_" + jid), ignore_errors=True)
         finish_line=f"=== FINISHED: exit {code} ===\n"
-        self._write_job_log_file(finish_line)
-        self.append_log(finish_line); self.proc=None; self.current_job_id=None; self._termination_action=None; self.cancel.setEnabled(False); self.gen.setEnabled(True)
+        try:
+            if self._active_log_file:
+                with Path(self._active_log_file).open('a', encoding='utf-8', errors='replace') as f:
+                    f.write(finish_line)
+        except Exception:
+            pass
+        self.append_log(finish_line); self.proc=None; self.current_job_id=None; self._termination_action=None; self.cancel.setEnabled(False); self._sync_main_generate_button()
         self._active_log_file=None
         self.status.setText("Queue ready" if code in (0,3) else f"Job stopped/failed ({code})"); self._save_queue_state(); self._refresh_queue_views()
         if job and job.get("music_clip_job") and getattr(self, "music_clip_widget", None) is not None:
@@ -8629,6 +8860,8 @@ exit /b %RC%
         except Exception:
             pass
         self.save_last()
+        if getattr(self, "image_widget", None) is not None:
+            self.image_widget.save_timer.stop(); self.image_widget.save()
         if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
             job=self._job_by_id(self.current_job_id)
             if job:
