@@ -1507,11 +1507,12 @@ def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selec
     out = [
         "[REFERENCE IMAGES]", *pictures,
         "", "[SUBJECTS]", *(line for _, line in subjects),
-        "", "[SELECTED VISUAL STYLE LOCK]",
-        "Photorealistic live-action cinematic music video. Real human skin texture, natural facial motion, physically believable lighting, consistent reference identity and coherent camera perspective."
+        "", "[SELECTED VISUAL STYLE LOCK]"
     ]
     if style:
         out.append(style + ".")
+    else:
+        out.append("Photorealistic live-action cinematic music video. Real human skin texture, natural facial motion, physically believable lighting, consistent reference identity and coherent camera perspective.")
     if creative:
         out.append("Creative direction: " + creative + ".")
 
@@ -1522,7 +1523,10 @@ def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selec
     elif location:
         out.append("Location: " + location.strip().rstrip(".") + ".")
     else:
-        out.append("A consistent, physically believable setting appropriate to the chosen visual references.")
+        if style:
+            out.append("A coherent setting appropriate to the selected visual style and references.")
+        else:
+            out.append("A consistent, physically believable setting appropriate to the chosen visual references.")
     if char_nums and not avoid_duplicates:
         out.append(f"The referenced characters are {fmt(char_nums)}, retaining their own referenced appearances and positions.")
     if obj_nums and not avoid_duplicates:
@@ -1536,7 +1540,10 @@ def _build_structured_music_prompt(project: MusicProject, shot: MusicShot, selec
     if story:
         out.append(story.strip().rstrip(".") + ".")
     else:
-        out.append("Create energetic, natural action driven by the music in the referenced environment.")
+        if style:
+            out.append("Create energetic action driven by the music, consistent with the selected visual style.")
+        else:
+            out.append("Create energetic, natural action driven by the music in the referenced environment.")
     if camera:
         out.append("Camera choreography: " + camera.strip().rstrip(".") + ".")
     out.append("The recorded music in <Audio 1> is the sole authority for vocal syllables, pauses and timing. Visible mouth movements, when present, follow the actual audio rather than written lyrics. Keep movement and camera action active through the final frame.")

@@ -5831,7 +5831,7 @@ class MainWindow(QMainWindow):
         self.vram_residency_engine.addItem("Static partial (recommended)", "static")
         self.vram_residency_engine.addItem("DynamicVRAM / VBAR", "dynamic")
         self.vram_residency_engine.setCurrentIndex(0)
-        self.vram_residency_engine.setToolTip("Static partial disables (Comfy) DynamicVRAM and uses the ModelPatcher partial-residency budget. Test both settings to see whatworks best for you")
+        self.vram_residency_engine.setToolTip("Static partial uses GrizzlyMax residency control. DynamicVRAM uses Comfy VBAR for diffusion only (experimental).")
         vf.addRow("Residency engine", self.vram_residency_engine)
 
         self.vram_runtime_free = QDoubleSpinBox(); self.vram_runtime_free.setRange(0.10, 8.0); self.vram_runtime_free.setDecimals(2); self.vram_runtime_free.setSingleStep(0.10); self.vram_runtime_free.setValue(0.50); self.vram_runtime_free.setSuffix(" GB")
