@@ -53,6 +53,22 @@ Main Features :
 
 ---
 
+- 11/21/2026
+
+  - Important update – Major performance improvements
+  - After updating GrizzlyMax, close the application and run install.bat again to update the required dependencies.
+  - This update includes:
+    - Fixed DynamicVRAM / VBAR activation.
+    - Restored SLA attention support.
+    - Accelerated INT8 dense attention.
+    - Updated Comfy Kitchen to 0.2.41.
+    - Significantly faster high-resolution video generation.
+  - For best performance, try DynamicVRAM combined with SLA Attention. (in settings tab)
+![MiniMax H3 INT4 Standalone](/presets/setsave/2026-11-21%2004_03_18-minimax%20H3%20Standalone.jpg)
+
+
+---
+
 - 11/15/2026
 
   - MiniMax H3 Image Generation & Editing
