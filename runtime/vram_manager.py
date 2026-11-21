@@ -83,6 +83,8 @@ class VRAMManager:
                 flush=True,
             )
         self.stage = "text"
+        self._dynamic_active = False
+        self._dynamic_attempted = False
         self._orig_load_models_gpu = None
         self._seen = set()
         self._hook_handles = []
@@ -202,6 +204,40 @@ class VRAMManager:
         except Exception:
             pass
 
+    def _activate_dynamic_diffusion(self):
+        """Opt-in VBAR for diffusion only; static reference/Qwen stays intact."""
+        if self._dynamic_attempted:
+            return
+        self._dynamic_attempted = True
+        args = self.comfy.cli_args.args
+        if not getattr(args, "enable_dynamic_vram", False) or getattr(args, "disable_dynamic_vram", False):
+            return
+        self._log("Requested engine: DynamicVRAM / VBAR (diffusion only)", force=True)
+        try:
+            if not torch.cuda.is_available() or not self.mm.is_nvidia():
+                raise RuntimeError("NVIDIA CUDA device required")
+            if self.mm.torch_version_numeric < (2, 8):
+                raise RuntimeError("PyTorch 2.8 or newer required")
+            control = getattr(self.comfy, "_h3_aimdo_control", None)
+            if control is None:
+                raise RuntimeError("AIMDO bootstrap unavailable")
+            device = self.mm.get_torch_device()
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            try:
+                ok = control.init_devices(iter([(index, int(getattr(args, "vram_headroom", 0) * _GIB))]))
+            except TypeError:
+                ok = control.init_devices(iter([index]))
+            if not ok:
+                raise RuntimeError("AIMDO device initialization returned false")
+            self.comfy.model_patcher.CoreModelPatcher = self.comfy.model_patcher.ModelPatcherDynamic
+            self.comfy.memory_management.aimdo_enabled = True
+            self._dynamic_active = True
+            self._log("AIMDO initialization: SUCCESS | active engine: DynamicVRAM / VBAR", force=True)
+        except Exception as exc:
+            self.comfy.model_patcher.CoreModelPatcher = self.comfy.model_patcher.ModelPatcher
+            self.comfy.memory_management.aimdo_enabled = False
+            self._log(f"AIMDO initialization failed; active engine: static partial | {exc}", force=True)
+
     def set_stage(self, stage: str):
         self.stage = self._normalize_stage(stage)
         if self.stage != "diffusion":
@@ -214,6 +250,8 @@ class VRAMManager:
             self._ultra_admission_logged = False
             self._sampling_target_free_bytes = 0
         managed = self.is_stage_managed(self.stage)
+        if managed and self.stage == "diffusion":
+            self._activate_dynamic_diffusion()
         if managed:
             self._set_comfy_reserve(self.load_headroom_bytes())
         else:
@@ -372,7 +410,7 @@ class VRAMManager:
             self._install_allocator_guard()
         else:
             self._restore_allocator_guard()
-        if managed:
+        if managed and not (self._dynamic_active and self.stage == "diffusion"):
             self._install_pinned_offload_guard()
         else:
             self._restore_pinned_offload_guard()
@@ -463,6 +501,15 @@ class VRAMManager:
         def managed_load_models_gpu(models, *args, **kwargs):
             if not manager.is_stage_managed():
                 return manager._orig_load_models_gpu(models, *args, **kwargs)
+            if manager._dynamic_active and manager.stage == "diffusion":
+                # Let Comfy/AIMDO decide residency; retain stage reserve and
+                # PyTorch allocator guard, but do not rewrite its load estimates.
+                manager._set_comfy_reserve(manager.load_headroom_bytes())
+                out = manager._orig_load_models_gpu(models, *args, **kwargs)
+                if any(id(m) not in manager._seen for m in models):
+                    manager._seen.update(id(m) for m in models)
+                    manager.log_residency("after DynamicVRAM load", force=True)
+                return out
             first_load = any(id(m) not in manager._seen for m in models)
             reserve = manager.load_headroom_bytes() if first_load else manager.runtime_floor_bytes()
             if manager.stage == "diffusion":
@@ -722,6 +769,8 @@ class VRAMManager:
     def enforce_patcher(self, patcher, target_free: int | None = None, reason: str = "runtime") -> int:
         if patcher is None or not torch.cuda.is_available():
             return 0
+        if self._dynamic_active and self.stage == "diffusion":
+            return 0
         try:
             load_device = getattr(patcher, "load_device", None)
             if load_device is not None and getattr(load_device, "type", str(load_device).split(':')[0]) != "cuda":
@@ -903,6 +952,11 @@ class VRAMManager:
             self.fill_residency(reason=f"post-block {name}")
 
     def install_sampling_hooks(self, model):
+        if self._dynamic_active:
+            if not model.is_dynamic():
+                raise RuntimeError("DynamicVRAM initialized but final diffusion patcher is static; benchmark aborted. Select Static partial to retry.")
+            self._log(f"Dynamic residency ACTIVE | patcher={type(model).__name__} | manual offload/refill hooks disabled", force=True)
+            return lambda: None
         if not self.is_stage_managed("diffusion"):
             self._log("diffusion stage is native; sampling residency hooks not installed", force=True)
             return lambda: None

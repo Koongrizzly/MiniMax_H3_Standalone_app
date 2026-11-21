@@ -25,6 +25,25 @@ sys.argv = [sys.argv[0], *_extra_comfy_args]
 import comfy.options
 comfy.options.enable_args_parsing(True)
 import comfy.cli_args
+# The embedded worker does not execute ComfyUI's main.py. Initialize the
+# optional AIMDO runtime explicitly, but leave the static patcher in place
+# until the VRAM manager enters the diffusion stage.
+if comfy.cli_args.args.enable_dynamic_vram and not comfy.cli_args.args.disable_dynamic_vram:
+    try:
+        import comfy_aimdo.control as _aimdo_control
+        _reserve = comfy.cli_args.args.reserve_vram
+        _headroom = None if _reserve is None else int(_reserve * 1024 ** 3)
+        try:
+            _aimdo_control.init(simple_vram_headroom=_headroom,
+                                nvml_pressure=not getattr(comfy.cli_args.args, 'disable_nvml_pressure', False))
+        except TypeError:
+            try:
+                _aimdo_control.init(simple_vram_headroom=_headroom)
+            except TypeError:
+                _aimdo_control.init()
+        comfy._h3_aimdo_control = _aimdo_control
+    except Exception as exc:
+        print(f"[VRAM-MGR] AIMDO bootstrap failed; static fallback: {exc}", flush=True)
 import comfy.sd
 import comfy.utils
 import comfy.model_management
