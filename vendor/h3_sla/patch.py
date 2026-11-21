@@ -172,6 +172,29 @@ def _build_sage_dense_fn(mode):
     return attention_sage_dense
 
 
+def _build_ck_dense_compat():
+    """Backport only the Kitchen dense API bridge for older Comfy builds.
+
+    The current H3 call site supplies BHSD tensors. Keep this bridge scoped
+    to SLA, leaving Comfy's global attention dispatch untouched.
+    """
+    import comfy_kitchen as ck
+    kernel = getattr(ck, "int8_attention", None)
+    if not callable(kernel):
+        return None
+
+    def attention_ck_dense_compat(q, k, v, heads, mask=None,
+                                  attn_precision=None, skip_reshape=False,
+                                  skip_output_reshape=False, **kwargs):
+        # Only the packed H3 self-attention path is admitted by the caller.
+        out = kernel(q, k, v, scale=kwargs.get("scale"), attn_mask=mask)
+        if not skip_output_reshape:
+            out = out.transpose(1, 2).reshape(q.shape[0], -1, heads * q.shape[-1])
+        return out
+
+    return attention_ck_dense_compat
+
+
 def _resolve_backend(name):
     """Look up a specific dense-path attention function by name.
 
@@ -201,6 +224,13 @@ def _resolve_backend(name):
                 break
         except Exception:  # noqa: BLE001 - a bad candidate must not crash
             continue
+    if fn is None and name == "comfy_kitchen":
+        try:
+            fn = _build_ck_dense_compat()
+        except ImportError:
+            fn = None
+        if fn is not None:
+            print("[SLA] dense backend resolved: comfy_kitchen.int8_attention (local compatibility adapter)", flush=True)
     if fn is None:
         log.warning(
             "[H3Utils] SLA: could not resolve dense_backend=%r on this "
@@ -249,6 +279,8 @@ def _new_state():
         "pinned": 0,
         "backend": None,   # what we displaced
         "dense_backend": None,  # what dense steps actually ran on
+        "dense_counts": {},
+        "ck_dense_failed": None,
         "failed": None,    # first kernel failure, if any
         "fp16_saved": None,     # (fp16, bf16) matmul reduction flags to restore
         "call_idx": 0,       # this step's call count, for stabilize_motion
@@ -269,6 +301,8 @@ def _reset_run_state(state):
     state["blocks"] = 0
     state["pinned"] = 0
     state["failed"] = None
+    state["dense_counts"].clear()
+    state["ck_dense_failed"] = None
     # Catches the case the end-of-run clear (in the wrapper) can't: a
     # generation that got cancelled mid-run never reaches that clear, so
     # stabilize_motion's held tensors from the abandoned run would otherwise
@@ -490,33 +524,44 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
 
     def override(func, q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kwargs):
+        to = kwargs.get("transformer_options") or {}
+        eligible = (
+            skip_reshape and mask is None and q.ndim == 4
+            and q.shape[-1] == _H3_HEAD_DIM and q.dtype in _OK_DTYPES
+            and q.shape[2] >= min_seq_len
+        )
+
         def dense():
             state["dense"] += 1
             call = dense_fn or func
-            if state["dense_backend"] is None:
-                state["dense_backend"] = getattr(call, "__name__", repr(call))
-            return call(q, k, v, heads, mask=mask, attn_precision=attn_precision,
-                        skip_reshape=skip_reshape,
-                        skip_output_reshape=skip_output_reshape, **kwargs)
+            compat = getattr(call, "__name__", "") == "attention_ck_dense_compat"
+            if compat and (not eligible or state["ck_dense_failed"] is not None
+                           or not q.is_cuda or q.shape != k.shape or q.shape != v.shape
+                           or kwargs.get("low_precision_attention", True) is False):
+                call = func
+                compat = False
+            call_kwargs = dict(mask=mask, attn_precision=attn_precision,
+                               skip_reshape=skip_reshape,
+                               skip_output_reshape=skip_output_reshape, **kwargs)
+            try:
+                out = call(q, k, v, heads, **call_kwargs)
+            except Exception as exc:
+                if not compat or isinstance(exc, torch.OutOfMemoryError):
+                    raise
+                state["ck_dense_failed"] = str(exc)
+                log.warning("[SLA] Kitchen dense adapter failed; using original attention for this run: %s", exc)
+                call = func
+                out = call(q, k, v, heads, **call_kwargs)
+            name = getattr(call, "__name__", type(call).__name__)
+            state["dense_backend"] = name
+            counts = state["dense_counts"]
+            counts[name] = counts.get(name, 0) + 1
+            return out
 
         if state["backend"] is None:
             state["backend"] = getattr(func, "__name__", repr(func))
 
-        to = kwargs.get("transformer_options") or {}
-
-        # Anything that is not the packed H3 self-attention goes straight
-        # through. The min_seq_len guard is what keeps the 2-block token refiner
-        # (S = text length, a few hundred) and lower-resolution runs on dense
-        # attention, where block sparsity would cost more than it saves.
-        if (
-            not skip_reshape
-            or mask is not None
-            or q.ndim != 4
-            or q.shape[-1] != _H3_HEAD_DIM
-            or q.dtype not in _OK_DTYPES
-            or q.shape[2] < min_seq_len
-            or to.get("_h3sla_dense", False)
-        ):
+        if not eligible or to.get("_h3sla_dense", False):
             return dense()
 
         try:
@@ -942,6 +987,8 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
             or step0 in dense_steps
         )
 
+        before_sparse = state["calls"]
+        before_dense = dict(state["dense_counts"])
         # Forward minimax_payload only when H3 actually supplied one. Nothing
         # stops a user wiring this node to a non-H3 model, and every other
         # diffusion model would raise TypeError on the unexpected kwarg -- a
@@ -969,6 +1016,14 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             raise
+
+        dense_delta = {name: count - before_dense.get(name, 0)
+                       for name, count in state["dense_counts"].items()
+                       if count > before_dense.get(name, 0)}
+        dense_report = ", ".join(f"{name}={count}" for name, count in dense_delta.items()) or "none"
+        print(f"[SLA] step {state['step']}/{n_steps} | "
+              f"scheduled={'dense' if to['_h3sla_dense'] else 'sparse'} | "
+              f"sparse_calls={state['calls'] - before_sparse} | dense_calls: {dense_report}", flush=True)
 
         if state["step"] >= n_steps and not state["summarized"]:
             _summarise(state, sparsity_ratio, blkq, blkk)
