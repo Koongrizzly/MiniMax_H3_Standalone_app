@@ -307,6 +307,11 @@ echo [8/8] Running import / CUDA / SageAttention smoke test...
 "%PY%" "%CD%\runtime\validate_install.py"
 if errorlevel 1 goto :fail
 
+REM Verify the SLA entry point after all runtime dependency installations.
+echo       Checking Comfy Kitchen SLA support...
+"%PY%" -c "import comfy_kitchen as ck; from importlib.metadata import version; v=version('comfy-kitchen'); assert v=='0.2.41', 'Unexpected Comfy Kitchen version: '+v; assert callable(getattr(ck,'sol_attn',None)), 'Comfy Kitchen lacks callable sol_attn'; b=ck.list_backends().get('cuda',{}); assert b.get('available') and not b.get('disabled'), 'Comfy Kitchen CUDA backend unavailable'; print('Comfy Kitchen SLA API and CUDA backend OK:',v)"
+if errorlevel 1 goto :fail
+
 echo.
 echo ============================================================
 echo RUNTIME INSTALL COMPLETE
